@@ -185,11 +185,6 @@ def test_user_buffers_ar_rms_norm(mnk, mpi_pool_executor):
     c = torch.randn((m, n), dtype=dtype)
     gamma = torch.randn((n), dtype=dtype)
 
-    # a = torch.ones((m, k), dtype=dtype)
-    # b = torch.ones((k, n), dtype=dtype)
-    # c = torch.ones((m, n), dtype=dtype)
-    # gamma = torch.ones((n), dtype=dtype)
-
     results = mpi_pool_executor.map(
         run_single_rank_ar_rms_norm,
         *zip(*[(tensor_parallel_size, a, b, c, gamma)] * tensor_parallel_size),
