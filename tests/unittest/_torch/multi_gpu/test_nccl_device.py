@@ -135,8 +135,8 @@ def run_single_rank_ar_rms_norm(tensor_parallel_size, a, b, c, gamma):
         ref = rms_norm(ref_residual.to(torch.float32), gamma, eps).to(res.dtype)
         torch.testing.assert_close(ref, res, atol=5e-1, rtol=1e-2)
 
-        chunked_residual_comparison = False # Current production version performs full scatter also for the residual, so we can compare unchunked
-        
+        chunked_residual_comparison = False  # Current production version performs full scatter also for the residual, so we can compare unchunked
+
         # Since we do not always perform an AllGather of the residual, let's compare on every rank the right portions of the residual
         residual_chunk_size = ref_residual.size(0) // tensor_parallel_size
         if ref_residual.size(0) % tensor_parallel_size != 0:
