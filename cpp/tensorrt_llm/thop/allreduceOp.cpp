@@ -485,6 +485,7 @@ private:
             "UserBuffer has not been initialized (required for NCCL_DEVICE)");
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
         int size = input.numel();
+        auto ub_tensor0 = input;
         auto& ub_manager = tensorrt_llm::runtime::ub::UserBuffersManager::get_instance();
         auto& allocator = tensorrt_llm::runtime::ub::UserBufferAllocator::Instance();
         auto* nccl_ub_allocator_ptr = dynamic_cast<tensorrt_llm::runtime::ub::NCCLUserBufferAllocator*>(&allocator);
