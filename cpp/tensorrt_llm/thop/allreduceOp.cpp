@@ -463,8 +463,9 @@ private:
         TLLM_CHECK(!ub_buffer0.invalid());
         auto [norm_out, ub_buffer1] = torch_ext::create_userbuffers_tensor(input.sizes(), input.scalar_type());
 
+        auto& rawComm = std::get<std::shared_ptr<ncclComm_t>>(mNcclComm);
         NCCLCHECK(ncclAllReduce(
-            ub_buffer0.addr, norm_out.mutable_data_ptr(), size, (*getDtypeMap())[mType], ncclSum, *mNcclComm, stream));
+            ub_buffer0.addr, norm_out.mutable_data_ptr(), size, (*getDtypeMap())[mType], ncclSum, *rawComm, stream));
 
         if (mOp == AllReduceFusionOp::NONE)
         {
@@ -507,11 +508,12 @@ private:
         auto [norm_out, ub_buffer1] = torch_ext::create_userbuffers_tensor(input.sizes(), input.scalar_type());
         TLLM_CHECK(!ub_buffer1.invalid());
         // Get rank and size
+        auto& rawComm = std::get<std::shared_ptr<ncclComm_t>>(mNcclComm);
         int rank, nRanks;
-        ncclResult_t ncclError = ncclCommCount(*mNcclComm, &nRanks);
+        ncclResult_t ncclError = ncclCommCount(*rawComm, &nRanks);
         TLLM_CHECK_WITH_INFO(
             ncclError == ncclSuccess, "Failed to get NCCL communicator size: %s", ncclGetErrorString(ncclError));
-        ncclError = ncclCommUserRank(*mNcclComm, &rank);
+        ncclError = ncclCommUserRank(*rawComm, &rank);
         TLLM_CHECK_WITH_INFO(
             ncclError == ncclSuccess, "Failed to get NCCL communicator rank: %s", ncclGetErrorString(ncclError));
 
@@ -519,7 +521,7 @@ private:
         {
         case AllReduceFusionOp::NONE:
             NCCLCHECK(ncclAllReduce(ub_buffer0.addr, norm_out.mutable_data_ptr(), size, (*getDtypeMap())[mType],
-                ncclSum, *mNcclComm, stream));
+                ncclSum, *rawComm, stream));
 
             return {norm_out};
         case AllReduceFusionOp::RESIDUAL_RMS_NORM:
@@ -566,7 +568,7 @@ private:
         default:
         default_case:
             NCCLCHECK(ncclAllReduce(
-                ub_buffer0.addr, ub_buffer1.addr, size, (*getDtypeMap())[mType], ncclSum, *mNcclComm, stream));
+                ub_buffer0.addr, ub_buffer1.addr, size, (*getDtypeMap())[mType], ncclSum, *rawComm, stream));
             return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, norm_out);
         }
     }
