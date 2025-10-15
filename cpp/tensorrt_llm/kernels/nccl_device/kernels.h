@@ -85,7 +85,7 @@ __inline__ __device__ T blockReduceSumV2(T* val)
 template <typename T, typename TN, int Nunroll, bool useResidual, bool useBias, bool kUnshardCompletely>
 __global__ void fusedAllReduceRMSNormKernel(ncclWindow_t input_win, ncclWindow_t output_win, const TN* residual,
     ncclWindow_t residual_out_win, const TN* weight, const TN* bias, int const startToken, int const hidden_size,
-    int const num_tokens, ncclDevComm devComm, float const eps)
+    int const tokensPerRank, ncclDevComm devComm, float const eps)
 {
     // Static assertion: kUnshardCompletely can only be true when useResidual is true
     static_assert(!kUnshardCompletely || useResidual, "kUnshardCompletely can only be true when useResidual is true");
@@ -96,9 +96,10 @@ __global__ void fusedAllReduceRMSNormKernel(ncclWindow_t input_win, ncclWindow_t
     bar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
 
     // Calculate which token this block should process
-    int const token_id = blockIdx.x + startToken;
-    if (token_id < num_tokens)
+
+    for (int token_offset = blockIdx.x; token_offset < tokensPerRank; token_offset += gridDim.x)
     {
+        int const token_id = token_offset + startToken;
         // Calculate elements per vector type
         constexpr int elems_per_vec = sizeof(TN) / sizeof(T);
 
