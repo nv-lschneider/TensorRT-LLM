@@ -90,7 +90,7 @@ public:
 
     virtual int getElementsPerVector() const = 0;
     virtual nvinfer1::DataType getDataType() const = 0;
-    virtual bool isValidConfig(int threadsPerBlock, int unrollFactor, int blocksPerRank) const = 0;
+    virtual bool isValidConfig(int threadsPerBlock, int unrollFactor) const = 0;
 
     // Launcher functions as member functions
     void launchRMSNorm(ncclWindow_t inWindow, ncclWindow_t outWindow, void const* const residual,
@@ -99,6 +99,8 @@ public:
 
     bool supportsMultimem() const;
 
+    // Logging output
+    std::string getLoggingString() const;
 protected:
     // Pure virtual launch function that must be implemented by derived classes
     virtual void launchKernel(ncclWindow_t inWindow, ncclWindow_t outWindow, void const* const residual,
@@ -106,8 +108,6 @@ protected:
         float const eps, cudaStream_t stream) const
         = 0;
 
-    // Logging output
-    std::string getLoggingString() const;
 };
 
 // Kernel launch information helper class
@@ -145,7 +145,7 @@ public:
         return this->elementsPerVector;
     }
 
-    virtual bool isValidConfig(int threadsPerBlock, int unrollFactor, int blocksPerRank) const override;
+    virtual bool isValidConfig(int threadsPerBlock, int unrollFactor) const override;
 
     // Launch function that handles all the type-specific logic internally
     virtual void launchKernel(ncclWindow_t inWindow, ncclWindow_t outWindow, void const* const residual,

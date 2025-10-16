@@ -106,7 +106,6 @@ std::string LaunchConfig::getLoggingString() const
     oss << "\tConfiguration:\n";
     oss << "\t\t ThreadsPerBlock: " << this->getThreadsPerBlock() << "\n";
     oss << "\t\t UnrollFactor: " << this->getUnrollFactor() << "\n";
-    oss << "\t\t BlocksPerRank (gridDim.x): " << this->getNumSMs() << "\n";
     oss << "\t\t TokensPerRank: " << this->token_per_rank << "\n";
     oss << "\t\t NumSMs: " << this->getNumSMs() << "\n";
     oss << "\t\t VectorInfo: " << this->getElementsPerVector() << "\n";
@@ -142,7 +141,7 @@ TypedLaunchConfig<T>::TypedLaunchConfig(int const hidden_dim, int const num_toke
             if (elementsProcessedPerBlock == hidden_dim)
             {
                 // Validate that this configuration can actually be launched
-                if (isValidConfig(testThreadsPerBlock, testUnrollFactor, this->token_per_rank))
+                if (isValidConfig(testThreadsPerBlock, testUnrollFactor))
                 {
                     valid_launch_combo.push_back(std::make_pair(testThreadsPerBlock, testUnrollFactor));
                 }
@@ -187,7 +186,7 @@ template class TypedLaunchConfig<float>;
 
 // Implementation of launch configuration validation
 template <typename T>
-bool TypedLaunchConfig<T>::isValidConfig(int threadsPerBlock, int unrollFactor, int blocksPerRank) const
+bool TypedLaunchConfig<T>::isValidConfig(int threadsPerBlock, int unrollFactor) const
 {
     // Get CUDA device properties
     int dev = -1;
@@ -219,12 +218,6 @@ bool TypedLaunchConfig<T>::isValidConfig(int threadsPerBlock, int unrollFactor, 
 
     // 3. Check unroll factor validity
     if (unrollFactor <= 0 || unrollFactor > kMaxUnrollFactor)
-    {
-        return false;
-    }
-
-    // 4. Check blocks per rank
-    if (blocksPerRank <= 0)
     {
         return false;
     }

@@ -538,6 +538,7 @@ private:
             std::shared_ptr<tensorrt_llm::kernels::nccl_device::LaunchConfig> launchConfig
                 = nccl_ub_allocator.getCachedNCCLDeviceLaunchConfig(
                     mType, hidden_size, num_tokens, rank, nRanks, true, false, true);
+
             // Check if multimem is supported for this data type
             if (launchConfig->supportsMultimem())
             {
@@ -549,7 +550,7 @@ private:
                 auto [residual_out, ub_buffer2]
                     = torch_ext::create_userbuffers_tensor(input.sizes(), input.scalar_type());
                 TLLM_CHECK(!ub_buffer2.invalid());
-                ncclDevComm devComm = nccl_ub_allocator.getNCCLDevComm(launchConfig->getBlocksPerRank());
+                ncclDevComm devComm = nccl_ub_allocator.getNCCLDevComm(launchConfig->getNumSMs());
 
                 launchConfig->launchRMSNorm(inWindow, outWindow, residual.value().data_ptr(), ub_buffer2.window,
                     norm_weight.value().data_ptr(), nullptr, devComm, mEps, stream);
