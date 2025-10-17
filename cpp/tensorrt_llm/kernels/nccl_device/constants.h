@@ -24,11 +24,10 @@ namespace tensorrt_llm::kernels::nccl_device
 
 // CUDA and kernel constants
 constexpr int kWarpSize = 32;
-constexpr int kMaxThreadsPerBlock = 1024;       // Maximum block size configurable for performance.
+constexpr int kMaxThreadsPerBlock = 1024;      // Maximum block size configurable for performance.
 constexpr int kMinThreadsPerBlock = kWarpSize; // Minimum block size is a warp.
 constexpr int kMaxUnrollFactor = 8; // We require manual instantiation and switches. Changing the number is not good
                                     // enough, see launcher function for details
-constexpr bool kUnshardCompletely = true;
 } // namespace tensorrt_llm::kernels::nccl_device
 
 #endif // TRTLLM_NCCL_DEVICE_CONSTANTS_H

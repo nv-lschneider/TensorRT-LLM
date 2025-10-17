@@ -82,13 +82,11 @@ __inline__ __device__ T blockReduceSumV2(T* val)
 }
 
 // AllReduce deterministic multimem unrolled kernel with template parameters
-template <typename T, typename TN, int Nunroll, bool useResidual, bool useBias, bool kUnshardCompletely>
+template <typename T, typename TN, int Nunroll, bool useResidual, bool useBias, bool oneShot>
 __global__ void fusedAllReduceRMSNormKernel(ncclWindow_t input_win, ncclWindow_t output_win, const TN* residual,
     ncclWindow_t residual_out_win, const TN* weight, const TN* bias, int const startToken, int const hidden_size,
     int const tokensPerRank, ncclDevComm devComm, float const eps)
 {
-    // Static assertion: kUnshardCompletely can only be true when useResidual is true
-    static_assert(!kUnshardCompletely || useResidual, "kUnshardCompletely can only be true when useResidual is true");
 
     using accType = typename VectorType<T>::accType;
     ncclLsaBarrierSession<ncclCoopCta> bar{
@@ -118,16 +116,17 @@ __global__ void fusedAllReduceRMSNormKernel(ncclWindow_t input_win, ncclWindow_t
 
         // Get aligned pointers for vector types
         TN* send_ptr = reinterpret_cast<TN*>(ncclGetMultimemPointer(input_win, 0, devComm.lsaMultimem));
-        TN* recv_ptr = reinterpret_cast<TN*>(ncclGetMultimemPointer(output_win, 0, devComm.lsaMultimem));
+        TN* recv_ptr = reinterpret_cast<TN*>(
+            oneShot ? ncclGetLocalPointer(output_win, 0) : ncclGetMultimemPointer(output_win, 0, devComm.lsaMultimem));
 
         assert(send_ptr != nullptr);
         assert(recv_ptr != nullptr);
         TN* residual_out = nullptr;
         if constexpr (useResidual)
         {
-            residual_out = kUnshardCompletely
-                ? reinterpret_cast<TN*>(ncclGetMultimemPointer(residual_out_win, 0, devComm.lsaMultimem))
-                : reinterpret_cast<TN*>(ncclGetLocalPointer(residual_out_win, 0));
+            residual_out = oneShot
+                ? reinterpret_cast<TN*>(ncclGetLocalPointer(residual_out_win, 0))
+                : reinterpret_cast<TN*>(ncclGetMultimemPointer(residual_out_win, 0, devComm.lsaMultimem));
 
             assert(residual != nullptr);
             assert(residual_out != nullptr);
@@ -158,7 +157,6 @@ __global__ void fusedAllReduceRMSNormKernel(ncclWindow_t input_win, ncclWindow_t
             size_t const offset_TN = offset_T / elems_per_vec;       // Convert to vector offset
             // The residual is the allreduced result (v) plus the input residual
             T const* residual_elem = useResidual ? reinterpret_cast<T const*>(residual + offset_TN) : nullptr;
-            T* residual_out_elem = useResidual ? reinterpret_cast<T*>(residual_out + offset_TN) : nullptr;
             T* v_elem = reinterpret_cast<T*>(&v[i]);
 
 #pragma unroll elems_per_vec
@@ -169,10 +167,6 @@ __global__ void fusedAllReduceRMSNormKernel(ncclWindow_t input_win, ncclWindow_t
                     // Residual = allreduced_result + input_residual
                     v_elem[j]
                         = static_cast<T>(static_cast<accType>(v_elem[j]) + static_cast<accType>(residual_elem[j]));
-
-                    // Update v_elem to be the residual for RMS normalization
-                    if (not kUnshardCompletely)
-                        residual_out_elem[j] = v_elem[j];
                 }
 
                 // Calculate sum of squares using residual values
@@ -180,16 +174,17 @@ __global__ void fusedAllReduceRMSNormKernel(ncclWindow_t input_win, ncclWindow_t
                 local_sum_squares += value * value;
             }
         }
-        if constexpr (kUnshardCompletely)
-        {
+
 #pragma unroll Nunroll
-            for (int i = 0; i < Nunroll; i++)
-            {
-                int const stride_offset = i * kWarpSize * elems_per_vec; // Scale stride by elements per vector
-                size_t const offset_T = base_offset_T + stride_offset;
-                size_t const offset_TN = offset_T / elems_per_vec;       // Convert to vector offset
+        for (int i = 0; i < Nunroll; i++)
+        {
+            int const stride_offset = i * kWarpSize * elems_per_vec; // Scale stride by elements per vector
+            size_t const offset_T = base_offset_T + stride_offset;
+            size_t const offset_TN = offset_T / elems_per_vec;       // Convert to vector offset
+            if (!oneShot)
                 multimemStore<T, TN>(reinterpret_cast<T*>(residual_out + offset_TN), v[i]);
-            }
+            else
+                residual_out[offset_TN] = v[i];
         }
 
         // RMS normalization: each block processes exactly one token
@@ -244,7 +239,10 @@ __global__ void fusedAllReduceRMSNormKernel(ncclWindow_t input_win, ncclWindow_t
             int const stride_offset = i * kWarpSize * elems_per_vec; // Scale stride by elements per vector
             size_t const offset_T = base_offset_T + stride_offset;
             size_t const offset_TN = offset_T / elems_per_vec;       // Convert to vector offset
-            multimemStore<T, TN>(reinterpret_cast<T*>(recv_ptr + offset_TN), v[i]);
+            if (!oneShot)
+                multimemStore<T, TN>(reinterpret_cast<T*>(recv_ptr + offset_TN), v[i]);
+            else
+                recv_ptr[offset_TN] = v[i];
         }
     }
     bar.sync(ncclCoopCta(), cuda::memory_order_release);

@@ -537,7 +537,7 @@ private:
             // Get cached launch config from NCCLUserBufferAllocator
             std::shared_ptr<tensorrt_llm::kernels::nccl_device::LaunchConfig> launchConfig
                 = nccl_ub_allocator.getCachedNCCLDeviceLaunchConfig(
-                    mType, hidden_size, num_tokens, rank, nRanks, true, false, true);
+                    mType, hidden_size, num_tokens, rank, nRanks, true, false);
 
             // Check if multimem is supported for this data type
             if (launchConfig->supportsMultimem())

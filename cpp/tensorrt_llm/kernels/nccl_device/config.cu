@@ -25,14 +25,14 @@ std::pair<int, int> LaunchConfig::pickLaunchCombo(std::vector<std::pair<int, int
 }
 
 LaunchConfig::LaunchConfig(int const hidden_dim, int const num_tokens, int const rank, int const nRanks,
-    bool useResidual, bool useBias, bool unshardResidualOut, int const num_sms)
+    bool useResidual, bool useBias, int const num_sms)
     : hidden_dim(hidden_dim)
     , num_tokens(num_tokens)
     , rank(rank)
     , nRanks(nRanks)
     , useResidual(useResidual)
     , useBias(useBias)
-    , unshardResidualOut(unshardResidualOut)
+    , oneShot(true)
     , token_per_rank(-1)
     , start_token(-1)
     , num_sms(num_sms)
@@ -40,12 +40,6 @@ LaunchConfig::LaunchConfig(int const hidden_dim, int const num_tokens, int const
     , threadsPerBlock(0)
     , unrollFactor(0)
 {
-    // Distribute tokens across ranks: first 'remainder' ranks get one extra token
-    int const base_tokens = num_tokens / nRanks;
-    int const remainder = num_tokens % nRanks;
-    token_per_rank = base_tokens + (rank < remainder ? 1 : 0);
-    start_token = rank * base_tokens + std::min(rank, remainder);
-
     // Query GPU SM count if not specified
     if (this->num_sms == -1)
     {
@@ -90,6 +84,21 @@ LaunchConfig::LaunchConfig(int const hidden_dim, int const num_tokens, int const
         this->num_sms = local_sms;
 #endif
     }
+
+    if (this->oneShot)
+    {
+        // In one shot mode, each rank processes all tokens
+        this->token_per_rank = num_tokens;
+        this->start_token = 0;
+    }
+    else
+    {
+        // Distribute tokens across ranks: first 'remainder' ranks get one extra token
+        int const base_tokens = num_tokens / nRanks;
+        int const remainder = num_tokens % nRanks;
+        this->token_per_rank = base_tokens + (rank < remainder ? 1 : 0);
+        this->start_token = rank * base_tokens + std::min(rank, remainder);
+    }
 }
 
 std::string LaunchConfig::getLoggingString() const
@@ -120,8 +129,8 @@ std::string LaunchConfig::getLoggingString() const
 // Template class implementation
 template <typename T>
 TypedLaunchConfig<T>::TypedLaunchConfig(int const hidden_dim, int const num_tokens, int const rank, int const nRanks,
-    bool useResidual, bool useBias, bool unshardResidualOut, int const num_sms)
-    : LaunchConfig(hidden_dim, num_tokens, rank, nRanks, useResidual, useBias, unshardResidualOut, num_sms)
+    bool useResidual, bool useBias, int const num_sms)
+    : LaunchConfig(hidden_dim, num_tokens, rank, nRanks, useResidual, useBias, num_sms)
 {
 
     // Calculate optimal block size to achieve better coverage
@@ -161,19 +170,19 @@ TypedLaunchConfig<T>::TypedLaunchConfig(int const hidden_dim, int const num_toke
 }
 
 std::shared_ptr<LaunchConfig> makeLaunchConfig(nvinfer1::DataType dataType, int const hidden_dim, int const num_tokens,
-    int const rank, int const nRanks, bool useResidual, bool useBias, bool unshardResidualOut, int const num_sms)
+    int const rank, int const nRanks, bool useResidual, bool useBias, int const num_sms)
 {
     switch (dataType)
     {
     case nvinfer1::DataType::kHALF:
         return std::make_shared<TypedLaunchConfig<half>>(
-            hidden_dim, num_tokens, rank, nRanks, useResidual, useBias, unshardResidualOut, num_sms);
+            hidden_dim, num_tokens, rank, nRanks, useResidual, useBias, num_sms);
     case nvinfer1::DataType::kBF16:
         return std::make_shared<TypedLaunchConfig<__nv_bfloat16>>(
-            hidden_dim, num_tokens, rank, nRanks, useResidual, useBias, unshardResidualOut, num_sms);
+            hidden_dim, num_tokens, rank, nRanks, useResidual, useBias, num_sms);
     case nvinfer1::DataType::kFLOAT:
         return std::make_shared<TypedLaunchConfig<float>>(
-            hidden_dim, num_tokens, rank, nRanks, useResidual, useBias, unshardResidualOut, num_sms);
+            hidden_dim, num_tokens, rank, nRanks, useResidual, useBias, num_sms);
     default: TLLM_THROW("Unimplemented data type for fused NCCL AllReduce launches.");
     }
     return nullptr;
@@ -277,29 +286,43 @@ void* TypedLaunchConfig<T>::getKernelPtrForUnroll() const
     using TN = typename VectorType<T>::type;
 
     void* result = nullptr;
-    if (useResidual && useBias && unshardResidualOut)
+    if (oneShot)
     {
-        result = reinterpret_cast<void*>(fusedAllReduceRMSNormKernel<T, TN, Nunroll, true, true, true>);
-    }
-    else if (useResidual && useBias && !unshardResidualOut)
-    {
-        result = reinterpret_cast<void*>(fusedAllReduceRMSNormKernel<T, TN, Nunroll, true, true, false>);
-    }
-    else if (useResidual && !useBias && unshardResidualOut)
-    {
-        result = reinterpret_cast<void*>(fusedAllReduceRMSNormKernel<T, TN, Nunroll, true, false, true>);
-    }
-    else if (useResidual && !useBias && !unshardResidualOut)
-    {
-        result = reinterpret_cast<void*>(fusedAllReduceRMSNormKernel<T, TN, Nunroll, true, false, false>);
-    }
-    else if (!useResidual && useBias)
-    {
-        result = reinterpret_cast<void*>(fusedAllReduceRMSNormKernel<T, TN, Nunroll, false, true, false>);
+        if (useResidual && useBias)
+        {
+            result = reinterpret_cast<void*>(fusedAllReduceRMSNormKernel<T, TN, Nunroll, true, true, true>);
+        }
+        else if (useResidual && !useBias)
+        {
+            result = reinterpret_cast<void*>(fusedAllReduceRMSNormKernel<T, TN, Nunroll, true, false, true>);
+        }
+        else if (!useResidual && useBias)
+        {
+            result = reinterpret_cast<void*>(fusedAllReduceRMSNormKernel<T, TN, Nunroll, false, true, true>);
+        }
+        else
+        {
+            result = reinterpret_cast<void*>(fusedAllReduceRMSNormKernel<T, TN, Nunroll, false, false, true>);
+        }
     }
     else
     {
-        result = reinterpret_cast<void*>(fusedAllReduceRMSNormKernel<T, TN, Nunroll, false, false, false>);
+        if (useResidual && useBias)
+        {
+            result = reinterpret_cast<void*>(fusedAllReduceRMSNormKernel<T, TN, Nunroll, true, true, false>);
+        }
+        else if (useResidual && !useBias)
+        {
+            result = reinterpret_cast<void*>(fusedAllReduceRMSNormKernel<T, TN, Nunroll, true, false, false>);
+        }
+        else if (!useResidual && useBias)
+        {
+            result = reinterpret_cast<void*>(fusedAllReduceRMSNormKernel<T, TN, Nunroll, false, true, false>);
+        }
+        else
+        {
+            result = reinterpret_cast<void*>(fusedAllReduceRMSNormKernel<T, TN, Nunroll, false, false, false>);
+        }
     }
 
     return result;
@@ -397,41 +420,67 @@ void TypedLaunchConfig<T>::launchKernelForUnrollImpl(ncclWindow_t inWindow, nccl
     size_t const sharedMemSize = 0;
 
     // Use the exact same logic as getKernelPtrForUnroll but launch the kernel
-    if (this->useResidual && this->useBias && this->unshardResidualOut)
+    if (this->oneShot)
     {
-        fusedAllReduceRMSNormKernel<T, TN, Nunroll, true, true, true><<<gridDim, blockDim, sharedMemSize, stream>>>(
-            inWindow, outWindow, static_cast<const TN*>(residual), residualOutWindow, static_cast<const TN*>(weight),
-            static_cast<const TN*>(bias), this->start_token, this->hidden_dim, this->token_per_rank, devComm, eps);
-    }
-    else if (this->useResidual && this->useBias && !this->unshardResidualOut)
-    {
-        fusedAllReduceRMSNormKernel<T, TN, Nunroll, true, true, false><<<gridDim, blockDim, sharedMemSize, stream>>>(
-            inWindow, outWindow, static_cast<const TN*>(residual), residualOutWindow, static_cast<const TN*>(weight),
-            static_cast<const TN*>(bias), this->start_token, this->hidden_dim, this->token_per_rank, devComm, eps);
-    }
-    else if (this->useResidual && !this->useBias && this->unshardResidualOut)
-    {
-        fusedAllReduceRMSNormKernel<T, TN, Nunroll, true, false, true><<<gridDim, blockDim, sharedMemSize, stream>>>(
-            inWindow, outWindow, static_cast<const TN*>(residual), residualOutWindow, static_cast<const TN*>(weight),
-            static_cast<const TN*>(bias), this->start_token, this->hidden_dim, this->token_per_rank, devComm, eps);
-    }
-    else if (this->useResidual && !this->useBias && !this->unshardResidualOut)
-    {
-        fusedAllReduceRMSNormKernel<T, TN, Nunroll, true, false, false><<<gridDim, blockDim, sharedMemSize, stream>>>(
-            inWindow, outWindow, static_cast<const TN*>(residual), residualOutWindow, static_cast<const TN*>(weight),
-            static_cast<const TN*>(bias), this->start_token, this->hidden_dim, this->token_per_rank, devComm, eps);
-    }
-    else if (!this->useResidual && this->useBias)
-    {
-        fusedAllReduceRMSNormKernel<T, TN, Nunroll, false, true, false><<<gridDim, blockDim, sharedMemSize, stream>>>(
-            inWindow, outWindow, static_cast<const TN*>(residual), residualOutWindow, static_cast<const TN*>(weight),
-            static_cast<const TN*>(bias), this->start_token, this->hidden_dim, this->token_per_rank, devComm, eps);
+        if (this->useResidual && this->useBias)
+        {
+            fusedAllReduceRMSNormKernel<T, TN, Nunroll, true, true, true>
+                <<<gridDim, blockDim, sharedMemSize, stream>>>(inWindow, outWindow, static_cast<const TN*>(residual),
+                    residualOutWindow, static_cast<const TN*>(weight), static_cast<const TN*>(bias), this->start_token,
+                    this->hidden_dim, this->token_per_rank, devComm, eps);
+        }
+        else if (this->useResidual && !this->useBias)
+        {
+            fusedAllReduceRMSNormKernel<T, TN, Nunroll, true, false, true>
+                <<<gridDim, blockDim, sharedMemSize, stream>>>(inWindow, outWindow, static_cast<const TN*>(residual),
+                    residualOutWindow, static_cast<const TN*>(weight), static_cast<const TN*>(bias), this->start_token,
+                    this->hidden_dim, this->token_per_rank, devComm, eps);
+        }
+        else if (!this->useResidual && this->useBias)
+        {
+            fusedAllReduceRMSNormKernel<T, TN, Nunroll, false, true, true>
+                <<<gridDim, blockDim, sharedMemSize, stream>>>(inWindow, outWindow, static_cast<const TN*>(residual),
+                    residualOutWindow, static_cast<const TN*>(weight), static_cast<const TN*>(bias), this->start_token,
+                    this->hidden_dim, this->token_per_rank, devComm, eps);
+        }
+        else
+        {
+            fusedAllReduceRMSNormKernel<T, TN, Nunroll, false, false, true>
+                <<<gridDim, blockDim, sharedMemSize, stream>>>(inWindow, outWindow, static_cast<const TN*>(residual),
+                    residualOutWindow, static_cast<const TN*>(weight), static_cast<const TN*>(bias), this->start_token,
+                    this->hidden_dim, this->token_per_rank, devComm, eps);
+        }
     }
     else
     {
-        fusedAllReduceRMSNormKernel<T, TN, Nunroll, false, false, false><<<gridDim, blockDim, sharedMemSize, stream>>>(
-            inWindow, outWindow, static_cast<const TN*>(residual), residualOutWindow, static_cast<const TN*>(weight),
-            static_cast<const TN*>(bias), this->start_token, this->hidden_dim, this->token_per_rank, devComm, eps);
+        if (this->useResidual && this->useBias)
+        {
+            fusedAllReduceRMSNormKernel<T, TN, Nunroll, true, true, false>
+                <<<gridDim, blockDim, sharedMemSize, stream>>>(inWindow, outWindow, static_cast<const TN*>(residual),
+                    residualOutWindow, static_cast<const TN*>(weight), static_cast<const TN*>(bias), this->start_token,
+                    this->hidden_dim, this->token_per_rank, devComm, eps);
+        }
+        else if (this->useResidual && !this->useBias)
+        {
+            fusedAllReduceRMSNormKernel<T, TN, Nunroll, true, false, false>
+                <<<gridDim, blockDim, sharedMemSize, stream>>>(inWindow, outWindow, static_cast<const TN*>(residual),
+                    residualOutWindow, static_cast<const TN*>(weight), static_cast<const TN*>(bias), this->start_token,
+                    this->hidden_dim, this->token_per_rank, devComm, eps);
+        }
+        else if (!this->useResidual && this->useBias)
+        {
+            fusedAllReduceRMSNormKernel<T, TN, Nunroll, false, true, false>
+                <<<gridDim, blockDim, sharedMemSize, stream>>>(inWindow, outWindow, static_cast<const TN*>(residual),
+                    residualOutWindow, static_cast<const TN*>(weight), static_cast<const TN*>(bias), this->start_token,
+                    this->hidden_dim, this->token_per_rank, devComm, eps);
+        }
+        else
+        {
+            fusedAllReduceRMSNormKernel<T, TN, Nunroll, false, false, false>
+                <<<gridDim, blockDim, sharedMemSize, stream>>>(inWindow, outWindow, static_cast<const TN*>(residual),
+                    residualOutWindow, static_cast<const TN*>(weight), static_cast<const TN*>(bias), this->start_token,
+                    this->hidden_dim, this->token_per_rank, devComm, eps);
+        }
     }
 #else
     TLLM_THROW("NCCL device kernels not available (NCCL version < 2.28). Cannot launch kernel.");

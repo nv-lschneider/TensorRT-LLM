@@ -44,7 +44,7 @@ public:
     int const rank;
     bool const useResidual;
     bool const useBias;
-    bool const unshardResidualOut;
+    bool const oneShot;
 
 protected:
     int token_per_rank;
@@ -59,7 +59,7 @@ protected:
 public:
     // Constructor with dynamic block size calculation
     LaunchConfig(int const hidden_dim, int const num_tokens, int const rank, int const nRanks, bool useResidual,
-        bool useBias, bool unshardResidualOut, int const num_sms = -1);
+        bool useBias, int const num_sms = -1);
 
     inline int getThreadsPerBlock() const
     {
@@ -101,13 +101,13 @@ public:
 
     // Logging output
     std::string getLoggingString() const;
+
 protected:
     // Pure virtual launch function that must be implemented by derived classes
     virtual void launchKernel(ncclWindow_t inWindow, ncclWindow_t outWindow, void const* const residual,
         ncclWindow_t residualOutWindow, void const* const weight, void const* const bias, ncclDevComm devComm,
         float const eps, cudaStream_t stream) const
         = 0;
-
 };
 
 // Kernel launch information helper class
@@ -154,7 +154,7 @@ public:
 
     // Constructor with dynamic block size calculation
     TypedLaunchConfig(int const hidden_dim, int const num_tokens, int const rank, int const nRanks, bool useResidual,
-        bool useBias, bool unshardResidualOut, int const num_sms = -1);
+        bool useBias, int const num_sms = -1);
 
     nvinfer1::DataType getDataType() const
     {
@@ -173,7 +173,7 @@ public:
 };
 
 std::shared_ptr<LaunchConfig> makeLaunchConfig(nvinfer1::DataType dataType, int const hidden_dim, int const num_tokens,
-    int const rank, int const nRanks, bool useResidual, bool useBias, bool unshardResidualOut, int const num_sms = -1);
+    int const rank, int const nRanks, bool useResidual, bool useBias, int const num_sms = -1);
 
 } // namespace tensorrt_llm::kernels::nccl_device
 

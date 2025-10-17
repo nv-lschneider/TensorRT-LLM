@@ -158,7 +158,7 @@ public:
     // Cached NCCL device launch config functionality
     std::shared_ptr<tensorrt_llm::kernels::nccl_device::LaunchConfig> getCachedNCCLDeviceLaunchConfig(
         nvinfer1::DataType dataType, int const hidden_dim, int const num_tokens, int const rank, int const nRanks,
-        bool useResidual, bool useBias, bool unshardResidualOut);
+        bool useResidual, bool useBias);
 
 private:
     std::shared_ptr<ncclComm_t> mComm;
@@ -175,13 +175,12 @@ private:
         int nRanks;
         bool useResidual;
         bool useBias;
-        bool unshardResidualOut;
 
         bool operator<(LaunchConfigKey const& other) const
         {
-            return std::tie(dataType, hidden_dim, num_tokens, rank, nRanks, useResidual, useBias, unshardResidualOut)
+            return std::tie(dataType, hidden_dim, num_tokens, rank, nRanks, useResidual, useBias)
                 < std::tie(other.dataType, other.hidden_dim, other.num_tokens, other.rank, other.nRanks,
-                    other.useResidual, other.useBias, other.unshardResidualOut);
+                    other.useResidual, other.useBias);
         }
     };
 
