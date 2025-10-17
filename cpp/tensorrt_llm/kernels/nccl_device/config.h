@@ -44,9 +44,9 @@ public:
     int const rank;
     bool const useResidual;
     bool const useBias;
-    bool const oneShot;
 
 protected:
+    bool oneShot;
     int token_per_rank;
     int start_token;
     int num_sms;

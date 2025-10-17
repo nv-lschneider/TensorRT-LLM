@@ -93,9 +93,10 @@ __global__ void fusedAllReduceRMSNormKernel(ncclWindow_t input_win, ncclWindow_t
         ncclCoopCta(), devComm, ncclTeamLsa(devComm), devComm.lsaBarrier, blockIdx.x, true, devComm.lsaMultimem};
     bar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
 
+    int const token_offset = blockIdx.x;
     // Calculate which token this block should process
-
-    for (int token_offset = blockIdx.x; token_offset < tokensPerRank; token_offset += gridDim.x)
+    //for (int token_offset = blockIdx.x; token_offset < tokensPerRank; token_offset += gridDim.x)
+    if (token_offset < tokensPerRank)
     {
         int const token_id = token_offset + startToken;
         // Calculate elements per vector type

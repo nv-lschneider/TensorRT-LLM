@@ -40,62 +40,27 @@ LaunchConfig::LaunchConfig(int const hidden_dim, int const num_tokens, int const
     , threadsPerBlock(0)
     , unrollFactor(0)
 {
-    // Query GPU SM count if not specified
-    if (this->num_sms == -1)
-    {
-        int local_sms = 1;
-        int dev = -1;
-        cudaError_t cudaStatus = cudaGetDevice(&dev);
-        if (cudaStatus == cudaSuccess)
-        {
-            cudaDeviceProp deviceProp;
-            cudaStatus = cudaGetDeviceProperties(&deviceProp, dev);
-            if (cudaStatus == cudaSuccess)
-            {
-                local_sms = deviceProp.multiProcessorCount;
-            }
-            else
-            {
-                TLLM_LOG_WARNING("Failed to get device properties for SM count: %s. Using default num_sms=1.",
-                    cudaGetErrorString(cudaStatus));
-            }
-        }
-        else
-        {
-            TLLM_LOG_WARNING(
-                "Failed to get CUDA device for SM count: %s. Using default num_sms=1.", cudaGetErrorString(cudaStatus));
-        }
+    // No grid-stride
+    int const base_tokens = num_tokens / nRanks;
+    this->num_sms = base_tokens;
+    int const remainder = num_tokens % nRanks;
+    if (remainder > 0 )
+        this->num_sms += 1;
 
-        // Coordinate SM count across all ranks using MPI_Allreduce with MIN operation
-        // This ensures all ranks use the same (minimum) number of SMs
-#if ENABLE_MULTI_DEVICE
-        try
-        {
-            COMM_SESSION.allreduce(
-                &local_sms, &this->num_sms, 1, tensorrt_llm::mpi::MpiType::kINT32, tensorrt_llm::mpi::MpiOp::MIN);
-            TLLM_LOG_DEBUG("Coordinated num_sms across ranks: local=%d, min=%d", local_sms, this->num_sms);
-        }
-        catch (std::exception const& e)
-        {
-            TLLM_LOG_WARNING("Failed to coordinate SM count via MPI: %s. Using local value: %d", e.what(), local_sms);
-            this->num_sms = local_sms;
-        }
-#else
-        this->num_sms = local_sms;
-#endif
-    }
-
+    // TODO hard coded value for now. Maybe some tuning possible
+    if (num_tokens <= 32)
+        this->oneShot = true;
+    
     if (this->oneShot)
     {
         // In one shot mode, each rank processes all tokens
         this->token_per_rank = num_tokens;
         this->start_token = 0;
+        this->num_sms = num_tokens;
     }
     else
     {
         // Distribute tokens across ranks: first 'remainder' ranks get one extra token
-        int const base_tokens = num_tokens / nRanks;
-        int const remainder = num_tokens % nRanks;
         this->token_per_rank = base_tokens + (rank < remainder ? 1 : 0);
         this->start_token = rank * base_tokens + std::min(rank, remainder);
     }
