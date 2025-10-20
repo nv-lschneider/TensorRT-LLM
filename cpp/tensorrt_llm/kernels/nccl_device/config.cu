@@ -32,7 +32,7 @@ LaunchConfig::LaunchConfig(int const hidden_dim, int const num_tokens, int const
     , nRanks(nRanks)
     , useResidual(useResidual)
     , useBias(useBias)
-    , oneShot(true)
+    , oneShot(false)
     , token_per_rank(-1)
     , start_token(-1)
     , num_sms(num_sms)
@@ -50,7 +50,7 @@ LaunchConfig::LaunchConfig(int const hidden_dim, int const num_tokens, int const
     // TODO hard coded value for now. Maybe some tuning possible
     if (num_tokens <= 32)
         this->oneShot = true;
-    
+
     if (this->oneShot)
     {
         // In one shot mode, each rank processes all tokens

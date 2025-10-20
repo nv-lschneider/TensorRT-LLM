@@ -109,9 +109,9 @@ def run_single_rank_ar_rms_norm(tensor_parallel_size, a, b, c, gamma):
             rank=rank,
         )
         ar = AllReduce(mapping=mapping,
-                       strategy=AllReduceStrategy.NCCL_SYMMETRIC)
+                       strategy=AllReduceStrategy.NCCL_DEVICE)
         ar_params = AllReduceParams(
-            strategy=AllReduceStrategy.NCCL_SYMMETRIC,
+            strategy=AllReduceStrategy.NCCL_DEVICE,
             fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
             residual=c,
             norm_weight=gamma,

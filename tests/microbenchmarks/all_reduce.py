@@ -85,9 +85,10 @@ def allreduce_benchmark(
     inner_loop = 1200
     outer_loop = 10
 
+    hidden_size = 4096
     size = min_size
-    hidden_size = size
-    bs = 1
+    hidden_size = min(size, hidden_size)
+    bs = size // hidden_size
     if mapping.rank == 0 and not no_header:
         print(
             f"{'world_size':<15}, {'dtype':<10}, {'tensor size (B)':<15}, {'strategy':<10}, {'fusion':<20}, {'version':<10}, {'duration (ms)':<10}"
@@ -189,7 +190,7 @@ def allreduce_benchmark(
                         )
 
         size *= ratio
-        if hidden_size * ratio > 4096:
+        if hidden_size * ratio > hidden_size:
             bs *= ratio
         else:
             hidden_size *= ratio
