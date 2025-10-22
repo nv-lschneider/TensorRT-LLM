@@ -10,8 +10,8 @@
 #include "kernels.h"
 #endif
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "vector_types.h"
 #include <cuda_runtime.h>
 #include <iostream>
@@ -45,7 +45,7 @@ LaunchConfig::LaunchConfig(int const hidden_dim, int const num_tokens, int const
     int const base_tokens = num_tokens / nRanks;
     this->num_sms = base_tokens;
     int const remainder = num_tokens % nRanks;
-    if (remainder > 0 )
+    if (remainder > 0)
         this->num_sms += 1;
 
     // TODO hard coded value for now. Maybe some tuning possible
@@ -69,14 +69,13 @@ LaunchConfig::LaunchConfig(int const hidden_dim, int const num_tokens, int const
     auto maxCTAEnv = tensorrt_llm::common::getIntEnv("TLLM_NCCL_DEVICE_AR_RMS_MAX_CTA");
     if (maxCTAEnv.has_value())
     {
-        if(maxCTAEnv.value() > 0)
+        if (maxCTAEnv.value() > 0)
             this->num_sms = maxCTAEnv.value();
         else
         {
             TLLM_LOG_WARNING("TLLM_NCCL_DEVICE_AR_RMS_MAX_CTA was detected as <= 0 and is ignored.");
         }
     }
-
 }
 
 std::string LaunchConfig::getLoggingString() const
@@ -191,25 +190,25 @@ bool TypedLaunchConfig<T>::isValidConfig(int threadsPerBlock, int unrollFactor) 
         return false;
     }
 
-    // 1. Check threads per block limits
+    // Check threads per block limits
     if (threadsPerBlock <= 0 || threadsPerBlock > deviceProp.maxThreadsPerBlock)
     {
         return false;
     }
 
-    // 2. Check warp size alignment
+    // Check warp size alignment
     if (threadsPerBlock % deviceProp.warpSize != 0)
     {
         return false;
     }
 
-    // 3. Check unroll factor validity
+    // Check unroll factor validity
     if (unrollFactor <= 0 || unrollFactor > kMaxUnrollFactor)
     {
         return false;
     }
 
-    // 6. Query actual kernel resource usage from kernel pointer for the specific unroll factor
+    // Query actual kernel resource usage from kernel pointer for the specific unroll factor
     void* kernelPtr = this->getKernelPtrForUnrollFactor(unrollFactor);
     if (kernelPtr == nullptr)
     {
@@ -239,7 +238,7 @@ bool TypedLaunchConfig<T>::isValidConfig(int threadsPerBlock, int unrollFactor) 
         return false;
     }
 
-    // 8. Check occupancy
+    // Check occupancy
     int const warpsPerBlock = threadsPerBlock / deviceProp.warpSize;
     int const maxWarpsPerSM = deviceProp.maxThreadsPerMultiProcessor / deviceProp.warpSize;
     int const maxBlocksPerSM = deviceProp.maxThreadsPerMultiProcessor / threadsPerBlock;

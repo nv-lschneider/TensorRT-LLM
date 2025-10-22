@@ -108,8 +108,7 @@ def run_single_rank_ar_rms_norm(tensor_parallel_size, a, b, c, gamma):
             tp_size=tensor_parallel_size,
             rank=rank,
         )
-        ar = AllReduce(mapping=mapping,
-                       strategy=AllReduceStrategy.NCCL_DEVICE)
+        ar = AllReduce(mapping=mapping, strategy=AllReduceStrategy.NCCL_DEVICE)
         ar_params = AllReduceParams(
             strategy=AllReduceStrategy.NCCL_DEVICE,
             fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
@@ -144,7 +143,7 @@ def run_single_rank_ar_rms_norm(tensor_parallel_size, a, b, c, gamma):
         chunk_start = rank * residual_chunk_size
         chunk_end = min((rank + 1) * residual_chunk_size, ref_residual.size(0))
 
-        # If we do perform the AllGaterh implicitly we can compare the entire tensor.
+        # If we do perform the AllGather implicitly we can compare the entire tensor.
         if not chunked_residual_comparison:
             chunk_start = 0
             chunk_end = ref_residual.size(0)
