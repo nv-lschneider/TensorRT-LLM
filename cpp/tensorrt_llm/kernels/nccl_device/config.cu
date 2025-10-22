@@ -11,6 +11,7 @@
 #endif
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "vector_types.h"
 #include <cuda_runtime.h>
 #include <iostream>
@@ -64,6 +65,18 @@ LaunchConfig::LaunchConfig(int const hidden_dim, int const num_tokens, int const
         this->token_per_rank = base_tokens + (rank < remainder ? 1 : 0);
         this->start_token = rank * base_tokens + std::min(rank, remainder);
     }
+
+    auto maxCTAEnv = tensorrt_llm::common::getIntEnv("TLLM_NCCL_DEVICE_AR_RMS_MAX_CTA");
+    if (maxCTAEnv.has_value())
+    {
+        if(maxCTAEnv.value() > 0)
+            this->num_sms = maxCTAEnv.value();
+        else
+        {
+            TLLM_LOG_WARNING("TLLM_NCCL_DEVICE_AR_RMS_MAX_CTA was detected as <= 0 and is ignored.");
+        }
+    }
+
 }
 
 std::string LaunchConfig::getLoggingString() const
