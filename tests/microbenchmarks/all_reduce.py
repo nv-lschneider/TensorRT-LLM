@@ -13,7 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
+import sys
 from argparse import ArgumentParser
+from contextlib import redirect_stderr, redirect_stdout
 
 # isort: off
 import torch
@@ -32,6 +35,65 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._utils import local_mpi_rank, local_mpi_size
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.functional import AllReduceParams, AllReduceStrategy
+
+
+def check_mnnvl_available():
+    """Check if MNNVL is available on this system"""
+    try:
+        from tensorrt_llm._mnnvl_utils import supports_mnnvl
+        return supports_mnnvl()
+    except Exception:
+        return False
+
+
+def verify_strategy_active(allreduce_module, requested_strategy, rank):
+    """
+    Verify that the requested strategy is actually active in the AllReduce module.
+
+    Returns:
+        tuple: (is_active: bool, actual_implementation: str, message: str)
+    """
+    if requested_strategy == AllReduceStrategy.MNNVL:
+        # Check if MNNVL implementation is active
+        has_mnnvl = hasattr(allreduce_module, 'mnnvl_allreduce') and \
+                    allreduce_module.mnnvl_allreduce is not None
+
+        if has_mnnvl:
+            return True, "MNNVL", "MNNVL AllReduce is active"
+        else:
+            # MNNVL requested but not active - likely fell back to C++ plugin
+            return False, "C++ Plugin (likely NCCL)", \
+                   "MNNVL requested but module does not have active mnnvl_allreduce. Likely fell back to NCCL via C++ plugin."
+
+    # For other strategies, we can't easily verify, so assume they're working
+    return True, requested_strategy.name, f"{requested_strategy.name} assumed active"
+
+
+def capture_trtllm_logs(func, *args, **kwargs):
+    """
+    Execute a function and capture both Python stdout/stderr and C++ logs.
+
+    Returns:
+        tuple: (result, captured_output: str)
+    """
+    # Capture Python output
+    stdout_capture = io.StringIO()
+    stderr_capture = io.StringIO()
+
+    # Flush any pending output first
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    try:
+        with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
+            result = func(*args, **kwargs)
+
+        output = stdout_capture.getvalue() + stderr_capture.getvalue()
+        return result, output
+    except Exception as e:
+        output = stdout_capture.getvalue() + stderr_capture.getvalue()
+        raise RuntimeError(
+            f"Function failed with: {e}\nCaptured output:\n{output}") from e
 
 
 def parse_args():
@@ -189,8 +251,70 @@ def run_benchmark(args):
                                           False)
     # NCCL, MIN_LATENCY, MNNVL don't need UB initialization
 
-    # Create AllReduce module (pass dtype for MNNVL support)
-    allreduce = AllReduce(mapping=mapping, strategy=strategy, dtype=torch_dtype)
+    # Pre-flight check for MNNVL
+    if strategy == AllReduceStrategy.MNNVL:
+        if rank == 0:
+            if not check_mnnvl_available():
+                print(
+                    f"ERROR: MNNVL strategy requested but MNNVL is not available on this system",
+                    file=sys.stderr,
+                    flush=True)
+                print(f"Possible reasons:", file=sys.stderr)
+                print(f"  - System is not ARM64/aarch64", file=sys.stderr)
+                print(
+                    f"  - NVLink is not available or not all links are active",
+                    file=sys.stderr)
+                print(f"  - MNNVL dependencies not met",
+                      file=sys.stderr,
+                      flush=True)
+                sys.exit(1)
+            else:
+                print(f"MNNVL pre-flight check: PASSED", flush=True)
+
+    # Create AllReduce module (pass dtype for MNNVL support) and capture logs
+    def create_allreduce():
+        return AllReduce(mapping=mapping, strategy=strategy, dtype=torch_dtype)
+
+    allreduce, init_logs = capture_trtllm_logs(create_allreduce)
+
+    # Check for fallback messages in logs
+    fallback_indicators = [
+        "fallback to AllReduceStrategy",
+        "Since Peer to Peer not supported",
+    ]
+
+    detected_fallback = any(indicator in init_logs
+                            for indicator in fallback_indicators)
+
+    if rank == 0 and detected_fallback:
+        print(f"\nWARNING: Detected fallback during AllReduce initialization:",
+              flush=True)
+        print(f"Strategy requested: {strategy.name}", flush=True)
+        print(f"Captured logs:\n{init_logs}", flush=True)
+
+    # Verify the requested strategy is actually active
+    is_active, actual_impl, verify_msg = verify_strategy_active(
+        allreduce, strategy, rank)
+
+    if rank == 0:
+        print(
+            f"Strategy verification: requested={strategy.name}, actual={actual_impl}",
+            flush=True)
+        print(f"  Details: {verify_msg}", flush=True)
+
+    if not is_active:
+        if rank == 0:
+            print(f"\nERROR: Requested strategy {strategy.name} is not active!",
+                  file=sys.stderr,
+                  flush=True)
+            print(f"The AllReduce module fell back to: {actual_impl}",
+                  file=sys.stderr,
+                  flush=True)
+            if init_logs:
+                print(f"Initialization logs:\n{init_logs}",
+                      file=sys.stderr,
+                      flush=True)
+        sys.exit(1)
 
     # Print header
     if rank == 0:
@@ -205,6 +329,13 @@ def run_benchmark(args):
 
     # Benchmark each fusion operation
     for fusion_op in fusion_ops:
+        # Skip NONE fusion for UB strategy (UB doesn't support NONE)
+        if strategy == AllReduceStrategy.UB and fusion_op == AllReduceFusionOp.NONE:
+            if rank == 0:
+                print(
+                    f"Skipping {strategy.name} with {fusion_op.name} (not supported)",
+                    flush=True)
+            continue
 
         # Iterate over token counts
         num_tokens = min_tokens
