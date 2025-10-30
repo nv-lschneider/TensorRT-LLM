@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
+import io
+import sys
 from argparse import ArgumentParser
 from dataclasses import dataclass
 from typing import List, Optional
@@ -255,10 +258,20 @@ def execute_benchmark(config: BenchmarkConfig) -> bool:
               f"{'duration (ms)':<12}")
 
     # Create allreduce module with dtype for MNNVL support
+    # Capture logs to detect fallback
     try:
-        allreduce = AllReduce(mapping=config.mapping,
-                              strategy=config.strategy,
-                              dtype=config.torch_dtype)
+        with capture_trtllm_logs() as log_lines:
+            allreduce = AllReduce(mapping=config.mapping,
+                                  strategy=config.strategy,
+                                  dtype=config.torch_dtype)
+
+            # Check if initialization caused a fallback
+            fallback_msg = check_for_strategy_fallback(log_lines,
+                                                       config.strategy)
+            if fallback_msg:
+                if config.mapping.rank == 0:
+                    print(f"Skipping {config.strategy.name}: {fallback_msg}")
+                return False
     except Exception as e:
         if config.mapping.rank == 0:
             print(
@@ -279,6 +292,25 @@ def execute_benchmark(config: BenchmarkConfig) -> bool:
             input_tensor = torch.ones((num_tokens, config.hidden_size),
                                       dtype=config.torch_dtype,
                                       device="cuda")
+
+            # Capture logs during first allreduce call to detect runtime fallback
+            log_lines_run = []
+            with capture_trtllm_logs() as log_lines_run:
+                # Do a test call to see if it falls back at runtime
+                test_params = AllReduceParams(fusion_op=config.fusion_op)
+
+                # First call might trigger runtime fallback detection
+                _ = allreduce(input_tensor, all_reduce_params=test_params)
+
+            # Check for runtime fallback
+            fallback_msg = check_for_strategy_fallback(log_lines_run,
+                                                       config.strategy)
+            if fallback_msg:
+                if config.mapping.rank == 0:
+                    print(
+                        f"Skipping {config.strategy.name} (num_tokens={num_tokens}): "
+                        f"{fallback_msg}")
+                return False
 
             # Setup parameters based on fusion operation
             if config.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
@@ -386,6 +418,82 @@ def execute_benchmark(config: BenchmarkConfig) -> bool:
             return False
 
     return True
+
+
+@contextlib.contextmanager
+def capture_trtllm_logs():
+    """
+    Capture TensorRT-LLM log output to detect fallback messages.
+
+    Yields:
+        A list that will be populated with log lines
+    """
+    captured_lines = []
+
+    # TRT-LLM logs go to stdout/stderr, so we need to capture both
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+
+    class LogCapture:
+
+        def __init__(self, original_stream):
+            self.original_stream = original_stream
+            self.buffer = io.StringIO()
+
+        def write(self, text):
+            self.original_stream.write(text)
+            self.original_stream.flush()
+            captured_lines.append(text)
+
+        def flush(self):
+            self.original_stream.flush()
+
+        def __getattr__(self, name):
+            return getattr(self.original_stream, name)
+
+    try:
+        # Note: We still write to original streams so user sees output
+        sys.stdout = LogCapture(original_stdout)
+        sys.stderr = LogCapture(original_stderr)
+        yield captured_lines
+    finally:
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+
+
+def check_for_strategy_fallback(
+        log_lines: List[str],
+        expected_strategy: AllReduceStrategy) -> Optional[str]:
+    """
+    Check captured logs for fallback messages indicating strategy couldn't run.
+
+    Args:
+        log_lines: List of captured log lines
+        expected_strategy: The strategy that was requested
+
+    Returns:
+        Error message if fallback detected, None otherwise
+    """
+    # Look for the telltale fallback messages from C++
+    fallback_indicators = [
+        "fallback to AllReduceStrategy: NCCL",
+        "fallback to AllReduceStrategy:",
+        "Since Peer to Peer not supported",
+        "Since messageSize is greater than maxWorkspaceSize",
+        "Since messageSize > maxWorkspace",
+        "Since not aligned",
+    ]
+
+    log_text = "".join(log_lines)
+
+    for indicator in fallback_indicators:
+        if indicator in log_text:
+            # Don't flag NCCL strategy itself as having fallen back
+            if expected_strategy == AllReduceStrategy.NCCL:
+                continue
+            return f"Strategy fell back (detected: '{indicator}')"
+
+    return None
 
 
 def check_strategy_viable(strategy: AllReduceStrategy,
@@ -510,13 +618,19 @@ def main():
     parser.add_argument(
         "--strategy",
         type=str,
+        nargs='*',
         default=None,
-        help="Test only specific strategy (e.g., MNNVL, NCCL_DEVICE, UB)")
+        help=
+        "Test specific strategies (e.g., --strategy MNNVL NCCL_DEVICE or --strategy MNNVL,NCCL_DEVICE)"
+    )
     parser.add_argument(
         "--fusion-op",
         type=str,
+        nargs='*',
         default=None,
-        help="Test only specific fusion op (e.g., NONE, RESIDUAL_RMS_NORM)")
+        help=
+        "Test specific fusion ops (e.g., --fusion-op NONE RESIDUAL_RMS_NORM or --fusion-op NONE,RESIDUAL_RMS_NORM)"
+    )
     parser.add_argument("--inner-loop",
                         type=int,
                         default=1200,
@@ -540,9 +654,19 @@ def main():
             "MNNVL": AllReduceStrategy.MNNVL,
             "UB": AllReduceStrategy.UB,
         }
-        if args.strategy.upper() not in strategy_map:
-            raise ValueError(f"Unknown strategy: {args.strategy}")
-        strategies = [strategy_map[args.strategy.upper()]]
+
+        # Parse strategies - support both space-separated and comma-separated
+        strategy_names = []
+        for arg in args.strategy:
+            # Split by comma in case user provides --strategy MNNVL,NCCL
+            strategy_names.extend([s.strip() for s in arg.split(',')])
+
+        # Convert to strategy enums
+        strategies = []
+        for name in strategy_names:
+            if name.upper() not in strategy_map:
+                raise ValueError(f"Unknown strategy: {name}")
+            strategies.append(strategy_map[name.upper()])
     else:
         strategies = get_default_strategies()
 
@@ -552,9 +676,19 @@ def main():
             "NONE": AllReduceFusionOp.NONE,
             "RESIDUAL_RMS_NORM": AllReduceFusionOp.RESIDUAL_RMS_NORM,
         }
-        if args.fusion_op.upper() not in fusion_map:
-            raise ValueError(f"Unknown fusion op: {args.fusion_op}")
-        fusion_ops = [fusion_map[args.fusion_op.upper()]]
+
+        # Parse fusion ops - support both space-separated and comma-separated
+        fusion_names = []
+        for arg in args.fusion_op:
+            # Split by comma in case user provides --fusion-op NONE,RESIDUAL_RMS_NORM
+            fusion_names.extend([f.strip() for f in arg.split(',')])
+
+        # Convert to fusion op enums
+        fusion_ops = []
+        for name in fusion_names:
+            if name.upper() not in fusion_map:
+                raise ValueError(f"Unknown fusion op: {name}")
+            fusion_ops.append(fusion_map[name.upper()])
     else:
         fusion_ops = get_default_fusion_ops()
 
