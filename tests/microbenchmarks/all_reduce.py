@@ -258,20 +258,10 @@ def execute_benchmark(config: BenchmarkConfig) -> bool:
               f"{'duration (ms)':<12}")
 
     # Create allreduce module with dtype for MNNVL support
-    # Capture logs to detect fallback
     try:
-        with capture_trtllm_logs() as log_lines:
-            allreduce = AllReduce(mapping=config.mapping,
-                                  strategy=config.strategy,
-                                  dtype=config.torch_dtype)
-
-            # Check if initialization caused a fallback
-            fallback_msg = check_for_strategy_fallback(log_lines,
-                                                       config.strategy)
-            if fallback_msg:
-                if config.mapping.rank == 0:
-                    print(f"Skipping {config.strategy.name}: {fallback_msg}")
-                return False
+        allreduce = AllReduce(mapping=config.mapping,
+                              strategy=config.strategy,
+                              dtype=config.torch_dtype)
     except Exception as e:
         if config.mapping.rank == 0:
             print(
@@ -280,6 +270,8 @@ def execute_benchmark(config: BenchmarkConfig) -> bool:
 
     # Iterate over token counts
     num_tokens = config.min_tokens
+    first_iteration = True
+
     while num_tokens <= config.max_tokens:
         try:
             # Skip large fusion ops for very large token counts
@@ -292,25 +284,6 @@ def execute_benchmark(config: BenchmarkConfig) -> bool:
             input_tensor = torch.ones((num_tokens, config.hidden_size),
                                       dtype=config.torch_dtype,
                                       device="cuda")
-
-            # Capture logs during first allreduce call to detect runtime fallback
-            log_lines_run = []
-            with capture_trtllm_logs() as log_lines_run:
-                # Do a test call to see if it falls back at runtime
-                test_params = AllReduceParams(fusion_op=config.fusion_op)
-
-                # First call might trigger runtime fallback detection
-                _ = allreduce(input_tensor, all_reduce_params=test_params)
-
-            # Check for runtime fallback
-            fallback_msg = check_for_strategy_fallback(log_lines_run,
-                                                       config.strategy)
-            if fallback_msg:
-                if config.mapping.rank == 0:
-                    print(
-                        f"Skipping {config.strategy.name} (num_tokens={num_tokens}): "
-                        f"{fallback_msg}")
-                return False
 
             # Setup parameters based on fusion operation
             if config.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
@@ -344,6 +317,24 @@ def execute_benchmark(config: BenchmarkConfig) -> bool:
                     if config.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
                         input = input[0]
                 return input
+
+            # On first iteration, do a test call to detect fallback
+            if first_iteration:
+                with capture_trtllm_logs() as log_lines_run:
+                    # Do a test warmup call
+                    _ = func(input_tensor)
+
+                # Check for runtime fallback
+                fallback_msg = check_for_strategy_fallback(
+                    log_lines_run, config.strategy)
+                if fallback_msg:
+                    if config.mapping.rank == 0:
+                        print(
+                            f"Skipping {config.strategy.name} with {config.fusion_op.name}: "
+                            f"{fallback_msg}")
+                    return False
+
+                first_iteration = False
 
             # Setup timing events
             start_events = [
@@ -411,10 +402,11 @@ def execute_benchmark(config: BenchmarkConfig) -> bool:
             num_tokens *= config.ratio
 
         except Exception as e:
+            error_msg = str(e) if str(e) else type(e).__name__
             if config.mapping.rank == 0:
                 print(
-                    f"Skipping {config.strategy.name} (num_tokens={num_tokens}): "
-                    f"Runtime error - {e}")
+                    f"Skipping {config.strategy.name} with {config.fusion_op.name} "
+                    f"(num_tokens={num_tokens}): Runtime error - {error_msg}")
             return False
 
     return True
