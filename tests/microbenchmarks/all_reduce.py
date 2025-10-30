@@ -76,7 +76,63 @@ def parse_args():
                         type=int,
                         default=10,
                         help="Number of outer loop iterations for timing")
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # Validate and convert strategy
+    strategy_map = {
+        "NCCL": AllReduceStrategy.NCCL,
+        "MIN_LATENCY": AllReduceStrategy.MIN_LATENCY,
+        "NCCL_SYMMETRIC": AllReduceStrategy.NCCL_SYMMETRIC,
+        "NCCL_DEVICE": AllReduceStrategy.NCCL_DEVICE,
+        "MNNVL": AllReduceStrategy.MNNVL,
+        "UB": AllReduceStrategy.UB,
+    }
+    strategy_name = args.strategy.strip().upper()
+    if strategy_name not in strategy_map:
+        parser.error(f"Unknown strategy: {args.strategy}. "
+                     f"Valid options: {', '.join(strategy_map.keys())}")
+    args.strategy = strategy_map[strategy_name]
+
+    # Validate and convert fusion ops
+    if args.fusion_op:
+        fusion_map = {
+            "NONE": AllReduceFusionOp.NONE,
+            "RESIDUAL_RMS_NORM": AllReduceFusionOp.RESIDUAL_RMS_NORM,
+        }
+        fusion_ops = []
+        for arg in args.fusion_op:
+            for name in arg.split(','):
+                name = name.strip().upper()
+                if name not in fusion_map:
+                    parser.error(
+                        f"Unknown fusion op: {name}. "
+                        f"Valid options: {', '.join(fusion_map.keys())}")
+                fusion_ops.append(fusion_map[name])
+        args.fusion_op = fusion_ops
+    else:
+        # Default: test both NONE and RESIDUAL_RMS_NORM
+        args.fusion_op = [
+            AllReduceFusionOp.NONE, AllReduceFusionOp.RESIDUAL_RMS_NORM
+        ]
+
+    # Parse token range
+    try:
+        min_tokens, max_tokens, ratio = [
+            int(i) for i in args.token_range.split(",")
+        ]
+        if min_tokens <= 0 or max_tokens <= 0 or ratio <= 0:
+            parser.error("Token range values must be positive")
+        if min_tokens > max_tokens:
+            parser.error("min_tokens must be <= max_tokens")
+        args.min_tokens = min_tokens
+        args.max_tokens = max_tokens
+        args.ratio = ratio
+    except ValueError:
+        parser.error(
+            "Invalid token-range format. Expected: min,max,ratio (e.g., 1,65536,4)"
+        )
+
+    return args
 
 
 def run_benchmark(args):
@@ -84,7 +140,11 @@ def run_benchmark(args):
     Run the AllReduce benchmark with the given arguments.
 
     Args:
-        args: Parsed command line arguments
+        args: Parsed and validated arguments with:
+            - strategy: AllReduceStrategy enum
+            - fusion_op: List of AllReduceFusionOp enums
+            - min_tokens, max_tokens, ratio: Parsed integers
+            - dtype, hidden_size, enable_cudagraph, inner_loop, outer_loop
     """
     # MPI setup
     world_size = tllm.mpi_world_size()
@@ -104,57 +164,25 @@ def run_benchmark(args):
     torch_dtype = tllm._utils.str_dtype_to_torch(args.dtype)
     dtype_size_bytes = torch_dtype.itemsize
 
-    # Parse token range
-    min_tokens, max_tokens, ratio = [
-        int(i) for i in args.token_range.split(",")
-    ]
-
-    # Parse strategy
-    strategy_map = {
-        "NCCL": AllReduceStrategy.NCCL,
-        "MIN_LATENCY": AllReduceStrategy.MIN_LATENCY,
-        "NCCL_SYMMETRIC": AllReduceStrategy.NCCL_SYMMETRIC,
-        "NCCL_DEVICE": AllReduceStrategy.NCCL_DEVICE,
-        "MNNVL": AllReduceStrategy.MNNVL,
-        "UB": AllReduceStrategy.UB,
-    }
-    strategy_name = args.strategy.strip().upper()
-    if strategy_name not in strategy_map:
-        raise ValueError(f"Unknown strategy: {args.strategy}. "
-                         f"Valid options: {', '.join(strategy_map.keys())}")
-    strategy = strategy_map[strategy_name]
-
-    # Parse fusion ops
-    if args.fusion_op:
-        fusion_map = {
-            "NONE": AllReduceFusionOp.NONE,
-            "RESIDUAL_RMS_NORM": AllReduceFusionOp.RESIDUAL_RMS_NORM,
-        }
-        fusion_ops = []
-        for arg in args.fusion_op:
-            for name in arg.split(','):
-                name = name.strip().upper()
-                if name not in fusion_map:
-                    raise ValueError(f"Unknown fusion op: {name}")
-                fusion_ops.append(fusion_map[name])
-    else:
-        # Default: test both NONE and RESIDUAL_RMS_NORM
-        fusion_ops = [
-            AllReduceFusionOp.NONE, AllReduceFusionOp.RESIDUAL_RMS_NORM
-        ]
+    # Extract validated values
+    strategy = args.strategy
+    fusion_ops = args.fusion_op
+    min_tokens = args.min_tokens
+    max_tokens = args.max_tokens
+    ratio = args.ratio
 
     # Initialize user buffers based on strategy
-    max_elements = max_tokens * args.hidden_size
+    max_elements = args.max_tokens * args.hidden_size
     max_bytes = max_elements * dtype_size_bytes
 
-    if strategy in [
+    if args.strategy in [
             AllReduceStrategy.NCCL_SYMMETRIC, AllReduceStrategy.NCCL_DEVICE
     ]:
         # These need UB with use_multicast=True
         ub.initialize_userbuffers_manager(world_size, 1, 1, rank,
                                           torch.cuda.device_count(), max_bytes,
                                           True)
-    elif strategy == AllReduceStrategy.UB:
+    elif args.strategy == AllReduceStrategy.UB:
         # UB needs use_multicast=False
         ub.initialize_userbuffers_manager(world_size, 1, 1, rank,
                                           torch.cuda.device_count(), max_bytes,
