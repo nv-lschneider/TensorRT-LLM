@@ -15,7 +15,7 @@
 
 from argparse import ArgumentParser
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 # isort: off
 import torch
@@ -30,6 +30,7 @@ import tensorrt_llm as tllm
 import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm import Mapping
 from tensorrt_llm._torch.distributed import AllReduce, AllReduceFusionOp
+from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._utils import local_mpi_rank, local_mpi_size
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
@@ -101,8 +102,6 @@ def initialize_environment(dtype: str, token_range: str,
     Returns:
         EnvironmentSetup with initialized parameters
     """
-    tllm.logger.set_level("error")
-
     # MPI setup
     world_size = tllm.mpi_world_size()
     rank = tllm.mpi_rank()
@@ -234,12 +233,15 @@ def create_benchmark_config(
     )
 
 
-def execute_benchmark(config: BenchmarkConfig) -> None:
+def execute_benchmark(config: BenchmarkConfig) -> bool:
     """
     Execute benchmark for the given configuration across all sizes.
 
     Args:
         config: Benchmark configuration with strategy, fusion_op, and size range
+
+    Returns:
+        True if benchmark completed successfully, False if it should stop iteration
     """
     # Print header if this is the first benchmark
     if config.mapping.rank == 0 and config.print_header:
@@ -253,120 +255,158 @@ def execute_benchmark(config: BenchmarkConfig) -> None:
               f"{'duration (ms)':<12}")
 
     # Create allreduce module with dtype for MNNVL support
-    allreduce = AllReduce(mapping=config.mapping,
-                          strategy=config.strategy,
-                          dtype=config.torch_dtype)
+    try:
+        allreduce = AllReduce(mapping=config.mapping,
+                              strategy=config.strategy,
+                              dtype=config.torch_dtype)
+    except Exception as e:
+        if config.mapping.rank == 0:
+            print(
+                f"Skipping {config.strategy.name}: Failed to initialize - {e}")
+        return False
 
     # Iterate over token counts
     num_tokens = config.min_tokens
     while num_tokens <= config.max_tokens:
-        # Skip large fusion ops for very large token counts
-        total_elements = num_tokens * config.hidden_size
-        if total_elements >= 25600000 and config.fusion_op != AllReduceFusionOp.NONE:
-            num_tokens *= config.ratio
-            continue
+        try:
+            # Skip large fusion ops for very large token counts
+            total_elements = num_tokens * config.hidden_size
+            if total_elements >= 25600000 and config.fusion_op != AllReduceFusionOp.NONE:
+                num_tokens *= config.ratio
+                continue
 
-        # Create input tensor with shape (num_tokens, hidden_size)
-        input_tensor = torch.ones((num_tokens, config.hidden_size),
-                                  dtype=config.torch_dtype,
-                                  device="cuda")
-
-        # Setup parameters based on fusion operation
-        if config.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
-            norm_weight = torch.randn((config.hidden_size, ),
+            # Create input tensor with shape (num_tokens, hidden_size)
+            input_tensor = torch.ones((num_tokens, config.hidden_size),
                                       dtype=config.torch_dtype,
                                       device="cuda")
-            norm = RMSNorm(hidden_size=config.hidden_size,
-                           dtype=config.torch_dtype,
-                           eps=1e-5).cuda()
-            norm.weight.data.copy_(norm_weight)
 
-            params = {
-                "all_reduce_params":
-                AllReduceParams(
-                    fusion_op=config.fusion_op,
-                    residual=input_tensor,
-                    norm_weight=norm.weight,
-                    eps=norm.variance_epsilon,
-                )
-            }
-        else:
-            params = {
-                "all_reduce_params": AllReduceParams(fusion_op=config.fusion_op)
-            }
+            # Setup parameters based on fusion operation
+            if config.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
+                norm_weight = torch.randn((config.hidden_size, ),
+                                          dtype=config.torch_dtype,
+                                          device="cuda")
+                norm = RMSNorm(hidden_size=config.hidden_size,
+                               dtype=config.torch_dtype,
+                               eps=1e-5).cuda()
+                norm.weight.data.copy_(norm_weight)
 
-        # Define benchmark function
-        def func(input):
-            for _ in range(config.inner_loop):
-                input = allreduce(input, **params)
-                if config.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
-                    input = input[0]
-            return input
+                params = {
+                    "all_reduce_params":
+                    AllReduceParams(
+                        fusion_op=config.fusion_op,
+                        residual=input_tensor,
+                        norm_weight=norm.weight,
+                        eps=norm.variance_epsilon,
+                    )
+                }
+            else:
+                params = {
+                    "all_reduce_params":
+                    AllReduceParams(fusion_op=config.fusion_op)
+                }
 
-        # Setup timing events
-        start_events = [
-            torch.cuda.Event(enable_timing=True)
-            for _ in range(config.outer_loop)
-        ]
-        stop_events = [
-            torch.cuda.Event(enable_timing=True)
-            for _ in range(config.outer_loop)
-        ]
+            # Define benchmark function
+            def func(input):
+                for _ in range(config.inner_loop):
+                    input = allreduce(input, **params)
+                    if config.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
+                        input = input[0]
+                return input
 
-        # Run benchmark
-        stream = torch.cuda.Stream()
-        with torch.cuda.stream(stream):
-            if config.enable_cudagraph:
-                # Warmup for CUDA graph
-                graph = torch.cuda.CUDAGraph()
-                for _ in range(2):
-                    func(input_tensor)
-                with torch.cuda.graph(graph, stream=stream):
-                    output = func(input_tensor)
+            # Setup timing events
+            start_events = [
+                torch.cuda.Event(enable_timing=True)
+                for _ in range(config.outer_loop)
+            ]
+            stop_events = [
+                torch.cuda.Event(enable_timing=True)
+                for _ in range(config.outer_loop)
+            ]
 
-            tllm.mpi_barrier()
-            delay_kernel(2000000, stream)
-            torch.cuda.profiler.start()
-
-            for i in range(config.outer_loop):
-                start_events[i].record(stream)
+            # Run benchmark
+            stream = torch.cuda.Stream()
+            with torch.cuda.stream(stream):
                 if config.enable_cudagraph:
-                    graph.replay()
-                else:
-                    output = func(input_tensor)
-                stop_events[i].record(stream)
+                    # Warmup for CUDA graph
+                    graph = torch.cuda.CUDAGraph()
+                    for _ in range(2):
+                        func(input_tensor)
+                    with torch.cuda.graph(graph, stream=stream):
+                        output = func(input_tensor)
 
-        torch.cuda.synchronize()
-        torch.cuda.profiler.stop()
+                tllm.mpi_barrier()
+                delay_kernel(2000000, stream)
+                torch.cuda.profiler.start()
 
-        # Calculate median runtime
-        runtimes = [
-            start_events[i].elapsed_time(stop_events[i])
-            for i in range(config.outer_loop)
-        ]
-        median_ms = sorted(runtimes)[len(runtimes) // 2] / config.inner_loop
+                for i in range(config.outer_loop):
+                    start_events[i].record(stream)
+                    if config.enable_cudagraph:
+                        graph.replay()
+                    else:
+                        output = func(input_tensor)
+                    stop_events[i].record(stream)
 
-        # Verify correctness for NONE fusion
-        if config.fusion_op == AllReduceFusionOp.NONE:
-            allreduce_ref = (input_tensor *
-                             config.world_size)**config.inner_loop
-            torch.testing.assert_close(output, allreduce_ref)
+            torch.cuda.synchronize()
+            torch.cuda.profiler.stop()
 
-        # Print results from rank 0
-        if config.mapping.rank == 0:
-            total_elements = num_tokens * config.hidden_size
-            message_size_b = total_elements * config.dtype_size_bytes
-            print(f"{config.world_size:<15}, "
-                  f"{config.dtype_name:<10}, "
-                  f"{num_tokens:<12}, "
-                  f"{config.hidden_size:<12}, "
-                  f"{message_size_b:<16.0f}, "
-                  f"{config.strategy.name:<15}, "
-                  f"{config.fusion_op.name:<25}, "
-                  f"{median_ms:<12.5f}")
+            # Calculate median runtime
+            runtimes = [
+                start_events[i].elapsed_time(stop_events[i])
+                for i in range(config.outer_loop)
+            ]
+            median_ms = sorted(runtimes)[len(runtimes) // 2] / config.inner_loop
 
-        # Update token count for next iteration
-        num_tokens *= config.ratio
+            # Verify correctness for NONE fusion
+            if config.fusion_op == AllReduceFusionOp.NONE:
+                allreduce_ref = (input_tensor *
+                                 config.world_size)**config.inner_loop
+                torch.testing.assert_close(output, allreduce_ref)
+
+            # Print results from rank 0
+            if config.mapping.rank == 0:
+                total_elements = num_tokens * config.hidden_size
+                message_size_b = total_elements * config.dtype_size_bytes
+                print(f"{config.world_size:<15}, "
+                      f"{config.dtype_name:<10}, "
+                      f"{num_tokens:<12}, "
+                      f"{config.hidden_size:<12}, "
+                      f"{message_size_b:<16.0f}, "
+                      f"{config.strategy.name:<15}, "
+                      f"{config.fusion_op.name:<25}, "
+                      f"{median_ms:<12.5f}")
+
+            # Update token count for next iteration
+            num_tokens *= config.ratio
+
+        except Exception as e:
+            if config.mapping.rank == 0:
+                print(
+                    f"Skipping {config.strategy.name} (num_tokens={num_tokens}): "
+                    f"Runtime error - {e}")
+            return False
+
+    return True
+
+
+def check_strategy_viable(strategy: AllReduceStrategy,
+                          env: EnvironmentSetup) -> Optional[str]:
+    """
+    Check if a strategy is viable for the current environment.
+
+    Args:
+        strategy: The AllReduce strategy to check
+        env: Environment setup with system info
+
+    Returns:
+        None if viable, or a string describing why it's not viable
+    """
+    # Check MNNVL specifically
+    if strategy == AllReduceStrategy.MNNVL:
+        if not MNNVLAllReduce.is_mnnvl(env.mapping, env.torch_dtype):
+            return f"MNNVL not supported (requires multi-node, aarch64, supported dtype, and NVLink)"
+
+    # All other strategies should be attempted - we'll catch runtime failures
+    return None
 
 
 def get_default_strategies() -> List[AllReduceStrategy]:
@@ -404,6 +444,7 @@ def launch_benchmarks(
     """
     Launch benchmarks for all strategy and fusion operation combinations.
     Creates a separate config for each combination and executes them sequentially.
+    Skips strategies that are not viable or fail to execute.
 
     Args:
         env: Environment setup (shared)
@@ -418,7 +459,19 @@ def launch_benchmarks(
 
     # Create and execute a config for each combination
     for strategy in strategies:
+        # Check if strategy is viable before attempting
+        viability_issue = check_strategy_viable(strategy, env)
+        if viability_issue:
+            if env.rank == 0:
+                print(f"Skipping {strategy.name}: {viability_issue}")
+            continue
+
+        strategy_failed = False
         for fusion_op in fusion_ops:
+            # Skip remaining fusion ops if this strategy already failed
+            if strategy_failed:
+                break
+
             config = create_benchmark_config(
                 env=env,
                 strategy=strategy,
@@ -428,8 +481,11 @@ def launch_benchmarks(
                 outer_loop=outer_loop,
                 print_header=first_run,
             )
-            execute_benchmark(config)
-            first_run = False
+            success = execute_benchmark(config)
+            if not success:
+                strategy_failed = True
+            else:
+                first_run = False
 
 
 def main():
