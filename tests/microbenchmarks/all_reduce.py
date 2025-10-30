@@ -37,13 +37,35 @@ from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.functional import AllReduceParams, AllReduceStrategy
 
 
-def check_mnnvl_available():
-    """Check if MNNVL is available on this system"""
-    try:
-        from tensorrt_llm._mnnvl_utils import supports_mnnvl
-        return supports_mnnvl()
-    except Exception:
-        return False
+def test_mnnvl_available(allreduce_module, rank):
+    """
+    Test if MNNVL is actually available and active in the AllReduce module.
+
+    Returns:
+        tuple: (is_available: bool, details: dict)
+    """
+    import platform
+
+    details = {
+        'has_mnnvl_attribute': False,
+        'mnnvl_is_not_none': False,
+        'architecture': platform.machine(),
+        'is_arm64': platform.machine() in ['aarch64', 'arm64'],
+    }
+
+    # Check if module has mnnvl_allreduce attribute
+    details['has_mnnvl_attribute'] = hasattr(allreduce_module,
+                                             'mnnvl_allreduce')
+
+    if details['has_mnnvl_attribute']:
+        details[
+            'mnnvl_is_not_none'] = allreduce_module.mnnvl_allreduce is not None
+
+    # MNNVL is available if both checks pass
+    is_available = details['has_mnnvl_attribute'] and details[
+        'mnnvl_is_not_none']
+
+    return is_available, details
 
 
 def verify_strategy_active(allreduce_module, requested_strategy, rank):
@@ -54,16 +76,15 @@ def verify_strategy_active(allreduce_module, requested_strategy, rank):
         tuple: (is_active: bool, actual_implementation: str, message: str)
     """
     if requested_strategy == AllReduceStrategy.MNNVL:
-        # Check if MNNVL implementation is active
-        has_mnnvl = hasattr(allreduce_module, 'mnnvl_allreduce') and \
-                    allreduce_module.mnnvl_allreduce is not None
+        # Test MNNVL availability
+        is_available, details = test_mnnvl_available(allreduce_module, rank)
 
-        if has_mnnvl:
+        if is_available:
             return True, "MNNVL", "MNNVL AllReduce is active"
         else:
             # MNNVL requested but not active - likely fell back to C++ plugin
-            return False, "C++ Plugin (likely NCCL)", \
-                   "MNNVL requested but module does not have active mnnvl_allreduce. Likely fell back to NCCL via C++ plugin."
+            msg = f"MNNVL requested but not active. Details: {details}"
+            return False, "C++ Plugin (likely NCCL)", msg
 
     # For other strategies, we can't easily verify, so assume they're working
     return True, requested_strategy.name, f"{requested_strategy.name} assumed active"
@@ -215,7 +236,11 @@ def run_benchmark(args):
     gpus_per_node = local_mpi_size()
 
     if world_size == 1:
-        raise RuntimeError("Benchmark must run with mpi_world_size > 1")
+        if rank == 0:
+            print("ERROR: Benchmark must run with mpi_world_size > 1",
+                  file=sys.stderr,
+                  flush=True)
+        sys.exit(1)
 
     # Device setup
     torch.cuda.set_device(local_rank)
@@ -250,26 +275,6 @@ def run_benchmark(args):
                                           torch.cuda.device_count(), max_bytes,
                                           False)
     # NCCL, MIN_LATENCY, MNNVL don't need UB initialization
-
-    # Pre-flight check for MNNVL
-    if strategy == AllReduceStrategy.MNNVL:
-        if rank == 0:
-            if not check_mnnvl_available():
-                print(
-                    f"ERROR: MNNVL strategy requested but MNNVL is not available on this system",
-                    file=sys.stderr,
-                    flush=True)
-                print(f"Possible reasons:", file=sys.stderr)
-                print(f"  - System is not ARM64/aarch64", file=sys.stderr)
-                print(
-                    f"  - NVLink is not available or not all links are active",
-                    file=sys.stderr)
-                print(f"  - MNNVL dependencies not met",
-                      file=sys.stderr,
-                      flush=True)
-                sys.exit(1)
-            else:
-                print(f"MNNVL pre-flight check: PASSED", flush=True)
 
     # Create AllReduce module (pass dtype for MNNVL support) and capture logs
     def create_allreduce():
@@ -310,10 +315,82 @@ def run_benchmark(args):
             print(f"The AllReduce module fell back to: {actual_impl}",
                   file=sys.stderr,
                   flush=True)
+
+            # Provide strategy-specific diagnostic info
+            if strategy == AllReduceStrategy.MNNVL:
+                print(f"\nMNNVL troubleshooting:", file=sys.stderr)
+                print(f"  - Ensure you're on ARM64/aarch64 architecture",
+                      file=sys.stderr)
+                print(
+                    f"  - Verify NVLink is available and all links are active",
+                    file=sys.stderr)
+                print(f"  - Check that world_size matches number of GPUs",
+                      file=sys.stderr)
+                print(f"  - Confirm MNNVL dependencies are installed",
+                      file=sys.stderr)
+
             if init_logs:
-                print(f"Initialization logs:\n{init_logs}",
+                print(f"\nInitialization logs:\n{init_logs}",
                       file=sys.stderr,
                       flush=True)
+
+        # Ensure all ranks exit together
+        tllm.mpi_barrier()
+        sys.exit(1)
+
+    # Run a test operation to verify strategy works before benchmarking
+    if rank == 0:
+        print(f"\nTesting {strategy.name} with a small operation...",
+              flush=True)
+
+    test_tensor = torch.ones((128, args.hidden_size),
+                             dtype=torch_dtype,
+                             device="cuda")
+
+    # Use appropriate fusion op for testing (UB doesn't support NONE)
+    test_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM if strategy == AllReduceStrategy.UB else AllReduceFusionOp.NONE
+
+    if test_fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
+        # Setup RMS norm for testing
+        norm_weight = torch.randn((args.hidden_size, ),
+                                  dtype=torch_dtype,
+                                  device="cuda")
+        norm = RMSNorm(hidden_size=args.hidden_size,
+                       dtype=torch_dtype,
+                       eps=1e-5).cuda()
+        norm.weight.data.copy_(norm_weight)
+        test_params = AllReduceParams(
+            fusion_op=test_fusion_op,
+            residual=test_tensor,
+            norm_weight=norm.weight,
+            eps=norm.variance_epsilon,
+        )
+    else:
+        test_params = AllReduceParams(fusion_op=test_fusion_op)
+
+    try:
+        test_output = allreduce(test_tensor, all_reduce_params=test_params)
+        torch.cuda.synchronize()
+
+        # Verify correctness for NONE fusion
+        if test_fusion_op == AllReduceFusionOp.NONE:
+            expected = test_tensor * world_size
+            torch.testing.assert_close(test_output, expected)
+
+        if rank == 0:
+            print(
+                f"Test passed! Strategy {strategy.name} is working correctly.",
+                flush=True)
+    except Exception as e:
+        if rank == 0:
+            print(
+                f"\nERROR: Test operation failed for strategy {strategy.name}!",
+                file=sys.stderr,
+                flush=True)
+            print(f"Error: {e}", file=sys.stderr, flush=True)
+
+        # Ensure all ranks exit together
+        tllm.mpi_barrier()
         sys.exit(1)
 
     # Print header
