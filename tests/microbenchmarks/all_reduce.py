@@ -87,17 +87,16 @@ class EnvironmentSetup:
     ratio: int
 
 
-def initialize_environment(dtype: str, token_range: str, hidden_size: int,
-                           only_ub: bool) -> EnvironmentSetup:
+def initialize_environment(dtype: str, token_range: str,
+                           hidden_size: int) -> EnvironmentSetup:
     """
-    Initialize MPI environment, devices, and user buffers.
-    This is called once at the start and shared across all benchmark configs.
+    Initialize MPI environment and devices (but NOT user buffers).
+    User buffers are initialized separately based on which strategies are tested.
 
     Args:
         dtype: Data type string (e.g., "float16", "bfloat16")
         token_range: Token count range string "min_tokens,max_tokens,ratio"
         hidden_size: Fixed hidden dimension size
-        only_ub: Whether to only test user buffer strategy
 
     Returns:
         EnvironmentSetup with initialized parameters
@@ -126,21 +125,6 @@ def initialize_environment(dtype: str, token_range: str, hidden_size: int,
     # Parse token range
     min_tokens, max_tokens, ratio = [int(i) for i in token_range.split(",")]
 
-    # Calculate max bytes needed for user buffers
-    max_elements = max_tokens * hidden_size
-    max_bytes = max_elements * dtype_size_bytes
-
-    # Initialize user buffers (needed for all strategies)
-    ub.initialize_userbuffers_manager(
-        world_size,
-        1,
-        1,
-        rank,
-        torch.cuda.device_count(),
-        max_bytes,
-        not only_ub  # use_multicast for non-UB strategies
-    )
-
     return EnvironmentSetup(
         world_size=world_size,
         rank=rank,
@@ -155,6 +139,53 @@ def initialize_environment(dtype: str, token_range: str, hidden_size: int,
         max_tokens=max_tokens,
         ratio=ratio,
     )
+
+
+def initialize_userbuffers_for_strategies(
+        env: EnvironmentSetup, strategies: List[AllReduceStrategy]) -> None:
+    """
+    Initialize user buffers based on which strategies are being tested.
+
+    Different strategies have different UB requirements:
+    - NCCL_SYMMETRIC, NCCL_DEVICE: need UB with use_multicast=True
+    - UB: needs UB with use_multicast=False
+    - NCCL, MIN_LATENCY, MNNVL: don't need UB initialization
+
+    Args:
+        env: Environment setup with device and size info
+        strategies: List of strategies that will be tested
+    """
+    # Calculate max bytes needed
+    max_elements = env.max_tokens * env.hidden_size
+    max_bytes = max_elements * env.dtype_size_bytes
+
+    # Check which strategies need UB
+    needs_ub_with_multicast = any(
+        s in [AllReduceStrategy.NCCL_SYMMETRIC, AllReduceStrategy.NCCL_DEVICE]
+        for s in strategies)
+    needs_ub_without_multicast = AllReduceStrategy.UB in strategies
+
+    if needs_ub_with_multicast and needs_ub_without_multicast:
+        # Both types needed - initialize with multicast=True (more general)
+        # Note: This is a limitation - can't test both types in same run
+        if env.rank == 0:
+            print(
+                "Warning: Testing both UB and NCCL_SYMMETRIC/NCCL_DEVICE together. "
+                "Initializing with use_multicast=True.")
+        ub.initialize_userbuffers_manager(env.world_size, 1, 1, env.rank,
+                                          torch.cuda.device_count(), max_bytes,
+                                          True)
+    elif needs_ub_with_multicast:
+        # NCCL_SYMMETRIC or NCCL_DEVICE
+        ub.initialize_userbuffers_manager(env.world_size, 1, 1, env.rank,
+                                          torch.cuda.device_count(), max_bytes,
+                                          True)
+    elif needs_ub_without_multicast:
+        # UB strategy
+        ub.initialize_userbuffers_manager(env.world_size, 1, 1, env.rank,
+                                          torch.cuda.device_count(), max_bytes,
+                                          False)
+    # else: No UB initialization needed
 
 
 def create_benchmark_config(
@@ -338,29 +369,28 @@ def execute_benchmark(config: BenchmarkConfig) -> None:
         num_tokens *= config.ratio
 
 
-def get_default_strategies(only_ub: bool) -> List[AllReduceStrategy]:
-    """Get the default list of strategies to test"""
-    if only_ub:
-        return [AllReduceStrategy.UB]
-    else:
-        return [
-            AllReduceStrategy.NCCL,
-            AllReduceStrategy.MIN_LATENCY,
-            AllReduceStrategy.NCCL_SYMMETRIC,
-            AllReduceStrategy.NCCL_DEVICE,
-            AllReduceStrategy.MNNVL,
-        ]
+def get_default_strategies() -> List[AllReduceStrategy]:
+    """
+    Get the default list of strategies to test.
+
+    Note: UB strategy is excluded from defaults because it has conflicting
+    UB initialization requirements. Use --strategy=UB to test it separately.
+    """
+    return [
+        AllReduceStrategy.NCCL,
+        AllReduceStrategy.MIN_LATENCY,
+        AllReduceStrategy.NCCL_SYMMETRIC,
+        AllReduceStrategy.NCCL_DEVICE,
+        AllReduceStrategy.MNNVL,
+    ]
 
 
-def get_default_fusion_ops(only_ub: bool) -> List[AllReduceFusionOp]:
+def get_default_fusion_ops() -> List[AllReduceFusionOp]:
     """Get the default list of fusion operations to test"""
-    if only_ub:
-        return [AllReduceFusionOp.RESIDUAL_RMS_NORM]
-    else:
-        return [
-            AllReduceFusionOp.NONE,
-            AllReduceFusionOp.RESIDUAL_RMS_NORM,
-        ]
+    return [
+        AllReduceFusionOp.NONE,
+        AllReduceFusionOp.RESIDUAL_RMS_NORM,
+    ]
 
 
 def launch_benchmarks(
@@ -421,14 +451,11 @@ def main():
     parser.add_argument("--enable-cudagraph",
                         action="store_true",
                         help="Enable CUDA graph capture")
-    parser.add_argument("--only-ub",
-                        action="store_true",
-                        help="Only test user buffer strategy")
     parser.add_argument(
         "--strategy",
         type=str,
         default=None,
-        help="Test only specific strategy (e.g., MNNVL, NCCL_DEVICE)")
+        help="Test only specific strategy (e.g., MNNVL, NCCL_DEVICE, UB)")
     parser.add_argument(
         "--fusion-op",
         type=str,
@@ -445,8 +472,7 @@ def main():
     args = parser.parse_args()
 
     # Initialize environment (once, shared across all configs)
-    env = initialize_environment(args.dtype, args.token_range, args.hidden_size,
-                                 args.only_ub)
+    env = initialize_environment(args.dtype, args.token_range, args.hidden_size)
 
     # Determine which strategies to test
     if args.strategy:
@@ -462,7 +488,7 @@ def main():
             raise ValueError(f"Unknown strategy: {args.strategy}")
         strategies = [strategy_map[args.strategy.upper()]]
     else:
-        strategies = get_default_strategies(args.only_ub)
+        strategies = get_default_strategies()
 
     # Determine which fusion ops to test
     if args.fusion_op:
@@ -474,7 +500,10 @@ def main():
             raise ValueError(f"Unknown fusion op: {args.fusion_op}")
         fusion_ops = [fusion_map[args.fusion_op.upper()]]
     else:
-        fusion_ops = get_default_fusion_ops(args.only_ub)
+        fusion_ops = get_default_fusion_ops()
+
+    # Initialize user buffers based on which strategies are being tested
+    initialize_userbuffers_for_strategies(env, strategies)
 
     # Launch benchmarks (creates separate config for each combination)
     launch_benchmarks(
