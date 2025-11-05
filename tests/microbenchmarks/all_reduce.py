@@ -13,10 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import io
 import sys
 from argparse import ArgumentParser
-from contextlib import redirect_stderr, redirect_stdout
 
 # isort: off
 import torch
@@ -35,86 +33,6 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._utils import local_mpi_rank, local_mpi_size
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.functional import AllReduceParams, AllReduceStrategy
-
-
-def test_mnnvl_available(allreduce_module, rank):
-    """
-    Test if MNNVL is actually available and active in the AllReduce module.
-
-    Returns:
-        tuple: (is_available: bool, details: dict)
-    """
-    import platform
-
-    details = {
-        'has_mnnvl_attribute': False,
-        'mnnvl_is_not_none': False,
-        'architecture': platform.machine(),
-        'is_arm64': platform.machine() in ['aarch64', 'arm64'],
-    }
-
-    # Check if module has mnnvl_allreduce attribute
-    details['has_mnnvl_attribute'] = hasattr(allreduce_module,
-                                             'mnnvl_allreduce')
-
-    if details['has_mnnvl_attribute']:
-        details[
-            'mnnvl_is_not_none'] = allreduce_module.mnnvl_allreduce is not None
-
-    # MNNVL is available if both checks pass
-    is_available = details['has_mnnvl_attribute'] and details[
-        'mnnvl_is_not_none']
-
-    return is_available, details
-
-
-def verify_strategy_active(allreduce_module, requested_strategy, rank):
-    """
-    Verify that the requested strategy is actually active in the AllReduce module.
-
-    Returns:
-        tuple: (is_active: bool, actual_implementation: str, message: str)
-    """
-    if requested_strategy == AllReduceStrategy.MNNVL:
-        # Test MNNVL availability
-        is_available, details = test_mnnvl_available(allreduce_module, rank)
-
-        if is_available:
-            return True, "MNNVL", "MNNVL AllReduce is active"
-        else:
-            # MNNVL requested but not active - likely fell back to C++ plugin
-            msg = f"MNNVL requested but not active. Details: {details}"
-            return False, "C++ Plugin (likely NCCL)", msg
-
-    # For other strategies, we can't easily verify, so assume they're working
-    return True, requested_strategy.name, f"{requested_strategy.name} assumed active"
-
-
-def capture_trtllm_logs(func, *args, **kwargs):
-    """
-    Execute a function and capture both Python stdout/stderr and C++ logs.
-
-    Returns:
-        tuple: (result, captured_output: str)
-    """
-    # Capture Python output
-    stdout_capture = io.StringIO()
-    stderr_capture = io.StringIO()
-
-    # Flush any pending output first
-    sys.stdout.flush()
-    sys.stderr.flush()
-
-    try:
-        with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
-            result = func(*args, **kwargs)
-
-        output = stdout_capture.getvalue() + stderr_capture.getvalue()
-        return result, output
-    except Exception as e:
-        output = stdout_capture.getvalue() + stderr_capture.getvalue()
-        raise RuntimeError(
-            f"Function failed with: {e}\nCaptured output:\n{output}") from e
 
 
 def parse_args():
@@ -276,67 +194,7 @@ def run_benchmark(args):
                                           False)
     # NCCL, MIN_LATENCY, MNNVL don't need UB initialization
 
-    # Create AllReduce module (pass dtype for MNNVL support) and capture logs
-    def create_allreduce():
-        return AllReduce(mapping=mapping, strategy=strategy, dtype=torch_dtype)
-
-    allreduce, init_logs = capture_trtllm_logs(create_allreduce)
-
-    # Check for fallback messages in logs
-    fallback_indicators = [
-        "fallback to AllReduceStrategy",
-        "Since Peer to Peer not supported",
-    ]
-
-    detected_fallback = any(indicator in init_logs
-                            for indicator in fallback_indicators)
-
-    if rank == 0 and detected_fallback:
-        print(f"\nWARNING: Detected fallback during AllReduce initialization:",
-              flush=True)
-        print(f"Strategy requested: {strategy.name}", flush=True)
-        print(f"Captured logs:\n{init_logs}", flush=True)
-
-    # Verify the requested strategy is actually active
-    is_active, actual_impl, verify_msg = verify_strategy_active(
-        allreduce, strategy, rank)
-
-    if rank == 0:
-        print(
-            f"Strategy verification: requested={strategy.name}, actual={actual_impl}",
-            flush=True)
-        print(f"  Details: {verify_msg}", flush=True)
-
-    if not is_active:
-        if rank == 0:
-            print(f"\nERROR: Requested strategy {strategy.name} is not active!",
-                  file=sys.stderr,
-                  flush=True)
-            print(f"The AllReduce module fell back to: {actual_impl}",
-                  file=sys.stderr,
-                  flush=True)
-
-            # Provide strategy-specific diagnostic info
-            if strategy == AllReduceStrategy.MNNVL:
-                print(f"\nMNNVL troubleshooting:", file=sys.stderr)
-                print(f"  - Ensure you're on ARM64/aarch64 architecture",
-                      file=sys.stderr)
-                print(
-                    f"  - Verify NVLink is available and all links are active",
-                    file=sys.stderr)
-                print(f"  - Check that world_size matches number of GPUs",
-                      file=sys.stderr)
-                print(f"  - Confirm MNNVL dependencies are installed",
-                      file=sys.stderr)
-
-            if init_logs:
-                print(f"\nInitialization logs:\n{init_logs}",
-                      file=sys.stderr,
-                      flush=True)
-
-        # Ensure all ranks exit together
-        tllm.mpi_barrier()
-        sys.exit(1)
+    allreduce = AllReduce(mapping=mapping, strategy=strategy, dtype=torch_dtype)
 
     # Run a test operation to verify strategy works before benchmarking
     if rank == 0:
