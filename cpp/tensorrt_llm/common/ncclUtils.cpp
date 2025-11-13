@@ -50,7 +50,7 @@ void NcclCommResourceManager::registerResource(ncclComm_t comm, ResourceCleanupF
         commMutexPtr = &getCommMutexLocked(comm);
     }
 
-    std::lock_guard<std::mutex> commLock(*commMutexPtr);
+    std::lock_guard<std::mutex> commLock(**commMutexPtr);
     {
         std::lock_guard<std::mutex> mapLock(mMutex);
         auto& resources = mCommResources[comm];
@@ -77,7 +77,7 @@ void NcclCommResourceManager::cleanupResources(ncclComm_t comm) noexcept
     }
 
     {
-        std::lock_guard<std::mutex> commLock(*commMutexPtr);
+        std::lock_guard<std::mutex> commLock(**commMutexPtr);
         {
             std::lock_guard<std::mutex> mapLock(mMutex);
             auto it = mCommResources.find(comm);
