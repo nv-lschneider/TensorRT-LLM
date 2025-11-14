@@ -160,10 +160,25 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     TLLM_CHECK_WITH_INFO(comm != nullptr, "NCCL communicator cannot be null");
     TLLM_CHECK_WITH_INFO(size > 0, "Buffer size must be greater than 0");
 
+    std::cout << "[DEBUG] requestBuffer: comm=" << static_cast<void*>(comm) << ", size=" << size << std::endl;
+
     std::lock_guard<std::mutex> lock(mMutex);
 
     // Check validity after acquiring lock (comm must not be cleaned up)
-    TLLM_CHECK_WITH_INFO(isCommValidLocked(comm), "NCCL communicator has been cleaned up or is invalid");
+    bool isValid = isCommValidLocked(comm);
+    std::cout << "[DEBUG] requestBuffer: isCommValidLocked(" << static_cast<void*>(comm)
+              << ") = " << (isValid ? "true" : "false") << std::endl;
+    if (!isValid)
+    {
+        std::cout << "[DEBUG] requestBuffer: comm " << static_cast<void*>(comm) << " is INVALID!" << std::endl;
+        std::cout << "[DEBUG]   - In mCleanedUpComms: "
+                  << (mCleanedUpComms.find(comm) != mCleanedUpComms.end() ? "YES" : "NO") << std::endl;
+        std::cout << "[DEBUG]   - In mRegisteredComms: "
+                  << (mRegisteredComms.find(comm) != mRegisteredComms.end() ? "YES" : "NO") << std::endl;
+        std::cout << "[DEBUG]   - In mBufferPool: " << (mBufferPool.find(comm) != mBufferPool.end() ? "YES" : "NO")
+                  << std::endl;
+    }
+    TLLM_CHECK_WITH_INFO(isValid, "NCCL communicator has been cleaned up or is invalid");
 
     // Register cleanup callback for this communicator if not already registered
     // This is cheap even if no buffers exist yet - cleanup will just return early
@@ -305,7 +320,10 @@ bool NCCLWindowAllocator::isCommValidLocked(ncclComm_t comm) const noexcept
 {
     // A comm is invalid only if it has been cleaned up
     // All other comms (new or active) are valid
-    return mCleanedUpComms.find(comm) == mCleanedUpComms.end();
+    bool isCleanedUp = mCleanedUpComms.find(comm) != mCleanedUpComms.end();
+    std::cout << "[DEBUG] isCommValidLocked: comm=" << static_cast<void*>(comm)
+              << ", isCleanedUp=" << (isCleanedUp ? "true" : "false") << std::endl;
+    return !isCleanedUp;
 }
 
 NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle)
@@ -367,18 +385,23 @@ NCCLWindowBuffer NCCLWindowAllocator::searchBufferLocked(ncclComm_t comm, void* 
 
 void NCCLWindowAllocator::registerBufferCleanup(ncclComm_t comm)
 {
+    std::cout << "[DEBUG] registerBufferCleanup: comm=" << static_cast<void*>(comm) << std::endl;
+
     // Don't register if already registered or if comm has been cleaned up
     if (mRegisteredComms.find(comm) != mRegisteredComms.end())
     {
+        std::cout << "[DEBUG] registerBufferCleanup: comm already registered, returning" << std::endl;
         return;
     }
 
     // Reject cleaned-up comms
     if (mCleanedUpComms.find(comm) != mCleanedUpComms.end())
     {
+        std::cout << "[DEBUG] registerBufferCleanup: comm is cleaned up, throwing" << std::endl;
         TLLM_THROW("Cannot register cleanup for a communicator that has already been cleaned up");
     }
 
+    std::cout << "[DEBUG] registerBufferCleanup: registering comm " << static_cast<void*>(comm) << std::endl;
     mRegisteredComms.insert(comm);
 
     // Register cleanup with the resource manager
@@ -388,16 +411,23 @@ void NCCLWindowAllocator::registerBufferCleanup(ncclComm_t comm)
 
 void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
 {
+    std::cout << "[DEBUG] cleanupBuffersForComm: START comm=" << static_cast<void*>(comm) << std::endl;
+
     std::lock_guard<std::mutex> lock(mMutex);
 
     // Mark as cleaned up first to prevent any new operations on this comm
+    std::cout << "[DEBUG] cleanupBuffersForComm: marking comm " << static_cast<void*>(comm) << " as cleaned up"
+              << std::endl;
     mCleanedUpComms.insert(comm);
 
     auto commIt = mBufferPool.find(comm);
     if (commIt == mBufferPool.end())
     {
         // No buffers to clean up, but comm is still marked as cleaned up
+        std::cout << "[DEBUG] cleanupBuffersForComm: comm " << static_cast<void*>(comm)
+                  << " not in buffer pool, removing from registered" << std::endl;
         mRegisteredComms.erase(comm);
+        std::cout << "[DEBUG] cleanupBuffersForComm: END (no buffers) comm=" << static_cast<void*>(comm) << std::endl;
         return;
     }
 
@@ -435,6 +465,7 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
 
     mBufferPool.erase(commIt);
     mRegisteredComms.erase(comm);
+    std::cout << "[DEBUG] cleanupBuffersForComm: END (with buffers) comm=" << static_cast<void*>(comm) << std::endl;
 }
 
 } // namespace tensorrt_llm::common::nccl_util
