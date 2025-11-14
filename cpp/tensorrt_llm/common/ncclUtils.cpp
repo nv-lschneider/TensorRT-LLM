@@ -389,9 +389,15 @@ void NCCLWindowAllocator::registerBufferCleanup(ncclComm_t comm)
 void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
 {
     std::lock_guard<std::mutex> lock(mMutex);
+
+    // Mark as cleaned up first to prevent any new operations on this comm
+    mCleanedUpComms.insert(comm);
+
     auto commIt = mBufferPool.find(comm);
     if (commIt == mBufferPool.end())
     {
+        // No buffers to clean up, but comm is still marked as cleaned up
+        mRegisteredComms.erase(comm);
         return;
     }
 
@@ -429,8 +435,6 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
 
     mBufferPool.erase(commIt);
     mRegisteredComms.erase(comm);
-    // Mark this comm as cleaned up so we can detect use-after-cleanup
-    mCleanedUpComms.insert(comm);
 }
 
 } // namespace tensorrt_llm::common::nccl_util
