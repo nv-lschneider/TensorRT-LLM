@@ -213,7 +213,9 @@ public:
     // Get the number of buffers in use for a communicator
     size_t getBufferInUseCount(ncclComm_t comm) const;
 
-    // Check if a communicator is still valid (hasn't been cleaned up)
+    // Check if a communicator is valid (non-null)
+    // Note: We don't track cleaned-up comms because NCCL can reuse memory addresses.
+    // All non-null comms are considered valid and will be registered when first used.
     bool isCommValid(ncclComm_t comm) const noexcept;
 
     NCCLWindowAllocator(NCCLWindowAllocator const&) = delete;
@@ -231,9 +233,6 @@ private:
     // Search for a buffer by pointer (assumes mMutex is already locked)
     NCCLWindowBuffer searchBufferLocked(ncclComm_t comm, void* ptr) const;
 
-    // Check if a communicator is valid (assumes mMutex is already locked)
-    bool isCommValidLocked(ncclComm_t comm) const noexcept;
-
     // Register cleanup function for all buffers associated with a communicator
     void registerBufferCleanup(ncclComm_t comm);
 
@@ -249,7 +248,6 @@ private:
     mutable std::mutex mMutex;
     std::unordered_map<ncclComm_t, std::vector<BufferEntry>> mBufferPool;
     std::unordered_set<ncclComm_t> mRegisteredComms;
-    std::unordered_set<ncclComm_t> mCleanedUpComms; // Track comms that have been cleaned up
 };
 
 // RAII wrapper for NCCL window buffers

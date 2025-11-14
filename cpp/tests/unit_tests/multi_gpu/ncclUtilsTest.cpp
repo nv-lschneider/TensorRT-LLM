@@ -469,7 +469,8 @@ TEST_F(NCCLWindowAllocatorTest, CleanupOnCommDestroy)
     // The cleanup should have removed all buffers for this comm
     EXPECT_EQ(allocator.getBufferCount(rawComm), 0);
     EXPECT_EQ(allocator.getBufferInUseCount(rawComm), 0);
-    EXPECT_FALSE(allocator.isCommValid(rawComm));
+    // Note: isCommValid only checks for null, not cleaned-up state, because NCCL can reuse addresses
+    // The real check is that buffers are gone, which we verify above
 }
 
 TEST_F(NCCLWindowAllocatorTest, CommValidity)

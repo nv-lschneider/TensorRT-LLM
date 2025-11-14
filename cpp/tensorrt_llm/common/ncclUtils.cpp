@@ -164,22 +164,6 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
 
     std::lock_guard<std::mutex> lock(mMutex);
 
-    // Check validity after acquiring lock (comm must not be cleaned up)
-    bool isValid = isCommValidLocked(comm);
-    std::cout << "[DEBUG] requestBuffer: isCommValidLocked(" << static_cast<void*>(comm)
-              << ") = " << (isValid ? "true" : "false") << std::endl;
-    if (!isValid)
-    {
-        std::cout << "[DEBUG] requestBuffer: comm " << static_cast<void*>(comm) << " is INVALID!" << std::endl;
-        std::cout << "[DEBUG]   - In mCleanedUpComms: "
-                  << (mCleanedUpComms.find(comm) != mCleanedUpComms.end() ? "YES" : "NO") << std::endl;
-        std::cout << "[DEBUG]   - In mRegisteredComms: "
-                  << (mRegisteredComms.find(comm) != mRegisteredComms.end() ? "YES" : "NO") << std::endl;
-        std::cout << "[DEBUG]   - In mBufferPool: " << (mBufferPool.find(comm) != mBufferPool.end() ? "YES" : "NO")
-                  << std::endl;
-    }
-    TLLM_CHECK_WITH_INFO(isValid, "NCCL communicator has been cleaned up or is invalid");
-
     // Register cleanup callback for this communicator if not already registered
     // This is cheap even if no buffers exist yet - cleanup will just return early
     registerBufferCleanup(comm);
@@ -307,23 +291,10 @@ size_t NCCLWindowAllocator::getBufferInUseCount(ncclComm_t comm) const
 
 bool NCCLWindowAllocator::isCommValid(ncclComm_t comm) const noexcept
 {
-    if (!comm)
-    {
-        return false;
-    }
-
-    std::lock_guard<std::mutex> lock(mMutex);
-    return isCommValidLocked(comm);
-}
-
-bool NCCLWindowAllocator::isCommValidLocked(ncclComm_t comm) const noexcept
-{
-    // A comm is invalid only if it has been cleaned up
-    // All other comms (new or active) are valid
-    bool isCleanedUp = mCleanedUpComms.find(comm) != mCleanedUpComms.end();
-    std::cout << "[DEBUG] isCommValidLocked: comm=" << static_cast<void*>(comm)
-              << ", isCleanedUp=" << (isCleanedUp ? "true" : "false") << std::endl;
-    return !isCleanedUp;
+    // Simply check for null - all non-null comms are valid
+    // We don't track cleaned-up comms because NCCL can reuse memory addresses,
+    // making pointer-based tracking unreliable. New comms will be registered when used.
+    return comm != nullptr;
 }
 
 NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle)
@@ -387,18 +358,11 @@ void NCCLWindowAllocator::registerBufferCleanup(ncclComm_t comm)
 {
     std::cout << "[DEBUG] registerBufferCleanup: comm=" << static_cast<void*>(comm) << std::endl;
 
-    // Don't register if already registered or if comm has been cleaned up
+    // Don't register if already registered
     if (mRegisteredComms.find(comm) != mRegisteredComms.end())
     {
         std::cout << "[DEBUG] registerBufferCleanup: comm already registered, returning" << std::endl;
         return;
-    }
-
-    // Reject cleaned-up comms
-    if (mCleanedUpComms.find(comm) != mCleanedUpComms.end())
-    {
-        std::cout << "[DEBUG] registerBufferCleanup: comm is cleaned up, throwing" << std::endl;
-        TLLM_THROW("Cannot register cleanup for a communicator that has already been cleaned up");
     }
 
     std::cout << "[DEBUG] registerBufferCleanup: registering comm " << static_cast<void*>(comm) << std::endl;
@@ -415,15 +379,10 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
 
     std::lock_guard<std::mutex> lock(mMutex);
 
-    // Mark as cleaned up first to prevent any new operations on this comm
-    std::cout << "[DEBUG] cleanupBuffersForComm: marking comm " << static_cast<void*>(comm) << " as cleaned up"
-              << std::endl;
-    mCleanedUpComms.insert(comm);
-
     auto commIt = mBufferPool.find(comm);
     if (commIt == mBufferPool.end())
     {
-        // No buffers to clean up, but comm is still marked as cleaned up
+        // No buffers to clean up
         std::cout << "[DEBUG] cleanupBuffersForComm: comm " << static_cast<void*>(comm)
                   << " not in buffer pool, removing from registered" << std::endl;
         mRegisteredComms.erase(comm);
