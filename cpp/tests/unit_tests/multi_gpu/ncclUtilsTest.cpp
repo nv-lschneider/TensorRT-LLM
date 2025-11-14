@@ -92,11 +92,11 @@ protected:
 
         // Set CUDA device for this rank (required before NCCL initialization)
         int deviceCount = 0;
-        CUDACHECK(cudaGetDeviceCount(&deviceCount));
+        TLLM_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
         if (deviceCount > 0)
         {
             int deviceId = mRank % deviceCount;
-            CUDACHECK(cudaSetDevice(deviceId));
+            TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
         }
 
         // Create a communicator for testing
@@ -219,11 +219,11 @@ protected:
 
         // Set CUDA device for this rank (required before NCCL initialization)
         int deviceCount = 0;
-        CUDACHECK(cudaGetDeviceCount(&deviceCount));
+        TLLM_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
         if (deviceCount > 0)
         {
             int deviceId = mRank % deviceCount;
-            CUDACHECK(cudaSetDevice(deviceId));
+            TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
         }
 
         // Check if NCCL symmetric is supported
@@ -533,11 +533,11 @@ protected:
 
         // Set CUDA device for this rank (required before NCCL initialization)
         int deviceCount = 0;
-        CUDACHECK(cudaGetDeviceCount(&deviceCount));
+        TLLM_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
         if (deviceCount > 0)
         {
             int deviceId = mRank % deviceCount;
-            CUDACHECK(cudaSetDevice(deviceId));
+            TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
         }
 
         // Check if NCCL symmetric is supported
