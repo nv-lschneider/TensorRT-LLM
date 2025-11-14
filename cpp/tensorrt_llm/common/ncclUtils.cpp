@@ -296,7 +296,9 @@ bool NCCLWindowAllocator::isCommValid(ncclComm_t comm) const noexcept
     }
 
     std::lock_guard<std::mutex> lock(mMutex);
-    return mRegisteredComms.find(comm) != mRegisteredComms.end() || mBufferPool.find(comm) == mBufferPool.end();
+    // A comm is valid if it's registered (has buffers or had buffers that were cleaned up)
+    // After cleanup, it's removed from mRegisteredComms, so it's no longer valid
+    return mRegisteredComms.find(comm) != mRegisteredComms.end();
 }
 
 NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle)

@@ -362,7 +362,9 @@ TEST_F(NCCLWindowAllocatorTest, SearchBuffer)
     auto found = allocator.searchBuffer(*mComm, buffer.ptr);
     EXPECT_TRUE(found.isValid());
     EXPECT_EQ(found.ptr, buffer.ptr);
-    EXPECT_EQ(found.size, bufferSize);
+    // Compare against actual allocated size (ncclMemAlloc may allocate more than requested)
+    EXPECT_EQ(found.size, buffer.size);
+    EXPECT_GE(found.size, bufferSize); // At least the requested size
 
     // Test search for non-existent buffer
     void* fakePtr = reinterpret_cast<void*>(0xDEADBEEF);
@@ -384,9 +386,10 @@ TEST_F(NCCLWindowAllocatorTest, GetWindowAndSize)
     EXPECT_NE(window, nullptr);
     EXPECT_EQ(window, buffer.window);
 
-    // Test getSize
+    // Test getSize - compare against actual allocated size (ncclMemAlloc may allocate more than requested)
     auto size = allocator.getSize(*mComm, buffer.ptr);
-    EXPECT_EQ(size, bufferSize);
+    EXPECT_EQ(size, buffer.size);
+    EXPECT_GE(size, bufferSize); // At least the requested size
 
     // Test with invalid pointer
     void* fakePtr = reinterpret_cast<void*>(0xDEADBEEF);
@@ -421,7 +424,9 @@ TEST_F(NCCLWindowAllocatorTest, ScopedBuffer)
         nccl_util::ScopedNCCLWindowBuffer scopedBuffer(*mComm, bufferSize);
         EXPECT_TRUE(scopedBuffer.getBuffer().isValid());
         EXPECT_NE(scopedBuffer.getPtr(), nullptr);
-        EXPECT_EQ(scopedBuffer.getSize(), bufferSize);
+        // Compare against actual allocated size (ncclMemAlloc may allocate more than requested)
+        EXPECT_EQ(scopedBuffer.getSize(), scopedBuffer.getBuffer().size);
+        EXPECT_GE(scopedBuffer.getSize(), bufferSize); // At least the requested size
         EXPECT_NE(scopedBuffer.getWindow(), nullptr);
 
         // Buffer should be in use
@@ -585,7 +590,8 @@ TEST_F(CreateNCCLWindowTensorTest, BasicTensorCreation)
     // Verify buffer properties
     EXPECT_TRUE(buffer.isValid());
     EXPECT_NE(buffer.ptr, nullptr);
-    EXPECT_EQ(buffer.size, 4 * 8 * sizeof(float));
+    // ncclMemAlloc may allocate more than requested, so check at least the requested size
+    EXPECT_GE(buffer.size, 4 * 8 * sizeof(float));
     EXPECT_NE(buffer.window, nullptr);
 
     // Verify tensor data pointer matches buffer pointer
@@ -606,7 +612,8 @@ TEST_F(CreateNCCLWindowTensorTest, DifferentDtypes)
     {
         auto [tensor, buffer] = createNCCLWindowTensor(*mComm, shape, torch::kFloat32);
         EXPECT_EQ(tensor.dtype(), torch::kFloat32);
-        EXPECT_EQ(buffer.size, 10 * sizeof(float));
+        // ncclMemAlloc may allocate more than requested, so check at least the requested size
+        EXPECT_GE(buffer.size, 10 * sizeof(float));
         EXPECT_EQ(tensor.data_ptr(), buffer.ptr);
     }
 
@@ -614,7 +621,8 @@ TEST_F(CreateNCCLWindowTensorTest, DifferentDtypes)
     {
         auto [tensor, buffer] = createNCCLWindowTensor(*mComm, shape, torch::kFloat16);
         EXPECT_EQ(tensor.dtype(), torch::kFloat16);
-        EXPECT_EQ(buffer.size, 10 * sizeof(at::Half));
+        // ncclMemAlloc may allocate more than requested, so check at least the requested size
+        EXPECT_GE(buffer.size, 10 * sizeof(at::Half));
         EXPECT_EQ(tensor.data_ptr(), buffer.ptr);
     }
 
@@ -622,7 +630,8 @@ TEST_F(CreateNCCLWindowTensorTest, DifferentDtypes)
     {
         auto [tensor, buffer] = createNCCLWindowTensor(*mComm, shape, torch::kInt32);
         EXPECT_EQ(tensor.dtype(), torch::kInt32);
-        EXPECT_EQ(buffer.size, 10 * sizeof(int32_t));
+        // ncclMemAlloc may allocate more than requested, so check at least the requested size
+        EXPECT_GE(buffer.size, 10 * sizeof(int32_t));
         EXPECT_EQ(tensor.data_ptr(), buffer.ptr);
     }
 }
@@ -637,7 +646,8 @@ TEST_F(CreateNCCLWindowTensorTest, DifferentShapes)
         auto [tensor, buffer] = createNCCLWindowTensor(*mComm, shape, torch::kFloat32);
         EXPECT_EQ(tensor.dim(), 1);
         EXPECT_EQ(tensor.size(0), 100);
-        EXPECT_EQ(buffer.size, 100 * sizeof(float));
+        // ncclMemAlloc may allocate more than requested, so check at least the requested size
+        EXPECT_GE(buffer.size, 100 * sizeof(float));
     }
 
     // 3D tensor
@@ -648,7 +658,8 @@ TEST_F(CreateNCCLWindowTensorTest, DifferentShapes)
         EXPECT_EQ(tensor.size(0), 2);
         EXPECT_EQ(tensor.size(1), 3);
         EXPECT_EQ(tensor.size(2), 4);
-        EXPECT_EQ(buffer.size, 2 * 3 * 4 * sizeof(float));
+        // ncclMemAlloc may allocate more than requested, so check at least the requested size
+        EXPECT_GE(buffer.size, 2 * 3 * 4 * sizeof(float));
     }
 
     // 4D tensor
@@ -657,7 +668,8 @@ TEST_F(CreateNCCLWindowTensorTest, DifferentShapes)
         auto [tensor, buffer] = createNCCLWindowTensor(*mComm, shape, torch::kFloat32);
         EXPECT_EQ(tensor.dim(), 4);
         EXPECT_EQ(tensor.numel(), 1 * 2 * 3 * 4);
-        EXPECT_EQ(buffer.size, 1 * 2 * 3 * 4 * sizeof(float));
+        // ncclMemAlloc may allocate more than requested, so check at least the requested size
+        EXPECT_GE(buffer.size, 1 * 2 * 3 * 4 * sizeof(float));
     }
 }
 
