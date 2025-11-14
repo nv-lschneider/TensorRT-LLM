@@ -159,9 +159,12 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
 {
     TLLM_CHECK_WITH_INFO(comm != nullptr, "NCCL communicator cannot be null");
     TLLM_CHECK_WITH_INFO(size > 0, "Buffer size must be greater than 0");
-    TLLM_CHECK_WITH_INFO(isCommValid(comm), "NCCL communicator has been cleaned up or is invalid");
 
     std::lock_guard<std::mutex> lock(mMutex);
+
+    // Check validity after acquiring lock (comm must not be cleaned up)
+    // A comm is invalid if it was in the pool but has been cleaned up (removed from mRegisteredComms)
+    TLLM_CHECK_WITH_INFO(isCommValidLocked(comm), "NCCL communicator has been cleaned up or is invalid");
 
     // Register cleanup callback for this communicator if not already registered
     // This is cheap even if no buffers exist yet - cleanup will just return early
@@ -296,9 +299,20 @@ bool NCCLWindowAllocator::isCommValid(ncclComm_t comm) const noexcept
     }
 
     std::lock_guard<std::mutex> lock(mMutex);
-    // A comm is valid if it's registered (has buffers or had buffers that were cleaned up)
-    // After cleanup, it's removed from mRegisteredComms, so it's no longer valid
-    return mRegisteredComms.find(comm) != mRegisteredComms.end();
+    return isCommValidLocked(comm);
+}
+
+bool NCCLWindowAllocator::isCommValidLocked(ncclComm_t comm) const noexcept
+{
+    // A comm is valid if:
+    // 1. It's registered (has buffers or had buffers that were cleaned up)
+    // 2. It's not in the buffer pool at all (new comm that hasn't been used yet)
+    // After cleanup, it's removed from both mRegisteredComms and mBufferPool, so it's no longer valid
+    // Note: We can't distinguish a new comm from a cleaned-up comm just from the maps,
+    // but in practice, cleaned-up comms are destroyed, so we won't check them.
+    bool isRegistered = mRegisteredComms.find(comm) != mRegisteredComms.end();
+    bool notInPool = mBufferPool.find(comm) == mBufferPool.end();
+    return isRegistered || notInPool;
 }
 
 NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle)

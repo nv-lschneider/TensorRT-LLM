@@ -231,6 +231,9 @@ private:
     // Search for a buffer by pointer (assumes mMutex is already locked)
     NCCLWindowBuffer searchBufferLocked(ncclComm_t comm, void* ptr) const;
 
+    // Check if a communicator is valid (assumes mMutex is already locked)
+    bool isCommValidLocked(ncclComm_t comm) const noexcept;
+
     // Register cleanup function for all buffers associated with a communicator
     void registerBufferCleanup(ncclComm_t comm);
 
