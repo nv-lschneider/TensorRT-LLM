@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/common/ncclUtils.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/userbuffers/ub_allocator.h"
@@ -87,6 +88,15 @@ protected:
         if (mWorldSize < 2)
         {
             GTEST_SKIP() << "Requires at least 2 ranks (got " << mWorldSize << ")";
+        }
+
+        // Set CUDA device for this rank (required before NCCL initialization)
+        int deviceCount = 0;
+        CUDACHECK(cudaGetDeviceCount(&deviceCount));
+        if (deviceCount > 0)
+        {
+            int deviceId = mRank % deviceCount;
+            CUDACHECK(cudaSetDevice(deviceId));
         }
 
         // Create a communicator for testing
@@ -205,6 +215,15 @@ protected:
         if (mWorldSize < 2)
         {
             GTEST_SKIP() << "Requires at least 2 ranks (got " << mWorldSize << ")";
+        }
+
+        // Set CUDA device for this rank (required before NCCL initialization)
+        int deviceCount = 0;
+        CUDACHECK(cudaGetDeviceCount(&deviceCount));
+        if (deviceCount > 0)
+        {
+            int deviceId = mRank % deviceCount;
+            CUDACHECK(cudaSetDevice(deviceId));
         }
 
         // Check if NCCL symmetric is supported
@@ -510,6 +529,15 @@ protected:
         if (mWorldSize < 2)
         {
             GTEST_SKIP() << "Requires at least 2 ranks (got " << mWorldSize << ")";
+        }
+
+        // Set CUDA device for this rank (required before NCCL initialization)
+        int deviceCount = 0;
+        CUDACHECK(cudaGetDeviceCount(&deviceCount));
+        if (deviceCount > 0)
+        {
+            int deviceId = mRank % deviceCount;
+            CUDACHECK(cudaSetDevice(deviceId));
         }
 
         // Check if NCCL symmetric is supported
