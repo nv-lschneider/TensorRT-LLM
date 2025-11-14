@@ -163,7 +163,6 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     std::lock_guard<std::mutex> lock(mMutex);
 
     // Check validity after acquiring lock (comm must not be cleaned up)
-    // A comm is invalid if it was in the pool but has been cleaned up (removed from mRegisteredComms)
     TLLM_CHECK_WITH_INFO(isCommValidLocked(comm), "NCCL communicator has been cleaned up or is invalid");
 
     // Register cleanup callback for this communicator if not already registered
@@ -304,15 +303,9 @@ bool NCCLWindowAllocator::isCommValid(ncclComm_t comm) const noexcept
 
 bool NCCLWindowAllocator::isCommValidLocked(ncclComm_t comm) const noexcept
 {
-    // A comm is valid if:
-    // 1. It's registered (has buffers or had buffers that were cleaned up)
-    // 2. It's not in the buffer pool at all (new comm that hasn't been used yet)
-    // After cleanup, it's removed from both mRegisteredComms and mBufferPool, so it's no longer valid
-    // Note: We can't distinguish a new comm from a cleaned-up comm just from the maps,
-    // but in practice, cleaned-up comms are destroyed, so we won't check them.
-    bool isRegistered = mRegisteredComms.find(comm) != mRegisteredComms.end();
-    bool notInPool = mBufferPool.find(comm) == mBufferPool.end();
-    return isRegistered || notInPool;
+    // A comm is invalid only if it has been cleaned up
+    // All other comms (new or active) are valid
+    return mCleanedUpComms.find(comm) == mCleanedUpComms.end();
 }
 
 NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle)
@@ -374,10 +367,16 @@ NCCLWindowBuffer NCCLWindowAllocator::searchBufferLocked(ncclComm_t comm, void* 
 
 void NCCLWindowAllocator::registerBufferCleanup(ncclComm_t comm)
 {
-    // Only register once per communicator
+    // Don't register if already registered or if comm has been cleaned up
     if (mRegisteredComms.find(comm) != mRegisteredComms.end())
     {
         return;
+    }
+
+    // Reject cleaned-up comms
+    if (mCleanedUpComms.find(comm) != mCleanedUpComms.end())
+    {
+        TLLM_THROW("Cannot register cleanup for a communicator that has already been cleaned up");
     }
 
     mRegisteredComms.insert(comm);
@@ -430,6 +429,8 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
 
     mBufferPool.erase(commIt);
     mRegisteredComms.erase(comm);
+    // Mark this comm as cleaned up so we can detect use-after-cleanup
+    mCleanedUpComms.insert(comm);
 }
 
 } // namespace tensorrt_llm::common::nccl_util

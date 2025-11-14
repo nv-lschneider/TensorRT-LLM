@@ -249,6 +249,7 @@ private:
     mutable std::mutex mMutex;
     std::unordered_map<ncclComm_t, std::vector<BufferEntry>> mBufferPool;
     std::unordered_set<ncclComm_t> mRegisteredComms;
+    std::unordered_set<ncclComm_t> mCleanedUpComms; // Track comms that have been cleaned up
 };
 
 // RAII wrapper for NCCL window buffers
