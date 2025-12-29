@@ -840,11 +840,7 @@ class AllReduce(nn.Module):
         disable_allreduce_autotune = os.environ.get(
             "TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0") == "1"
 
-        # Use AUTOTUNE instead of AUTO for better perf
-        if allreduce_strategy == AllReduceStrategy.AUTO and not disable_allreduce_autotune:
-            allreduce_strategy = AllReduceStrategy.AUTOTUNE
-
-        if allreduce_strategy == AllReduceStrategy.AUTOTUNE:
+        if not disable_allreduce_autotune:
             output = torch.ops.trtllm.tunable_allreduce(
                 input=input,
                 residual=all_reduce_params.residual,

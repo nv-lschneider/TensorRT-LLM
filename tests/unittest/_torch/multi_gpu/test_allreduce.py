@@ -72,14 +72,12 @@ def run_single_rank(
     hidden_size,
     dtype,
     fusion_op,
-    is_autotune: bool = False,
 ):
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
     try:
         single_rank_forward_func(input, residual, hidden_size, dtype,
-                                 tensor_parallel_size, rank, weights, fusion_op,
-                                 is_autotune)
+                                 tensor_parallel_size, rank, weights, fusion_op)
     except Exception:
         traceback.print_exc()
         raise
@@ -111,7 +109,6 @@ def run_allreduce_op(
     tensor_parallel_rank: int,
     weights: torch.Tensor,
     fusion_op: AllReduceFusionOp,
-    is_autotune: bool = False,
 ):
 
     def e2m1_and_ufp8sf_scale_to_float_v2(e2m1_tensor,
@@ -146,8 +143,7 @@ def run_allreduce_op(
     allreduce = AllReduce(mapping=mapping)
     norm = RMSNorm(hidden_size=hidden_size, eps=eps, dtype=dtype).cuda()
 
-    strategy = AllReduceStrategy.AUTOTUNE if is_autotune else AllReduceStrategy.AUTO
-    allreduce = AllReduce(mapping=mapping, strategy=strategy).cuda()
+    allreduce = AllReduce(mapping=mapping).cuda()
 
     scale = torch.tensor(1.0, dtype=torch.float32).cuda()
     linear.load_weights([dict(weight=weights[0])])
@@ -253,7 +249,7 @@ def run_allreduce_op(
     xs = torch.chunk(x.clone(), tensor_parallel_size, dim=-1)
 
     # trigger autotune
-    with autotune(tune_mode=is_autotune):
+    with autotune():
         calc_output = calc_func(xs[tensor_parallel_rank], residual)
 
     ref_output = ref_func(xs[tensor_parallel_rank], residual)
@@ -303,46 +299,6 @@ def test_allreduce_fusion_patterns(seq_len, hidden_size, fusion_op,
         run_single_rank,
         *zip(*[(tensor_parallel_size, run_allreduce_op, x, residual,
                 [linear_weight], hidden_size, dtype, fusion_op)] *
-             tensor_parallel_size),
-    )
-    for r in results:
-        assert r is True
-
-
-@pytest.mark.skipif(torch.cuda.device_count() < 2,
-                    reason="Requires at least 2 GPUs for this test")
-@pytest.mark.parametrize("seq_len", [1, 1024], ids=lambda x: f"seqlen:{x}")
-@pytest.mark.parametrize("hidden_size", [8192], ids=lambda x: f"hidden:{x}")
-@pytest.mark.parametrize(
-    "fusion_op",
-    [
-        pytest.param(AllReduceFusionOp.NONE, id="none"),
-        pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                     id="residual_rms_norm"),
-        pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
-                     id="residual_rms_norm_quant_fp8"),
-        pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8,
-                     id="residual_rms_norm_out_quant_fp8"),
-        pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
-                     id="residual_rms_norm_quant_nvfp4",
-                     marks=skip_pre_blackwell),
-        pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
-                     id="residual_rms_norm_out_quant_nvfp4",
-                     marks=skip_pre_blackwell),
-    ],
-)
-@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-def test_tunable_allreduce(seq_len, hidden_size, fusion_op, mpi_pool_executor):
-    torch.manual_seed(0)
-    dtype = torch.bfloat16
-    tensor_parallel_size = mpi_pool_executor.num_workers
-    x = torch.randn((seq_len, hidden_size), dtype=dtype)
-    residual = torch.randn_like(x)
-    linear_weight = torch.randn((hidden_size, hidden_size), dtype=dtype)
-    results = mpi_pool_executor.map(
-        run_single_rank,
-        *zip(*[(tensor_parallel_size, run_allreduce_op, x, residual,
-                [linear_weight], hidden_size, dtype, fusion_op, True)] *
              tensor_parallel_size),
     )
     for r in results:

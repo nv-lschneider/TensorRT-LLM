@@ -189,10 +189,10 @@ def allreduce_benchmark(
     ]
     strategies = [
         AllReduceStrategy.NCCL,
+        AllReduceStrategy.NCCL_SYMMETRIC,
         AllReduceStrategy.ONESHOT,
         AllReduceStrategy.TWOSHOT,
         AllReduceStrategy.AUTO,
-        AllReduceStrategy.AUTOTUNE,
     ]
     df = pd.DataFrame()
     for (num_tokens, hidden_size) in shape_list:
