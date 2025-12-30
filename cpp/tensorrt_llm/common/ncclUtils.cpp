@@ -275,7 +275,6 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
 #endif
 
     int handle;
-    bool needAllocate = false;
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -558,18 +557,9 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
     // Synchronize all ranks before the collective ncclCommWindowRegister call.
     // ncclCommWindowRegister is a collective operation that requires all ranks to participate.
     // Without synchronization, if ranks are out of sync (e.g., after autotuning), the call will hang.
-    // Note: synchronizeRanks will acquire NCCL op mutex, but we already hold it, so we need a version that doesn't
+    // Note: We already hold the NCCL op mutex, so we inline the synchronization here
     int nRanks;
     NCCLCHECK_THROW(ncclCommCount(comm, &nRanks));
-    int mpiRank = 0;
-#if ENABLE_MULTI_DEVICE
-    int mpiInitialized = 0;
-    MPI_Initialized(&mpiInitialized);
-    if (mpiInitialized)
-    {
-        MPI_Comm_rank(MPI_COMM_WORLD, &mpiRank);
-    }
-#endif
     if (nRanks > 1)
     {
         std::cout << "[NCCLUtil] Rank " << mpiRank << ": Synchronizing " << nRanks
