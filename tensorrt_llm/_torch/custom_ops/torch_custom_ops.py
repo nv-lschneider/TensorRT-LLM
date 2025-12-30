@@ -1712,7 +1712,6 @@ def _(
     bias: Optional[torch.Tensor],
     workspace: Optional[torch.Tensor],
     group: List[int],
-    strategy: int,
     op: int,
     eps: float,
     tp_size: int,

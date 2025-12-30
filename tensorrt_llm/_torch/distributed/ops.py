@@ -831,16 +831,12 @@ class AllReduce(nn.Module):
                 "pg": pg.boxed(),
             }
 
-            # TODO: args for non mpi version are not supported by Python side custom op
-            # API for now, just fallback to AUTO
-            allreduce_strategy = AllReduceStrategy.AUTO
-
         # In case that AutoTuner brings potential perf regression
         # TODO: Remove this if no perf regression is observed.
         disable_allreduce_autotune = os.environ.get(
             "TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0") == "1"
 
-        if not disable_allreduce_autotune:
+        if not disable_allreduce_autotune and not self._disable_mpi:
             output = torch.ops.trtllm.tunable_allreduce(
                 input=input,
                 residual=all_reduce_params.residual,
