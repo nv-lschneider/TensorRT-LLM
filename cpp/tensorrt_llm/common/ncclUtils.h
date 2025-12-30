@@ -284,6 +284,10 @@ private:
     // Allocate a new buffer and register it with NCCL as a window
     NCCLWindowBuffer allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle);
 
+    // Synchronize all ranks using a dummy NCCL allreduce as a barrier.
+    // This ensures all ranks reach the same point before/after collective operations.
+    void synchronizeRanks(ncclComm_t comm, char const* context) const;
+
     // Search for a buffer by pointer (assumes mMutex is already locked)
     NCCLWindowBuffer searchBufferLocked(ncclComm_t comm, void* ptr) const;
 
