@@ -21,13 +21,8 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/common/opUtils.h"
-#include <iostream>
 #include <limits>
 #include <stdexcept>
-#if ENABLE_MULTI_DEVICE
-#include <mpi.h>
-#endif
 
 namespace tensorrt_llm::common::nccl_util
 {
@@ -263,17 +258,6 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     TLLM_CHECK_WITH_INFO(comm != nullptr, "NCCL communicator cannot be null");
     TLLM_CHECK_WITH_INFO(size > 0, "Buffer size must be greater than 0");
 
-    // Get MPI rank for logging
-    int mpiRank = 0;
-#if ENABLE_MULTI_DEVICE
-    int mpiInitialized = 0;
-    MPI_Initialized(&mpiInitialized);
-    if (mpiInitialized)
-    {
-        MPI_Comm_rank(MPI_COMM_WORLD, &mpiRank);
-    }
-#endif
-
     int handle;
     {
         std::lock_guard<std::mutex> lock(mMutex);
@@ -300,11 +284,9 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
         if (firstFit != commBuffers.end())
         {
             firstFit->inUse = true;
-            std::cout << "[NCCLUtil] Rank " << mpiRank << ": Reusing NCCL window buffer for comm "
-                      << static_cast<void*>(comm) << ": handle=" << firstFit->buffer.handle
-                      << ", ptr=" << firstFit->buffer.ptr << ", size=" << firstFit->buffer.size
-                      << " (requested: " << size << ")" << std::endl;
-            std::cout.flush();
+            TLLM_LOG_TRACE(
+                "[NCCLUtil] Reusing NCCL window buffer for comm %p: handle=%d, ptr=%p, size=%zu (requested: %zu)",
+                static_cast<void*>(comm), firstFit->buffer.handle, firstFit->buffer.ptr, firstFit->buffer.size, size);
             return firstFit->buffer;
         }
 
@@ -315,10 +297,8 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     // Release the pool mutex before calling allocateAndRegisterBuffer (which will acquire NCCL op mutex)
     // We need to release mMutex here because allocateAndRegisterBuffer will acquire the NCCL op mutex
     // and we don't want to hold both mutexes at the same time
-    std::cout << "[NCCLUtil] Rank " << mpiRank << ": No buffer available, allocating new NCCL window buffer for comm "
-              << static_cast<void*>(comm) << ", handle=" << handle << ", size=" << size << std::endl;
-    std::cout.flush();
-
+    TLLM_LOG_TRACE(
+        "[NCCLUtil] Allocating new NCCL window buffer for comm %p, size=%zu", static_cast<void*>(comm), size);
     NCCLWindowBuffer buffer = allocateAndRegisterBuffer(comm, size, handle);
 
     {
@@ -326,10 +306,6 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
         std::lock_guard<std::mutex> relock(mMutex);
         mBufferPool[comm].push_back({buffer, true});
     }
-
-    std::cout << "[NCCLUtil] Rank " << mpiRank << ": Successfully allocated and registered buffer handle=" << handle
-              << ", ptr=" << buffer.ptr << ", size=" << size << std::endl;
-    std::cout.flush();
 
     return buffer;
 }
@@ -441,56 +417,6 @@ std::mutex& NCCLWindowAllocator::getNcclOpMutex(ncclComm_t comm) const
     return *it->second;
 }
 
-void NCCLWindowAllocator::synchronizeRanks(ncclComm_t comm, char const* context) const
-{
-    // Serialize NCCL operations - NCCL is not thread-safe
-    std::lock_guard<std::mutex> ncclLock(getNcclOpMutex(comm));
-
-    int nRanks;
-    NCCLCHECK_THROW(ncclCommCount(comm, &nRanks));
-
-    // Get current MPI rank for logging
-    int mpiRank = 0;
-#if ENABLE_MULTI_DEVICE
-    int mpiInitialized = 0;
-    MPI_Initialized(&mpiInitialized);
-    if (mpiInitialized)
-    {
-        MPI_Comm_rank(MPI_COMM_WORLD, &mpiRank);
-    }
-#endif
-
-    if (nRanks > 1)
-    {
-        std::cout << "[NCCLUtil] Rank " << mpiRank << ": Synchronizing " << nRanks << " ranks before " << context
-                  << " (comm=" << static_cast<void*>(comm) << ")" << std::endl;
-        std::cout.flush();
-
-        // Create a dummy buffer for the barrier allreduce
-        void* dummyBuffer;
-        TLLM_CUDA_CHECK(cudaMalloc(&dummyBuffer, sizeof(int)));
-        int dummyValue = 0;
-        TLLM_CUDA_CHECK(cudaMemcpy(dummyBuffer, &dummyValue, sizeof(int), cudaMemcpyHostToDevice));
-
-        // Use the default stream (nullptr) for the barrier allreduce
-        // Perform a dummy allreduce as a barrier to synchronize all ranks
-        NCCLCHECK_THROW(ncclAllReduce(dummyBuffer, dummyBuffer, 1, ncclInt, ncclSum, comm, nullptr));
-        // Synchronize the default stream to ensure the allreduce completes
-        TLLM_CUDA_CHECK(cudaStreamSynchronize(nullptr));
-        TLLM_CUDA_CHECK(cudaFree(dummyBuffer));
-
-        std::cout << "[NCCLUtil] Rank " << mpiRank << ": Completed synchronization for " << context
-                  << " (comm=" << static_cast<void*>(comm) << ")" << std::endl;
-        std::cout.flush();
-    }
-    else
-    {
-        std::cout << "[NCCLUtil] Rank " << mpiRank << ": Skipping synchronization (single rank) for " << context
-                  << " (comm=" << static_cast<void*>(comm) << ")" << std::endl;
-        std::cout.flush();
-    }
-}
-
 NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle)
 {
     // Serialize NCCL operations - NCCL is not thread-safe
@@ -499,21 +425,6 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
 
     NCCLWindowBuffer buffer;
     buffer.handle = handle;
-
-    // Get MPI rank for logging
-    int mpiRank = 0;
-#if ENABLE_MULTI_DEVICE
-    int mpiInitialized = 0;
-    MPI_Initialized(&mpiInitialized);
-    if (mpiInitialized)
-    {
-        MPI_Comm_rank(MPI_COMM_WORLD, &mpiRank);
-    }
-#endif
-
-    std::cout << "[NCCLUtil] Rank " << mpiRank << ": allocateAndRegisterBuffer START: handle=" << handle
-              << ", size=" << size << ", comm=" << static_cast<void*>(comm) << std::endl;
-    std::cout.flush();
 
     // Get NCCL helper for dynamic symbol loading
     auto& ncclHelper = NCCLHelper::getInstance();
@@ -537,82 +448,20 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
     }
 
     // Allocate device memory using ncclMemAlloc
-    std::cout << "[NCCLUtil] Rank " << mpiRank << ": Calling ncclMemAlloc: handle=" << handle << ", size=" << size
-              << std::endl;
-    std::cout.flush();
     ncclResult_t allocResult = ncclMemAllocFunc(&buffer.ptr, size);
     if (allocResult != ncclSuccess)
     {
-        std::cout << "[NCCLUtil] Rank " << mpiRank << ": ERROR ncclMemAlloc failed: " << allocResult
-                  << ", handle=" << handle << ", size=" << size << std::endl;
-        std::cout.flush();
         TLLM_THROW("ncclMemAlloc failed with error: %d", allocResult);
     }
     buffer.size = size;
-    std::cout << "[NCCLUtil] Rank " << mpiRank << ": ncclMemAlloc SUCCESS: handle=" << handle << ", ptr=" << buffer.ptr
-              << ", size=" << size << std::endl;
-    std::cout.flush();
-
-    // Synchronize all ranks before the collective ncclCommWindowRegister call.
-    // ncclCommWindowRegister is a collective operation that requires all ranks to participate.
-    // Without synchronization, if ranks are out of sync (e.g., after autotuning), the call will hang.
-    // Note: We already hold the NCCL op mutex, so we inline the synchronization here
-    int nRanks;
-    NCCLCHECK_THROW(ncclCommCount(comm, &nRanks));
-    if (nRanks > 1)
-    {
-        std::cout << "[NCCLUtil] Rank " << mpiRank << ": Synchronizing " << nRanks
-                  << " ranks before ncclCommWindowRegister"
-                  << " (comm=" << static_cast<void*>(comm) << ")" << std::endl;
-        std::cout.flush();
-        void* dummyBuffer;
-        TLLM_CUDA_CHECK(cudaMalloc(&dummyBuffer, sizeof(int)));
-        int dummyValue = 0;
-        TLLM_CUDA_CHECK(cudaMemcpy(dummyBuffer, &dummyValue, sizeof(int), cudaMemcpyHostToDevice));
-        NCCLCHECK_THROW(ncclAllReduce(dummyBuffer, dummyBuffer, 1, ncclInt, ncclSum, comm, nullptr));
-        TLLM_CUDA_CHECK(cudaStreamSynchronize(nullptr));
-        TLLM_CUDA_CHECK(cudaFree(dummyBuffer));
-        std::cout << "[NCCLUtil] Rank " << mpiRank << ": Completed synchronization before ncclCommWindowRegister"
-                  << std::endl;
-        std::cout.flush();
-    }
 
     // Register the buffer with NCCL as a window
-    std::cout << "[NCCLUtil] Rank " << mpiRank << ": Calling ncclCommWindowRegister: handle=" << handle
-              << ", ptr=" << buffer.ptr << ", size=" << size << std::endl;
-    std::cout.flush();
     ncclResult_t regResult
         = ncclCommWindowRegisterFunc(comm, buffer.ptr, size, &buffer.window, NCCL_WIN_COLL_SYMMETRIC);
     if (regResult != ncclSuccess)
     {
-        std::cout << "[NCCLUtil] Rank " << mpiRank << ": ERROR ncclCommWindowRegister failed: " << regResult
-                  << ", handle=" << handle << ", ptr=" << buffer.ptr << ", size=" << size << std::endl;
-        std::cout.flush();
         ncclMemFree(buffer.ptr);
         TLLM_THROW("ncclCommWindowRegister failed with error: %d", regResult);
-    }
-    std::cout << "[NCCLUtil] Rank " << mpiRank << ": ncclCommWindowRegister SUCCESS: handle=" << handle
-              << ", ptr=" << buffer.ptr << ", window=" << static_cast<void*>(buffer.window) << std::endl;
-    std::cout.flush();
-
-    // Synchronize all ranks after the collective ncclCommWindowRegister call.
-    // This ensures all ranks have completed registration before proceeding.
-    if (nRanks > 1)
-    {
-        std::cout << "[NCCLUtil] Rank " << mpiRank << ": Synchronizing " << nRanks
-                  << " ranks after ncclCommWindowRegister"
-                  << " (comm=" << static_cast<void*>(comm) << ")" << std::endl;
-        std::cout.flush();
-        void* dummyBuffer;
-        TLLM_CUDA_CHECK(cudaMalloc(&dummyBuffer, sizeof(int)));
-        int dummyValue = 0;
-        TLLM_CUDA_CHECK(cudaMemcpy(dummyBuffer, &dummyValue, sizeof(int), cudaMemcpyHostToDevice));
-        NCCLCHECK_THROW(ncclAllReduce(dummyBuffer, dummyBuffer, 1, ncclInt, ncclSum, comm, nullptr));
-        TLLM_CUDA_CHECK(cudaStreamSynchronize(nullptr));
-        TLLM_CUDA_CHECK(cudaFree(dummyBuffer));
-        std::cout << "[NCCLUtil] Rank " << mpiRank << ": Completed synchronization after ncclCommWindowRegister"
-                  << std::endl;
-        std::cout.flush();
     }
 
     TLLM_LOG_TRACE("[NCCLUtil] Allocated and registered NCCL window buffer: handle=%d, ptr=%p, size=%zu, window=%p",
