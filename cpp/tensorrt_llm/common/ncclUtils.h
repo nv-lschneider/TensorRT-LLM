@@ -304,8 +304,13 @@ private:
     };
 
     mutable std::mutex mMutex;
+    // Per-communicator mutex to serialize NCCL operations (NCCL ops are not thread-safe)
+    mutable std::unordered_map<ncclComm_t, std::unique_ptr<std::mutex>> mNcclOpMutexes;
     std::unordered_map<ncclComm_t, std::vector<BufferEntry>> mBufferPool;
     std::unordered_set<ncclComm_t> mRegisteredComms;
+
+    // Get or create a mutex for NCCL operations on a specific communicator
+    std::mutex& getNcclOpMutex(ncclComm_t comm) const;
 };
 
 // RAII wrapper for NCCL window buffers

@@ -263,42 +263,75 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     TLLM_CHECK_WITH_INFO(comm != nullptr, "NCCL communicator cannot be null");
     TLLM_CHECK_WITH_INFO(size > 0, "Buffer size must be greater than 0");
 
-    std::lock_guard<std::mutex> lock(mMutex);
-
-    // Register cleanup callback for this communicator if not already registered
-    // This is cheap even if no buffers exist yet - cleanup will just return early
-    registerBufferCleanup(comm);
-
-    // Check if we have an available buffer of at least the requested size for this communicator
-    // Use best-fit: find the smallest buffer that's >= requested size
-    auto& commBuffers = mBufferPool[comm];
-    auto bestFit = commBuffers.end();
-    size_t bestFitSize = std::numeric_limits<size_t>::max();
-
-    for (auto it = commBuffers.begin(); it != commBuffers.end(); ++it)
+    // Get MPI rank for logging
+    int mpiRank = 0;
+#if ENABLE_MULTI_DEVICE
+    int mpiInitialized = 0;
+    MPI_Initialized(&mpiInitialized);
+    if (mpiInitialized)
     {
-        if (!it->inUse && it->buffer.size >= size && it->buffer.size < bestFitSize)
+        MPI_Comm_rank(MPI_COMM_WORLD, &mpiRank);
+    }
+#endif
+
+    int handle;
+    bool needAllocate = false;
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+
+        // Register cleanup callback for this communicator if not already registered
+        // This is cheap even if no buffers exist yet - cleanup will just return early
+        registerBufferCleanup(comm);
+
+        // Check if we have an available buffer of at least the requested size for this communicator
+        // Use deterministic first-fit: find the first buffer that's >= requested size (by handle order)
+        // This ensures all ranks reuse the same buffers in the same order
+        auto& commBuffers = mBufferPool[comm];
+        auto firstFit = commBuffers.end();
+
+        for (auto it = commBuffers.begin(); it != commBuffers.end(); ++it)
         {
-            bestFit = it;
-            bestFitSize = it->buffer.size;
+            if (!it->inUse && it->buffer.size >= size)
+            {
+                firstFit = it;
+                break; // Use first fit for deterministic behavior
+            }
         }
+
+        if (firstFit != commBuffers.end())
+        {
+            firstFit->inUse = true;
+            std::cout << "[NCCLUtil] Rank " << mpiRank << ": Reusing NCCL window buffer for comm "
+                      << static_cast<void*>(comm) << ": handle=" << firstFit->buffer.handle
+                      << ", ptr=" << firstFit->buffer.ptr << ", size=" << firstFit->buffer.size
+                      << " (requested: " << size << ")" << std::endl;
+            std::cout.flush();
+            return firstFit->buffer;
+        }
+
+        // No available buffer found, will allocate a new one
+        handle = static_cast<int>(commBuffers.size());
+        needAllocate = true;
     }
 
-    if (bestFit != commBuffers.end())
-    {
-        bestFit->inUse = true;
-        TLLM_LOG_TRACE(
-            "[NCCLUtil] Reusing NCCL window buffer for comm %p: handle=%d, ptr=%p, size=%zu (requested: %zu)",
-            static_cast<void*>(comm), bestFit->buffer.handle, bestFit->buffer.ptr, bestFit->buffer.size, size);
-        return bestFit->buffer;
-    }
+    // Release the pool mutex before calling allocateAndRegisterBuffer (which will acquire NCCL op mutex)
+    // We need to release mMutex here because allocateAndRegisterBuffer will acquire the NCCL op mutex
+    // and we don't want to hold both mutexes at the same time
+    std::cout << "[NCCLUtil] Rank " << mpiRank << ": No buffer available, allocating new NCCL window buffer for comm "
+              << static_cast<void*>(comm) << ", handle=" << handle << ", size=" << size << std::endl;
+    std::cout.flush();
 
-    // No available buffer found, allocate a new one
-    TLLM_LOG_TRACE(
-        "[NCCLUtil] Allocating new NCCL window buffer for comm %p, size=%zu", static_cast<void*>(comm), size);
-    int handle = static_cast<int>(commBuffers.size());
     NCCLWindowBuffer buffer = allocateAndRegisterBuffer(comm, size, handle);
-    commBuffers.push_back({buffer, true});
+
+    {
+        // Re-acquire the lock for push_back
+        std::lock_guard<std::mutex> relock(mMutex);
+        mBufferPool[comm].push_back({buffer, true});
+    }
+
+    std::cout << "[NCCLUtil] Rank " << mpiRank << ": Successfully allocated and registered buffer handle=" << handle
+              << ", ptr=" << buffer.ptr << ", size=" << size << std::endl;
+    std::cout.flush();
 
     return buffer;
 }
@@ -398,8 +431,23 @@ bool NCCLWindowAllocator::isCommValid(ncclComm_t comm) const noexcept
     return comm != nullptr;
 }
 
+std::mutex& NCCLWindowAllocator::getNcclOpMutex(ncclComm_t comm) const
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    auto it = mNcclOpMutexes.find(comm);
+    if (it == mNcclOpMutexes.end())
+    {
+        mNcclOpMutexes[comm] = std::make_unique<std::mutex>();
+        return *mNcclOpMutexes[comm];
+    }
+    return *it->second;
+}
+
 void NCCLWindowAllocator::synchronizeRanks(ncclComm_t comm, char const* context) const
 {
+    // Serialize NCCL operations - NCCL is not thread-safe
+    std::lock_guard<std::mutex> ncclLock(getNcclOpMutex(comm));
+
     int nRanks;
     NCCLCHECK_THROW(ncclCommCount(comm, &nRanks));
 
@@ -447,8 +495,27 @@ void NCCLWindowAllocator::synchronizeRanks(ncclComm_t comm, char const* context)
 
 NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle)
 {
+    // Serialize NCCL operations - NCCL is not thread-safe
+    // This mutex ensures only one thread per communicator can perform NCCL operations at a time
+    std::lock_guard<std::mutex> ncclLock(getNcclOpMutex(comm));
+
     NCCLWindowBuffer buffer;
     buffer.handle = handle;
+
+    // Get MPI rank for logging
+    int mpiRank = 0;
+#if ENABLE_MULTI_DEVICE
+    int mpiInitialized = 0;
+    MPI_Initialized(&mpiInitialized);
+    if (mpiInitialized)
+    {
+        MPI_Comm_rank(MPI_COMM_WORLD, &mpiRank);
+    }
+#endif
+
+    std::cout << "[NCCLUtil] Rank " << mpiRank << ": allocateAndRegisterBuffer START: handle=" << handle
+              << ", size=" << size << ", comm=" << static_cast<void*>(comm) << std::endl;
+    std::cout.flush();
 
     // Get NCCL helper for dynamic symbol loading
     auto& ncclHelper = NCCLHelper::getInstance();
@@ -472,42 +539,92 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
     }
 
     // Allocate device memory using ncclMemAlloc
-    TLLM_LOG_DEBUG("[NCCLUtil] Allocating NCCL window buffer: handle=%d, size=%zu, comm=%p", handle, size,
-        static_cast<void*>(comm));
+    std::cout << "[NCCLUtil] Rank " << mpiRank << ": Calling ncclMemAlloc: handle=" << handle << ", size=" << size
+              << std::endl;
+    std::cout.flush();
     ncclResult_t allocResult = ncclMemAllocFunc(&buffer.ptr, size);
     if (allocResult != ncclSuccess)
     {
-        TLLM_LOG_ERROR("[NCCLUtil] ncclMemAlloc failed with error: %d (handle=%d, size=%zu, comm=%p)", allocResult,
-            handle, size, static_cast<void*>(comm));
+        std::cout << "[NCCLUtil] Rank " << mpiRank << ": ERROR ncclMemAlloc failed: " << allocResult
+                  << ", handle=" << handle << ", size=" << size << std::endl;
+        std::cout.flush();
         TLLM_THROW("ncclMemAlloc failed with error: %d", allocResult);
     }
     buffer.size = size;
-    TLLM_LOG_DEBUG(
-        "[NCCLUtil] Successfully allocated NCCL window buffer: handle=%d, ptr=%p, size=%zu", handle, buffer.ptr, size);
+    std::cout << "[NCCLUtil] Rank " << mpiRank << ": ncclMemAlloc SUCCESS: handle=" << handle << ", ptr=" << buffer.ptr
+              << ", size=" << size << std::endl;
+    std::cout.flush();
 
     // Synchronize all ranks before the collective ncclCommWindowRegister call.
     // ncclCommWindowRegister is a collective operation that requires all ranks to participate.
     // Without synchronization, if ranks are out of sync (e.g., after autotuning), the call will hang.
-    synchronizeRanks(comm, "ncclCommWindowRegister");
+    // Note: synchronizeRanks will acquire NCCL op mutex, but we already hold it, so we need a version that doesn't
+    int nRanks;
+    NCCLCHECK_THROW(ncclCommCount(comm, &nRanks));
+    int mpiRank = 0;
+#if ENABLE_MULTI_DEVICE
+    int mpiInitialized = 0;
+    MPI_Initialized(&mpiInitialized);
+    if (mpiInitialized)
+    {
+        MPI_Comm_rank(MPI_COMM_WORLD, &mpiRank);
+    }
+#endif
+    if (nRanks > 1)
+    {
+        std::cout << "[NCCLUtil] Rank " << mpiRank << ": Synchronizing " << nRanks
+                  << " ranks before ncclCommWindowRegister"
+                  << " (comm=" << static_cast<void*>(comm) << ")" << std::endl;
+        std::cout.flush();
+        void* dummyBuffer;
+        TLLM_CUDA_CHECK(cudaMalloc(&dummyBuffer, sizeof(int)));
+        int dummyValue = 0;
+        TLLM_CUDA_CHECK(cudaMemcpy(dummyBuffer, &dummyValue, sizeof(int), cudaMemcpyHostToDevice));
+        NCCLCHECK_THROW(ncclAllReduce(dummyBuffer, dummyBuffer, 1, ncclInt, ncclSum, comm, nullptr));
+        TLLM_CUDA_CHECK(cudaStreamSynchronize(nullptr));
+        TLLM_CUDA_CHECK(cudaFree(dummyBuffer));
+        std::cout << "[NCCLUtil] Rank " << mpiRank << ": Completed synchronization before ncclCommWindowRegister"
+                  << std::endl;
+        std::cout.flush();
+    }
 
     // Register the buffer with NCCL as a window
-    TLLM_LOG_DEBUG("[NCCLUtil] Registering NCCL window buffer: handle=%d, ptr=%p, size=%zu, comm=%p", handle,
-        buffer.ptr, size, static_cast<void*>(comm));
+    std::cout << "[NCCLUtil] Rank " << mpiRank << ": Calling ncclCommWindowRegister: handle=" << handle
+              << ", ptr=" << buffer.ptr << ", size=" << size << std::endl;
+    std::cout.flush();
     ncclResult_t regResult
         = ncclCommWindowRegisterFunc(comm, buffer.ptr, size, &buffer.window, NCCL_WIN_COLL_SYMMETRIC);
     if (regResult != ncclSuccess)
     {
-        TLLM_LOG_ERROR("[NCCLUtil] ncclCommWindowRegister failed with error: %d (handle=%d, ptr=%p, size=%zu, comm=%p)",
-            regResult, handle, buffer.ptr, size, static_cast<void*>(comm));
+        std::cout << "[NCCLUtil] Rank " << mpiRank << ": ERROR ncclCommWindowRegister failed: " << regResult
+                  << ", handle=" << handle << ", ptr=" << buffer.ptr << ", size=" << size << std::endl;
+        std::cout.flush();
         ncclMemFree(buffer.ptr);
         TLLM_THROW("ncclCommWindowRegister failed with error: %d", regResult);
     }
-    TLLM_LOG_DEBUG("[NCCLUtil] Successfully registered NCCL window buffer: handle=%d, ptr=%p, window=%p", handle,
-        buffer.ptr, static_cast<void*>(buffer.window));
+    std::cout << "[NCCLUtil] Rank " << mpiRank << ": ncclCommWindowRegister SUCCESS: handle=" << handle
+              << ", ptr=" << buffer.ptr << ", window=" << static_cast<void*>(buffer.window) << std::endl;
+    std::cout.flush();
 
     // Synchronize all ranks after the collective ncclCommWindowRegister call.
     // This ensures all ranks have completed registration before proceeding.
-    synchronizeRanks(comm, "post-ncclCommWindowRegister");
+    if (nRanks > 1)
+    {
+        std::cout << "[NCCLUtil] Rank " << mpiRank << ": Synchronizing " << nRanks
+                  << " ranks after ncclCommWindowRegister"
+                  << " (comm=" << static_cast<void*>(comm) << ")" << std::endl;
+        std::cout.flush();
+        void* dummyBuffer;
+        TLLM_CUDA_CHECK(cudaMalloc(&dummyBuffer, sizeof(int)));
+        int dummyValue = 0;
+        TLLM_CUDA_CHECK(cudaMemcpy(dummyBuffer, &dummyValue, sizeof(int), cudaMemcpyHostToDevice));
+        NCCLCHECK_THROW(ncclAllReduce(dummyBuffer, dummyBuffer, 1, ncclInt, ncclSum, comm, nullptr));
+        TLLM_CUDA_CHECK(cudaStreamSynchronize(nullptr));
+        TLLM_CUDA_CHECK(cudaFree(dummyBuffer));
+        std::cout << "[NCCLUtil] Rank " << mpiRank << ": Completed synchronization after ncclCommWindowRegister"
+                  << std::endl;
+        std::cout.flush();
+    }
 
     TLLM_LOG_TRACE("[NCCLUtil] Allocated and registered NCCL window buffer: handle=%d, ptr=%p, size=%zu, window=%p",
         handle, buffer.ptr, size, static_cast<void*>(buffer.window));
