@@ -310,7 +310,6 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
 
         // No available buffer found, will allocate a new one
         handle = static_cast<int>(commBuffers.size());
-        needAllocate = true;
     }
 
     // Release the pool mutex before calling allocateAndRegisterBuffer (which will acquire NCCL op mutex)
