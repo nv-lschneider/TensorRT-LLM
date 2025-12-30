@@ -455,6 +455,27 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
     }
     buffer.size = size;
 
+    // Synchronize all ranks before the collective ncclCommWindowRegister call.
+    // ncclCommWindowRegister is a collective operation that requires all ranks to participate.
+    // Without synchronization, if ranks are out of sync (e.g., after autotuning), the call will hang.
+    // Note: We already hold the NCCL op mutex, so we inline the synchronization here
+    int nRanks;
+    NCCLCHECK_THROW(ncclCommCount(comm, &nRanks));
+    if (nRanks > 1)
+    {
+        // Create a dummy buffer for the barrier allreduce
+        void* dummyBuffer;
+        TLLM_CUDA_CHECK(cudaMalloc(&dummyBuffer, sizeof(int)));
+        int dummyValue = 0;
+        TLLM_CUDA_CHECK(cudaMemcpy(dummyBuffer, &dummyValue, sizeof(int), cudaMemcpyHostToDevice));
+        // Use the default stream (nullptr) for the barrier allreduce
+        // Perform a dummy allreduce as a barrier to synchronize all ranks
+        NCCLCHECK_THROW(ncclAllReduce(dummyBuffer, dummyBuffer, 1, ncclInt, ncclSum, comm, nullptr));
+        // Synchronize the default stream to ensure the allreduce completes
+        TLLM_CUDA_CHECK(cudaStreamSynchronize(nullptr));
+        TLLM_CUDA_CHECK(cudaFree(dummyBuffer));
+    }
+
     // Register the buffer with NCCL as a window
     ncclResult_t regResult
         = ncclCommWindowRegisterFunc(comm, buffer.ptr, size, &buffer.window, NCCL_WIN_COLL_SYMMETRIC);
@@ -462,6 +483,22 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
     {
         ncclMemFree(buffer.ptr);
         TLLM_THROW("ncclCommWindowRegister failed with error: %d", regResult);
+    }
+
+    // Synchronize all ranks after the collective ncclCommWindowRegister call.
+    // This ensures all ranks have completed registration before proceeding.
+    if (nRanks > 1)
+    {
+        // Create a dummy buffer for the barrier allreduce
+        void* dummyBuffer;
+        TLLM_CUDA_CHECK(cudaMalloc(&dummyBuffer, sizeof(int)));
+        int dummyValue = 0;
+        TLLM_CUDA_CHECK(cudaMemcpy(dummyBuffer, &dummyValue, sizeof(int), cudaMemcpyHostToDevice));
+        // Perform a dummy allreduce as a barrier to synchronize all ranks
+        NCCLCHECK_THROW(ncclAllReduce(dummyBuffer, dummyBuffer, 1, ncclInt, ncclSum, comm, nullptr));
+        // Synchronize the default stream to ensure the allreduce completes
+        TLLM_CUDA_CHECK(cudaStreamSynchronize(nullptr));
+        TLLM_CUDA_CHECK(cudaFree(dummyBuffer));
     }
 
     TLLM_LOG_TRACE("[NCCLUtil] Allocated and registered NCCL window buffer: handle=%d, ptr=%p, size=%zu, window=%p",

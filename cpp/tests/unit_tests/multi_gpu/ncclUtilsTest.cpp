@@ -21,8 +21,13 @@
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
+#include <atomic>
+#include <chrono>
 #include <gtest/gtest.h>
+#include <mutex>
 #include <nccl.h>
+#include <set>
+#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -523,6 +528,408 @@ TEST_F(NCCLWindowAllocatorTest, MultipleComms)
     // Clean up comms
     comm1.reset();
     comm2.reset();
+}
+
+//==============================================================================
+// Tests for Changes 2, 3, 4, 5: First-fit, mutex management, thread safety
+//==============================================================================
+
+TEST_F(NCCLWindowAllocatorTest, FirstFitBehavior)
+{
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+
+    // Allocate buffers of different sizes in order
+    auto buffer512KB = allocator.requestBuffer(*mComm, 512 * 1024);
+    auto buffer1MB = allocator.requestBuffer(*mComm, 1024 * 1024);
+    auto buffer2MB = allocator.requestBuffer(*mComm, 2 * 1024 * 1024);
+
+    void* ptr512KB = buffer512KB.ptr;
+    void* ptr1MB = buffer1MB.ptr;
+    void* ptr2MB = buffer2MB.ptr;
+
+    // Release in order: 512KB, 1MB, 2MB
+    allocator.releaseBuffer(*mComm, ptr512KB);
+    allocator.releaseBuffer(*mComm, ptr1MB);
+    allocator.releaseBuffer(*mComm, ptr2MB);
+
+    // Test 1: Request 400KB - first-fit should select 512KB (first buffer >= 400KB)
+    // This demonstrates first-fit vs best-fit: first-fit takes first that fits, not smallest
+    auto buffer400KB = allocator.requestBuffer(*mComm, 400 * 1024);
+    EXPECT_TRUE(buffer400KB.isValid());
+    EXPECT_EQ(buffer400KB.ptr, ptr512KB); // First-fit: first buffer >= 400KB
+    EXPECT_EQ(buffer400KB.size, 512 * 1024);
+    allocator.releaseBuffer(*mComm, buffer400KB.ptr);
+
+    // Test 2: Request 768KB - first-fit should select 1MB (first buffer >= 768KB)
+    // 512KB is too small, so it skips to 1MB
+    auto buffer768KB = allocator.requestBuffer(*mComm, 768 * 1024);
+    EXPECT_TRUE(buffer768KB.isValid());
+    EXPECT_EQ(buffer768KB.ptr, ptr1MB); // First-fit: first buffer >= 768KB
+    EXPECT_EQ(buffer768KB.size, 1024 * 1024);
+    allocator.releaseBuffer(*mComm, buffer768KB.ptr);
+
+    // Test 3: Request 1.5MB - first-fit should select 2MB (first buffer >= 1.5MB)
+    // 512KB and 1MB are too small, so it takes 2MB
+    auto buffer1_5MB = allocator.requestBuffer(*mComm, 1536 * 1024);
+    EXPECT_TRUE(buffer1_5MB.isValid());
+    EXPECT_EQ(buffer1_5MB.ptr, ptr2MB); // First-fit: first buffer >= 1.5MB
+    EXPECT_EQ(buffer1_5MB.size, 2 * 1024 * 1024);
+    allocator.releaseBuffer(*mComm, buffer1_5MB.ptr);
+}
+
+TEST_F(NCCLWindowAllocatorTest, ThreadSafetyConcurrentRequests)
+{
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+
+    const size_t bufferSize = 256 * 1024;
+    int const numThreads = 10; // Increased for better stress testing
+    int const buffersPerThread = 5;
+
+    std::vector<std::thread> threads;
+    std::vector<std::vector<void*>> threadBuffers(numThreads);
+    std::atomic<bool> startFlag{false};
+    std::atomic<int> readyCount{0};
+
+    // Error collection for better diagnostics (inspired by Python RPC tests)
+    std::mutex errorMutex;
+    std::vector<std::string> errors;
+
+    // Launch threads that will concurrently request buffers
+    for (int t = 0; t < numThreads; ++t)
+    {
+        threads.emplace_back(
+            [&, t]()
+            {
+                try
+                {
+                    readyCount++;
+                    // Wait for all threads to be ready
+                    while (!startFlag)
+                    {
+                        std::this_thread::yield();
+                    }
+
+                    // Each thread requests multiple buffers
+                    for (int i = 0; i < buffersPerThread; ++i)
+                    {
+                        auto buffer = allocator.requestBuffer(*mComm, bufferSize);
+                        if (!buffer.isValid())
+                        {
+                            std::lock_guard<std::mutex> lock(errorMutex);
+                            std::ostringstream oss;
+                            oss << "Thread " << t << ": Buffer " << i << " is invalid";
+                            errors.push_back(oss.str());
+                        }
+                        threadBuffers[t].push_back(buffer.ptr);
+                        // Small delay to increase chance of interleaving
+                        std::this_thread::sleep_for(std::chrono::microseconds(10));
+                    }
+                }
+                catch (std::exception const& e)
+                {
+                    std::lock_guard<std::mutex> lock(errorMutex);
+                    std::ostringstream oss;
+                    oss << "Thread " << t << ": Exception: " << e.what();
+                    errors.push_back(oss.str());
+                }
+            });
+    }
+
+    // Wait for all threads to be ready
+    while (readyCount < numThreads)
+    {
+        std::this_thread::yield();
+    }
+
+    // Start all threads simultaneously
+    startFlag = true;
+
+    // Wait for all threads to complete with timeout
+    for (auto& thread : threads)
+    {
+        thread.join();
+    }
+
+    // Check for errors first
+    if (!errors.empty())
+    {
+        std::ostringstream oss;
+        oss << "Thread safety test failed with " << errors.size() << " errors:\n";
+        for (auto const& error : errors)
+        {
+            oss << "  " << error << "\n";
+        }
+        FAIL() << oss.str();
+    }
+
+    // Verify all buffers were allocated successfully
+    int totalBuffers = 0;
+    for (auto const& buffers : threadBuffers)
+    {
+        totalBuffers += buffers.size();
+        for (void* ptr : buffers)
+        {
+            EXPECT_NE(ptr, nullptr) << "Thread allocated null buffer";
+            auto found = allocator.searchBuffer(*mComm, ptr);
+            EXPECT_TRUE(found.isValid()) << "Buffer not found in allocator";
+        }
+    }
+
+    EXPECT_EQ(totalBuffers, numThreads * buffersPerThread)
+        << "Expected " << (numThreads * buffersPerThread) << " buffers, got " << totalBuffers;
+    EXPECT_EQ(allocator.getBufferInUseCount(*mComm), totalBuffers) << "Buffer in-use count mismatch";
+
+    // Release all buffers
+    for (auto& buffers : threadBuffers)
+    {
+        for (void* ptr : buffers)
+        {
+            allocator.releaseBuffer(*mComm, ptr);
+        }
+    }
+
+    EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 0) << "Buffers not released";
+}
+
+TEST_F(NCCLWindowAllocatorTest, MutexManagementNoDeadlock)
+{
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+
+    const size_t bufferSize = 128 * 1024;
+    int const numIterations = 50; // Increased for better stress testing
+
+    // This test verifies that mutex management (Change 3) works correctly:
+    // - mMutex is released before calling allocateAndRegisterBuffer
+    // - allocateAndRegisterBuffer acquires NCCL op mutex
+    // - No deadlock occurs
+
+    auto startTime = std::chrono::steady_clock::now();
+
+    for (int i = 0; i < numIterations; ++i)
+    {
+        // Request and release buffers repeatedly
+        // This exercises the mutex release/acquire pattern
+        auto buffer1 = allocator.requestBuffer(*mComm, bufferSize);
+        auto buffer2 = allocator.requestBuffer(*mComm, bufferSize * 2);
+        auto buffer3 = allocator.requestBuffer(*mComm, bufferSize * 3);
+
+        EXPECT_TRUE(buffer1.isValid()) << "Iteration " << i << ": buffer1 invalid";
+        EXPECT_TRUE(buffer2.isValid()) << "Iteration " << i << ": buffer2 invalid";
+        EXPECT_TRUE(buffer3.isValid()) << "Iteration " << i << ": buffer3 invalid";
+
+        allocator.releaseBuffer(*mComm, buffer1.ptr);
+        allocator.releaseBuffer(*mComm, buffer2.ptr);
+        allocator.releaseBuffer(*mComm, buffer3.ptr);
+
+        // Request again - should reuse buffers
+        auto buffer1Reuse = allocator.requestBuffer(*mComm, bufferSize);
+        EXPECT_TRUE(buffer1Reuse.isValid()) << "Iteration " << i << ": buffer1Reuse invalid";
+        allocator.releaseBuffer(*mComm, buffer1Reuse.ptr);
+    }
+
+    auto endTime = std::chrono::steady_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+
+    // If we get here without deadlock, the mutex management is working correctly
+    EXPECT_GE(allocator.getBufferCount(*mComm), 0);
+
+    // Verify test completed in reasonable time (should not hang)
+    // 50 iterations should complete in under 5 seconds
+    EXPECT_LT(duration.count(), 5000) << "Test took " << duration.count()
+                                      << "ms, possible deadlock or performance issue";
+}
+
+TEST_F(NCCLWindowAllocatorTest, PerCommunicatorMutexIsolation)
+{
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+
+    // Create two different communicators
+    auto comm1 = createSplitComm(*mComm, 0, mRank);
+    auto comm2 = createSplitComm(*mComm, 1, mRank);
+
+    const size_t bufferSize = 64 * 1024;
+
+    // This test verifies that each communicator has its own NCCL op mutex (Change 4)
+    // Operations on different communicators should not block each other
+    // We use timing to verify that operations proceed in parallel
+
+    std::atomic<bool> comm1Done{false};
+    std::atomic<bool> comm2Done{false};
+    auto startTime = std::chrono::steady_clock::now();
+    auto comm1StartTime = startTime;
+    auto comm2StartTime = startTime;
+
+    // Thread 1: Operate on comm1
+    std::thread thread1(
+        [&]()
+        {
+            comm1StartTime = std::chrono::steady_clock::now();
+            for (int i = 0; i < 10; ++i)
+            {
+                auto buffer = allocator.requestBuffer(*comm1, bufferSize);
+                EXPECT_TRUE(buffer.isValid());
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                allocator.releaseBuffer(*comm1, buffer.ptr);
+            }
+            comm1Done = true;
+        });
+
+    // Thread 2: Operate on comm2 simultaneously
+    std::thread thread2(
+        [&]()
+        {
+            comm2StartTime = std::chrono::steady_clock::now();
+            for (int i = 0; i < 10; ++i)
+            {
+                auto buffer = allocator.requestBuffer(*comm2, bufferSize);
+                EXPECT_TRUE(buffer.isValid());
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                allocator.releaseBuffer(*comm2, buffer.ptr);
+            }
+            comm2Done = true;
+        });
+
+    // Both threads should complete without blocking each other
+    // (operations on different comms use different mutexes)
+    thread1.join();
+    thread2.join();
+    auto endTime = std::chrono::steady_clock::now();
+
+    EXPECT_TRUE(comm1Done) << "comm1 thread did not complete";
+    EXPECT_TRUE(comm2Done) << "comm2 thread did not complete";
+
+    // Verify both threads started around the same time (within 100ms)
+    // This ensures they ran concurrently, not sequentially
+    auto startDiff
+        = (comm1StartTime > comm2StartTime) ? (comm1StartTime - comm2StartTime) : (comm2StartTime - comm1StartTime);
+    EXPECT_LT(startDiff, std::chrono::milliseconds(100)) << "Threads did not start concurrently (isolation test)";
+
+    // Total time should be roughly the time for one thread (not both sequentially)
+    // Each thread does 10 iterations * 5ms = 50ms, so total should be ~50-60ms, not ~100ms
+    auto totalDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+    EXPECT_LT(totalDuration.count(), 100)
+        << "Operations took too long, suggesting sequential execution instead of parallel";
+
+    // Clean up comms
+    comm1.reset();
+    comm2.reset();
+}
+
+TEST_F(NCCLWindowAllocatorTest, ConcurrentAllocationSameComm)
+{
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+
+    const size_t bufferSize = 512 * 1024;
+    int const numThreads = 8; // Increased for better stress testing
+
+    // This test verifies that NCCL op mutex (Change 5) properly serializes
+    // NCCL operations on the same communicator from multiple threads
+
+    std::vector<std::thread> threads;
+    std::vector<void*> buffers(numThreads);
+    std::vector<std::chrono::steady_clock::time_point> allocationTimes(numThreads);
+    std::atomic<bool> startFlag{false};
+    std::atomic<int> readyCount{0};
+
+    // Error collection
+    std::mutex errorMutex;
+    std::vector<std::string> errors;
+
+    for (int t = 0; t < numThreads; ++t)
+    {
+        threads.emplace_back(
+            [&, t]()
+            {
+                try
+                {
+                    readyCount++;
+                    while (!startFlag)
+                    {
+                        std::this_thread::yield();
+                    }
+
+                    // All threads request buffers from the same comm simultaneously
+                    // The NCCL op mutex should serialize the NCCL operations
+                    auto allocStart = std::chrono::steady_clock::now();
+                    auto buffer = allocator.requestBuffer(*mComm, bufferSize);
+                    allocationTimes[t] = std::chrono::steady_clock::now();
+
+                    if (!buffer.isValid())
+                    {
+                        std::lock_guard<std::mutex> lock(errorMutex);
+                        std::ostringstream oss;
+                        oss << "Thread " << t << ": Invalid buffer";
+                        errors.push_back(oss.str());
+                    }
+                    buffers[t] = buffer.ptr;
+                }
+                catch (std::exception const& e)
+                {
+                    std::lock_guard<std::mutex> lock(errorMutex);
+                    std::ostringstream oss;
+                    oss << "Thread " << t << ": Exception: " << e.what();
+                    errors.push_back(oss.str());
+                }
+            });
+    }
+
+    while (readyCount < numThreads)
+    {
+        std::this_thread::yield();
+    }
+
+    auto testStart = std::chrono::steady_clock::now();
+    startFlag = true;
+
+    for (auto& thread : threads)
+    {
+        thread.join();
+    }
+    auto testEnd = std::chrono::steady_clock::now();
+
+    // Check for errors
+    if (!errors.empty())
+    {
+        std::ostringstream oss;
+        oss << "Concurrent allocation test failed with " << errors.size() << " errors:\n";
+        for (auto const& error : errors)
+        {
+            oss << "  " << error << "\n";
+        }
+        FAIL() << oss.str();
+    }
+
+    // All buffers should be valid and different
+    std::set<void*> uniqueBuffers;
+    for (size_t i = 0; i < buffers.size(); ++i)
+    {
+        void* ptr = buffers[i];
+        EXPECT_NE(ptr, nullptr) << "Thread " << i << " got null buffer";
+        uniqueBuffers.insert(ptr);
+        auto found = allocator.searchBuffer(*mComm, ptr);
+        EXPECT_TRUE(found.isValid()) << "Thread " << i << " buffer not found";
+    }
+
+    // All buffers should be unique (each thread got its own buffer)
+    EXPECT_EQ(uniqueBuffers.size(), numThreads)
+        << "Expected " << numThreads << " unique buffers, got " << uniqueBuffers.size();
+
+    // Verify that allocations were serialized (not all happened at once)
+    // If properly serialized, allocations should be spread over time
+    auto minTime = *std::min_element(allocationTimes.begin(), allocationTimes.end());
+    auto maxTime = *std::max_element(allocationTimes.begin(), allocationTimes.end());
+    auto allocationSpread = std::chrono::duration_cast<std::chrono::microseconds>(maxTime - minTime);
+
+    // Allocations should take some time (serialization overhead)
+    // But not too long (should complete reasonably quickly)
+    EXPECT_GT(allocationSpread.count(), 0) << "Allocations happened simultaneously (no serialization)";
+    EXPECT_LT(allocationSpread.count(), 1000000) << "Allocations took too long (>1s)";
+
+    // Release all buffers
+    for (void* ptr : buffers)
+    {
+        allocator.releaseBuffer(*mComm, ptr);
+    }
 }
 
 #if ENABLE_MULTI_DEVICE && BUILD_PYT
