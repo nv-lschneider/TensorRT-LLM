@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/opUtils.h"
 #include <limits>
 #include <stdexcept>
 
