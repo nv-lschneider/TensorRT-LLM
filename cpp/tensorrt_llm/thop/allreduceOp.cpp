@@ -496,6 +496,9 @@ private:
             std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Calling ProcessGroup->allreduce" << std::endl
                       << std::flush;
             PGCHECK_THROW(torchPg->allreduce(tensors, {c10d::ReduceOp::SUM}));
+            // ProcessGroup allreduce may use async operations, synchronize before logging completion
+            auto pgStream = at::cuda::getCurrentCUDAStream(input.get_device());
+            TLLM_CUDA_CHECK(cudaStreamSynchronize(pgStream));
             std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": ProcessGroup->allreduce completed"
                       << std::endl
                       << std::flush;
@@ -510,7 +513,14 @@ private:
             // Treat any other patterns as fallback cases.
             std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Calling fallbackRunSubsequentOps"
                       << std::endl;
-            return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, reduceOutput);
+            auto result = fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, reduceOutput);
+            // Synchronize stream before logging completion - fallbackRunSubsequentOps launches GPU kernels
+            auto pgStream = at::cuda::getCurrentCUDAStream(input.get_device());
+            TLLM_CUDA_CHECK(cudaStreamSynchronize(pgStream));
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                      << ": fallbackRunSubsequentOps completed (ProcessGroup path)" << std::endl
+                      << std::flush;
+            return result;
         }
 
         // From here on, we have a raw NCCL comm - can proceed with window registration
@@ -621,6 +631,7 @@ private:
                 std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Calling cudaMemcpyAsync" << std::endl;
                 TLLM_CUDA_CHECK(cudaMemcpyAsync(
                     symmetricBuffer0.ptr, input.data_ptr(), bufferSizeBytes, cudaMemcpyDeviceToDevice, stream));
+                TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
                 std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": cudaMemcpyAsync completed" << std::endl;
                 windowBuffer0 = symmetricBuffer0;
                 inputTensor = symmetricInput; // Swap to window-backed tensor
@@ -657,6 +668,7 @@ private:
                   << ", comm=" << comm << ", stream=" << stream << std::endl
                   << std::flush;
         NCCLCHECK_THROW(ncclAllReduce(inputPtr, outputPtr, size, (*getDtypeMap())[mType], ncclSum, comm, stream));
+        TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
         std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": ncclAllReduce completed successfully"
                   << std::endl
                   << std::flush;
@@ -671,6 +683,8 @@ private:
         // Treat any other patterns as fallback cases.
         std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Calling fallbackRunSubsequentOps" << std::endl;
         auto result = fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, outputTensor);
+        // Synchronize stream before logging completion - fallbackRunSubsequentOps launches GPU kernels
+        TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
         std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": fallbackRunSubsequentOps completed" << std::endl;
         std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": runNCCLAllReduceSymmetric completed successfully"
                   << std::endl;

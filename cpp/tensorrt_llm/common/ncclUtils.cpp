@@ -590,14 +590,11 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
                   << ": About to call ncclAllReduce (barrier before registration)" << std::endl
                   << std::flush;
         NCCLCHECK_THROW(ncclAllReduce(dummyBuffer, dummyBuffer, 1, ncclInt, ncclSum, comm, nullptr));
+        // Synchronize the default stream to ensure the allreduce completes before logging
+        TLLM_CUDA_CHECK(cudaStreamSynchronize(nullptr));
         std::cout << "[NCCLWindowAllocator::allocateAndRegisterBuffer] Rank " << rank
                   << ": ncclAllReduce (barrier before registration) completed" << std::endl
                   << std::flush;
-        // Synchronize the default stream to ensure the allreduce completes
-        std::cout << "[NCCLWindowAllocator::allocateAndRegisterBuffer] Rank " << rank
-                  << ": Synchronizing default stream" << std::endl
-                  << std::flush;
-        TLLM_CUDA_CHECK(cudaStreamSynchronize(nullptr));
         TLLM_CUDA_CHECK(cudaFree(dummyBuffer));
         std::cout << "[NCCLWindowAllocator::allocateAndRegisterBuffer] Rank " << rank
                   << ": Barrier (before registration) completed" << std::endl
@@ -639,14 +636,11 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
                   << ": About to call ncclAllReduce (barrier after registration)" << std::endl
                   << std::flush;
         NCCLCHECK_THROW(ncclAllReduce(dummyBuffer, dummyBuffer, 1, ncclInt, ncclSum, comm, nullptr));
+        // Synchronize the default stream to ensure the allreduce completes before logging
+        TLLM_CUDA_CHECK(cudaStreamSynchronize(nullptr));
         std::cout << "[NCCLWindowAllocator::allocateAndRegisterBuffer] Rank " << rank
                   << ": ncclAllReduce (barrier after registration) completed" << std::endl
                   << std::flush;
-        // Synchronize the default stream to ensure the allreduce completes
-        std::cout << "[NCCLWindowAllocator::allocateAndRegisterBuffer] Rank " << rank
-                  << ": Synchronizing default stream" << std::endl
-                  << std::flush;
-        TLLM_CUDA_CHECK(cudaStreamSynchronize(nullptr));
         TLLM_CUDA_CHECK(cudaFree(dummyBuffer));
         std::cout << "[NCCLWindowAllocator::allocateAndRegisterBuffer] Rank " << rank
                   << ": Barrier (after registration) completed" << std::endl

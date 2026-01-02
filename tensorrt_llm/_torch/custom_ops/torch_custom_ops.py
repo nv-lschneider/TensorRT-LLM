@@ -1760,12 +1760,12 @@ class AllReduceRunner(TunableRunner):
             f"[AllReduceRunner.forward] Rank {rank}: residual={residual is not None}, norm_weight={norm_weight is not None}, scale={scale is not None}, bias={bias is not None}, workspace={workspace is not None}"
         )
 
-        if tactic == -1:
-            # Enabled NCCL_SYMMETRIC for debugging hang issue
-            tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
-            print(
-                f"[AllReduceRunner.forward] Rank {rank}: tactic was -1, using fallback NCCL_SYMMETRIC={tactic}"
-            )
+        # if tactic == -1:
+        #     # Enabled NCCL_SYMMETRIC for debugging hang issue
+        #     tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
+        #     print(
+        #         f"[AllReduceRunner.forward] Rank {rank}: tactic was -1, using fallback NCCL_SYMMETRIC={tactic}"
+        #     )
 
         print(
             f"[AllReduceRunner.forward] Rank {rank}: Calling torch.ops.trtllm.allreduce with tactic={tactic}"
@@ -1784,7 +1784,16 @@ class AllReduceRunner(TunableRunner):
             self.trigger_completion_at_end,
         )
         print(
-            f"[AllReduceRunner.forward] Rank {rank}: torch.ops.trtllm.allreduce completed, result shape={result.shape if hasattr(result, 'shape') else 'N/A'}"
+            f"[AllReduceRunner.forward] Rank {rank}: torch.ops.trtllm.allreduce returned, result type={type(result)}, result shape={result.shape if hasattr(result, 'shape') else 'N/A'}"
+        )
+        # Synchronize CUDA stream to ensure all GPU work is complete before returning
+        if input.is_cuda:
+            torch.cuda.synchronize(input.device)
+            print(
+                f"[AllReduceRunner.forward] Rank {rank}: CUDA stream synchronized after allreduce"
+            )
+        print(
+            f"[AllReduceRunner.forward] Rank {rank}: AllReduceRunner.forward completed successfully, returning result"
         )
         return result
 
