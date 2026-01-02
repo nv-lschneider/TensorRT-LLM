@@ -653,8 +653,8 @@ private:
         std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": About to call ncclAllReduce" << std::endl
                   << std::flush;
         std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": inputPtr=" << inputPtr
-                  << ", outputPtr=" << outputPtr << ", size=" << size << ", dtype=" << mType << ", comm=" << comm
-                  << ", stream=" << stream << std::endl
+                  << ", outputPtr=" << outputPtr << ", size=" << size << ", dtype=" << static_cast<int>(mType)
+                  << ", comm=" << comm << ", stream=" << stream << std::endl
                   << std::flush;
         NCCLCHECK_THROW(ncclAllReduce(inputPtr, outputPtr, size, (*getDtypeMap())[mType], ncclSum, comm, stream));
         std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": ncclAllReduce completed successfully"
