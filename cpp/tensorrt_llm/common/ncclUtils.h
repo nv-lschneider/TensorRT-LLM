@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -363,9 +364,27 @@ private:
 inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
     ncclComm_t comm, at::IntArrayRef shape, torch::ScalarType dtype)
 {
+    int rank = -1;
+    if (comm != nullptr)
+    {
+        ncclCommUserRank(comm, &rank);
+    }
+    std::cout << "[createNCCLWindowTensor] Rank " << rank
+              << ": Starting createNCCLWindowTensor, comm=" << static_cast<void*>(comm) << ", dtype=" << dtype
+              << std::endl
+              << std::flush;
+
     // Calculate buffer size
     int64_t buffer_size
         = std::accumulate(shape.begin(), shape.end(), 1LL, std::multiplies<int64_t>()) * torch::elementSize(dtype);
+    std::cout << "[createNCCLWindowTensor] Rank " << rank << ": Calculated buffer_size=" << buffer_size << ", shape=[";
+    for (size_t i = 0; i < shape.size(); ++i)
+    {
+        if (i > 0)
+            std::cout << ", ";
+        std::cout << shape[i];
+    }
+    std::cout << "]" << std::endl << std::flush;
 
     // Calculate strides
     std::vector<int64_t> strides_vec(shape.size());
@@ -379,12 +398,20 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
     }
 
     // Request buffer from allocator
+    std::cout << "[createNCCLWindowTensor] Rank " << rank << ": Calling allocator.requestBuffer" << std::endl
+              << std::flush;
     auto& allocator = NCCLWindowAllocator::getInstance();
     auto buffer = allocator.requestBuffer(comm, buffer_size);
+    std::cout << "[createNCCLWindowTensor] Rank " << rank
+              << ": allocator.requestBuffer completed, buffer.ptr=" << buffer.ptr << ", buffer.size=" << buffer.size
+              << std::endl
+              << std::flush;
 
     // Defensive validation: ensure buffer is valid before proceeding
     if (!buffer.isValid())
     {
+        std::cout << "[createNCCLWindowTensor] Rank " << rank << ": ERROR - Invalid buffer returned" << std::endl
+                  << std::flush;
         std::ostringstream oss;
         oss << "Failed to allocate NCCL window buffer: invalid buffer returned from requestBuffer "
             << "(comm=" << static_cast<void*>(comm) << ", buffer_size=" << buffer_size << ")";
@@ -395,7 +422,11 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
     auto deleter = [comm, ptr = buffer.ptr](void*) { NCCLWindowAllocator::getInstance().releaseBuffer(comm, ptr); };
 
     // Create tensor from the buffer
+    std::cout << "[createNCCLWindowTensor] Rank " << rank << ": Creating tensor from buffer" << std::endl << std::flush;
     auto tensor = torch::from_blob(buffer.ptr, shape, strides_vec, deleter, torch::dtype(dtype).device(torch::kCUDA));
+    std::cout << "[createNCCLWindowTensor] Rank " << rank << ": createNCCLWindowTensor completed successfully"
+              << std::endl
+              << std::flush;
 
     return std::make_pair(tensor, buffer);
 }

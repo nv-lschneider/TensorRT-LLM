@@ -54,6 +54,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <iostream>
 #include <limits>
 #include <unordered_set>
 
@@ -293,15 +294,30 @@ public:
 
         // Log runtime strategy
         auto const rank = getRank();
+        std::cout << "[AllreduceOp::run] Rank " << rank << ": Starting run, input shape=[" << input.size(0);
+        for (int i = 1; i < input.dim(); ++i)
+        {
+            std::cout << ", " << input.size(i);
+        }
+        std::cout << "], dtype=" << input.scalar_type() << ", size=" << size << ", seq_len=" << seq_len
+                  << ", hidden_size=" << hidden_size << ", bytes_per_element=" << bytes_per_element << std::endl;
+        std::cout << "[AllreduceOp::run] Rank " << rank
+                  << ": runtime_strategy=" << tensorrt_llm::kernels::toString(runtime_strategy) << std::endl;
         TLLM_LOG_DEBUG(
             "AllReduceOp runtime strategy for rank %d: " + tensorrt_llm::kernels::toString(runtime_strategy), rank);
 
         // Dispatch to different allreduce implementations
         switch (runtime_strategy)
         {
-        case AllReduceStrategyType::UB: return runUBAllReduce(input, residual, norm_weight, scale, bias);
-        case AllReduceStrategyType::NCCL: return runNCCLAllReduce(input, residual, norm_weight, scale, bias);
+        case AllReduceStrategyType::UB:
+            std::cout << "[AllreduceOp::run] Rank " << rank << ": Dispatching to runUBAllReduce" << std::endl;
+            return runUBAllReduce(input, residual, norm_weight, scale, bias);
+        case AllReduceStrategyType::NCCL:
+            std::cout << "[AllreduceOp::run] Rank " << rank << ": Dispatching to runNCCLAllReduce" << std::endl;
+            return runNCCLAllReduce(input, residual, norm_weight, scale, bias);
         case AllReduceStrategyType::NCCL_SYMMETRIC:
+            std::cout << "[AllreduceOp::run] Rank " << rank << ": Dispatching to runNCCLAllReduceSymmetric"
+                      << std::endl;
             return runNCCLAllReduceSymmetric(input, residual, norm_weight, scale, bias);
         case AllReduceStrategyType::MIN_LATENCY:
         case AllReduceStrategyType::ONESHOT:
@@ -449,29 +465,60 @@ private:
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
         torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias)
     {
+        auto const rank = getRank();
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Starting runNCCLAllReduceSymmetric" << std::endl;
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": input shape=[" << input.size(0);
+        for (int i = 1; i < input.dim(); ++i)
+        {
+            std::cout << ", " << input.size(i);
+        }
+        std::cout << "], dtype=" << input.scalar_type() << ", device=" << input.device() << std::endl;
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                  << ": residual=" << (residual.has_value() ? "yes" : "no")
+                  << ", norm_weight=" << (norm_weight.has_value() ? "yes" : "no")
+                  << ", scale=" << (scale.has_value() ? "yes" : "no") << ", bias=" << (bias.has_value() ? "yes" : "no")
+                  << std::endl;
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": mNcclComm.index()=" << mNcclComm.index()
+                  << std::endl;
+
         // Handle ProcessGroup path first - cannot extract NCCL comm for window registration
         // Use ProcessGroup's allreduce directly and return early
         if (mNcclComm.index() == 1)
         {
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Using ProcessGroup path" << std::endl;
             auto torchPg = std::get<1>(mNcclComm);
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                      << ": Got ProcessGroup, rank=" << torchPg->getRank() << std::endl;
 
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Cloning input tensor" << std::endl;
             torch::Tensor reduceOutput = input.clone();
             std::vector tensors{reduceOutput};
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Calling ProcessGroup->allreduce" << std::endl
+                      << std::flush;
             PGCHECK_THROW(torchPg->allreduce(tensors, {c10d::ReduceOp::SUM}));
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": ProcessGroup->allreduce completed"
+                      << std::endl
+                      << std::flush;
 
             if (mOp == AllReduceFusionOp::NONE)
             {
+                std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": mOp is NONE, returning reduceOutput"
+                          << std::endl;
                 return {reduceOutput};
             }
 
             // Treat any other patterns as fallback cases.
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Calling fallbackRunSubsequentOps"
+                      << std::endl;
             return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, reduceOutput);
         }
 
         // From here on, we have a raw NCCL comm - can proceed with window registration
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Using raw NCCL comm path" << std::endl;
         auto rawComm = std::get<0>(mNcclComm);
         ncclComm_t comm = *rawComm;
         TLLM_CHECK_WITH_INFO(comm != nullptr, "NCCL communicator is null");
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Got raw NCCL comm, comm=" << comm << std::endl;
         TLLM_LOG_DEBUG("[runNCCLAllReduceSymmetric] Using raw NCCL comm path (not ProcessGroup)");
 
         using tensorrt_llm::common::nccl_util::NCCLWindowAllocator;
@@ -480,6 +527,8 @@ private:
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
         int size = input.numel();
         size_t bufferSizeBytes = size * input.element_size();
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Got CUDA stream=" << stream << ", size=" << size
+                  << ", bufferSizeBytes=" << bufferSizeBytes << std::endl;
 
         // Using unregistered input buffers with NCCL symmetric, requires a memcpy
         // This is an overhead introduced with using NCCL_SYMMTRIC over NCCL.
@@ -494,33 +543,61 @@ private:
         double const a = -4986.43478503;
         double const b = 156716.52177552;
         int nRanks;
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Calling ncclCommCount" << std::endl
+                  << std::flush;
         NCCLCHECK_THROW(ncclCommCount(comm, &nRanks));
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": ncclCommCount completed, nRanks=" << nRanks
+                  << std::endl
+                  << std::flush;
         size_t minRegistrationThreshold = static_cast<size_t>(std::max(0.0, a * nRanks + b)) * input.element_size();
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                  << ": Initial minRegistrationThreshold=" << minRegistrationThreshold
+                  << ", mIsNVLINKSupported=" << mIsNVLINKSupported << ", mIsMNNVLSupported=" << mIsMNNVLSupported
+                  << std::endl;
         // Disable window registration if neither NVLink nor MNNVL is supported
         // TODO replace in NCCL 2.29 with comm query
         if (!mIsNVLINKSupported && !mIsMNNVLSupported)
         {
             minRegistrationThreshold = std::numeric_limits<size_t>::max();
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                      << ": Neither NVLink nor MNNVL supported, setting threshold to max" << std::endl;
         }
         char const* envThreshold = std::getenv("TLLM_NCCL_MIN_REGISTRATION");
         if (envThreshold != nullptr)
         {
             minRegistrationThreshold = static_cast<size_t>(std::atoi(envThreshold)) * input.element_size();
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                      << ": Overriding threshold from env, minRegistrationThreshold=" << minRegistrationThreshold
+                      << std::endl;
         }
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                  << ": Final minRegistrationThreshold=" << minRegistrationThreshold << std::endl;
 
         // Search for existing buffer
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Getting NCCLWindowAllocator instance"
+                  << std::endl;
         auto& allocator = NCCLWindowAllocator::getInstance();
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                  << ": Searching for existing buffer, input.data_ptr()=" << input.data_ptr() << std::endl;
         auto windowBuffer0 = allocator.searchBuffer(comm, input.data_ptr());
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                  << ": searchBuffer completed, windowBuffer0.isValid()=" << windowBuffer0.isValid() << std::endl;
 
         torch::Tensor inputTensor = input;
         void* inputPtr = input.data_ptr();
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Initial inputPtr=" << inputPtr << std::endl;
 
         // If buffer is not registered, decide whether to register based on size
         if (!windowBuffer0.isValid())
         {
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                      << ": Buffer not registered, checking size threshold" << std::endl;
             if (bufferSizeBytes < minRegistrationThreshold)
             {
                 // Small buffer: use input directly without window registration
+                std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Buffer size " << bufferSizeBytes
+                          << " < threshold " << minRegistrationThreshold << ", skipping window registration"
+                          << std::endl;
                 TLLM_LOG_DEBUG(
                     "[runNCCLAllReduceSymmetric] Buffer size %zu bytes < threshold %zu bytes, "
                     "skipping window registration",
@@ -530,36 +607,74 @@ private:
             else
             {
                 // Large buffer: create window buffer and copy input (can swap inputTensor reference)
+                std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Buffer size " << bufferSizeBytes
+                          << " >= threshold " << minRegistrationThreshold << ", creating window buffer" << std::endl;
+                std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Calling createNCCLWindowTensor"
+                          << std::endl
+                          << std::flush;
                 auto [symmetricInput, symmetricBuffer0]
                     = createNCCLWindowTensor(comm, input.sizes(), input.scalar_type());
+                std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                          << ": createNCCLWindowTensor completed, symmetricBuffer0.ptr=" << symmetricBuffer0.ptr
+                          << std::endl
+                          << std::flush;
+                std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Calling cudaMemcpyAsync" << std::endl;
                 TLLM_CUDA_CHECK(cudaMemcpyAsync(
                     symmetricBuffer0.ptr, input.data_ptr(), bufferSizeBytes, cudaMemcpyDeviceToDevice, stream));
+                std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": cudaMemcpyAsync completed" << std::endl;
                 windowBuffer0 = symmetricBuffer0;
                 inputTensor = symmetricInput; // Swap to window-backed tensor
                 inputPtr = windowBuffer0.ptr;
+                std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Updated inputPtr=" << inputPtr
+                          << std::endl;
             }
         }
         else
         {
             // Buffer already registered - use it directly
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Buffer already registered, using it directly"
+                      << std::endl;
             inputPtr = windowBuffer0.ptr;
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                      << ": Using registered buffer, inputPtr=" << inputPtr << std::endl;
         }
 
         // Use window-backed output buffer
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Creating output window buffer" << std::endl
+                  << std::flush;
         auto [normOut, windowBuffer1] = createNCCLWindowTensor(comm, input.sizes(), input.scalar_type());
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                  << ": Output window buffer created, windowBuffer1.ptr=" << windowBuffer1.ptr << std::endl
+                  << std::flush;
         torch::Tensor outputTensor = normOut;
         void* outputPtr = windowBuffer1.ptr;
 
         // Perform allreduce
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": About to call ncclAllReduce" << std::endl
+                  << std::flush;
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": inputPtr=" << inputPtr
+                  << ", outputPtr=" << outputPtr << ", size=" << size << ", dtype=" << mType << ", comm=" << comm
+                  << ", stream=" << stream << std::endl
+                  << std::flush;
         NCCLCHECK_THROW(ncclAllReduce(inputPtr, outputPtr, size, (*getDtypeMap())[mType], ncclSum, comm, stream));
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": ncclAllReduce completed successfully"
+                  << std::endl
+                  << std::flush;
 
         if (mOp == AllReduceFusionOp::NONE)
         {
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": mOp is NONE, returning outputTensor"
+                      << std::endl;
             return {outputTensor};
         }
 
         // Treat any other patterns as fallback cases.
-        return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, outputTensor);
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Calling fallbackRunSubsequentOps" << std::endl;
+        auto result = fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, outputTensor);
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": fallbackRunSubsequentOps completed" << std::endl;
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": runNCCLAllReduceSymmetric completed successfully"
+                  << std::endl;
+        return result;
     }
 
     std::vector<torch::Tensor> runLowPrecisionAllReduce(torch::Tensor const& input,

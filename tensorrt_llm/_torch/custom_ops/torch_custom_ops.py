@@ -2,6 +2,7 @@ from functools import lru_cache
 from typing import List, Mapping, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 import triton  # type: ignore[import]
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
@@ -1617,27 +1618,56 @@ class AllReduceRunner(TunableRunner):
         profile: OptimizationProfile,
         **kwargs,
     ) -> List[int]:
+        rank = dist.get_rank() if dist.is_initialized() else -1
+        print(
+            f"[AllReduceRunner.get_valid_tactics] Rank {rank}: Starting get_valid_tactics, tp_size={self.tp_size}, op={self.op}, group={self.group}"
+        )
+
         valid_strategies = [
-            # TODO: NCCL_SYMMETRIC will cause hang during tuning process
-            # AllReduceStrategy.NCCL_SYMMETRIC.value,
+            # Enabled NCCL_SYMMETRIC for debugging hang issue
+            AllReduceStrategy.NCCL_SYMMETRIC.value,
             AllReduceStrategy.NCCL.value,
         ]
+        print(
+            f"[AllReduceRunner.get_valid_tactics] Rank {rank}: Initial valid_strategies={valid_strategies}"
+        )
+
         # Fallback in allreduceOp is set to NCCL_SYMMETRIC as default
         # So we need to check if the workspace size is too large to avoid hanging.
         workspace_size = inputs[0].numel() * inputs[0].element_size()
+        print(
+            f"[AllReduceRunner.get_valid_tactics] Rank {rank}: workspace_size={workspace_size} bytes, input shape={inputs[0].shape}, input dtype={inputs[0].dtype}"
+        )
+
         max_workspace_size = CustomAllReduceHelper.max_workspace_size_auto(
             self.tp_size,
             support_deterministic=False,
         )
+        print(
+            f"[AllReduceRunner.get_valid_tactics] Rank {rank}: max_workspace_size={max_workspace_size} bytes"
+        )
+
         if workspace_size > max_workspace_size:
+            print(
+                f"[AllReduceRunner.get_valid_tactics] Rank {rank}: workspace_size > max_workspace_size, returning early with strategies={valid_strategies}"
+            )
             return valid_strategies
 
         valid_strategies.append(AllReduceStrategy.ONESHOT.value)
+        print(
+            f"[AllReduceRunner.get_valid_tactics] Rank {rank}: Added ONESHOT, valid_strategies={valid_strategies}"
+        )
 
         # Additional restrictions for TWOSHOT strategy
         if inputs[0].shape[0] >= self.tp_size:
             valid_strategies.append(AllReduceStrategy.TWOSHOT.value)
+            print(
+                f"[AllReduceRunner.get_valid_tactics] Rank {rank}: Added TWOSHOT, valid_strategies={valid_strategies}"
+            )
 
+        print(
+            f"[AllReduceRunner.get_valid_tactics] Rank {rank}: Returning final valid_strategies={valid_strategies}"
+        )
         return valid_strategies
 
     def forward(
@@ -1645,12 +1675,30 @@ class AllReduceRunner(TunableRunner):
         inputs: List[torch.Tensor],
         tactic: int = -1,
     ) -> torch.Tensor:
-        input, residual, norm_weight, scale, bias, workspace = inputs
-        if tactic == -1:
-            # TODO: Use NCCL instead of NCCL_SYMMETRIC to avoid hanging during tuning process
-            tactic = AllReduceStrategy.NCCL.value
+        rank = dist.get_rank() if dist.is_initialized() else -1
+        print(
+            f"[AllReduceRunner.forward] Rank {rank}: Starting forward, tactic={tactic}, tp_size={self.tp_size}, op={self.op}, group={self.group}"
+        )
 
-        return torch.ops.trtllm.allreduce(
+        input, residual, norm_weight, scale, bias, workspace = inputs
+        print(
+            f"[AllReduceRunner.forward] Rank {rank}: Input shape={input.shape}, dtype={input.dtype}, device={input.device}"
+        )
+        print(
+            f"[AllReduceRunner.forward] Rank {rank}: residual={residual is not None}, norm_weight={norm_weight is not None}, scale={scale is not None}, bias={bias is not None}, workspace={workspace is not None}"
+        )
+
+        if tactic == -1:
+            # Enabled NCCL_SYMMETRIC for debugging hang issue
+            tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
+            print(
+                f"[AllReduceRunner.forward] Rank {rank}: tactic was -1, using fallback NCCL_SYMMETRIC={tactic}"
+            )
+
+        print(
+            f"[AllReduceRunner.forward] Rank {rank}: Calling torch.ops.trtllm.allreduce with tactic={tactic}"
+        )
+        result = torch.ops.trtllm.allreduce(
             input,
             residual,
             norm_weight,
@@ -1663,6 +1711,10 @@ class AllReduceRunner(TunableRunner):
             self.eps,
             self.trigger_completion_at_end,
         )
+        print(
+            f"[AllReduceRunner.forward] Rank {rank}: torch.ops.trtllm.allreduce completed, result shape={result.shape if hasattr(result, 'shape') else 'N/A'}"
+        )
+        return result
 
 
 @torch.library.custom_op("trtllm::tunable_allreduce", mutates_args=())
@@ -1679,8 +1731,16 @@ def tunable_allreduce(
     tp_size: int,
     trigger_completion_at_end: bool,
 ) -> List[torch.Tensor]:
+    rank = dist.get_rank() if dist.is_initialized() else -1
+    print(
+        f"[tunable_allreduce] Rank {rank}: Starting tunable_allreduce, tp_size={tp_size}, op={op}, group={group}, trigger_completion_at_end={trigger_completion_at_end}"
+    )
+    print(
+        f"[tunable_allreduce] Rank {rank}: Input shape={input.shape}, dtype={input.dtype}, device={input.device}"
+    )
 
     tuner = AutoTuner.get()
+    print(f"[tunable_allreduce] Rank {rank}: Got AutoTuner instance")
 
     allreduce_runner = AllReduceRunner(
         tp_size,
@@ -1689,18 +1749,30 @@ def tunable_allreduce(
         eps,
         trigger_completion_at_end,
     )
+    print(f"[tunable_allreduce] Rank {rank}: Created AllReduceRunner")
 
+    print(f"[tunable_allreduce] Rank {rank}: Calling tuner.choose_one")
     _, best_tactic = tuner.choose_one(
         "trtllm::tunable_allreduce::allreduce",
         [allreduce_runner],
         AllReduceRunner.tuning_config,
         [input, residual, norm_weight, scale, bias, workspace],
     )
+    print(
+        f"[tunable_allreduce] Rank {rank}: tuner.choose_one completed, best_tactic={best_tactic}"
+    )
 
-    return allreduce_runner(
+    print(
+        f"[tunable_allreduce] Rank {rank}: Calling allreduce_runner with best_tactic={best_tactic}"
+    )
+    result = allreduce_runner(
         [input, residual, norm_weight, scale, bias, workspace],
         tactic=best_tactic,
     )
+    print(
+        f"[tunable_allreduce] Rank {rank}: allreduce_runner completed, result type={type(result)}"
+    )
+    return result
 
 
 @tunable_allreduce.register_fake
