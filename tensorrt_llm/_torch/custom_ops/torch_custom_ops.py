@@ -1702,8 +1702,9 @@ class AllReduceRunner(TunableRunner):
             f"[AllReduceRunner.get_valid_tactics] Rank {rank}: Starting get_valid_tactics, tp_size={self.tp_size}, op={self.op}, group={self.group}"
         )
 
+        # Always include NCCL_SYMMETRIC and NCCL as base strategies for auto-tuning
+        # NCCL_SYMMETRIC is the fallback strategy and should always be available
         valid_strategies = [
-            # Enabled NCCL_SYMMETRIC for debugging hang issue
             AllReduceStrategy.NCCL_SYMMETRIC.value,
             AllReduceStrategy.NCCL.value,
         ]
@@ -1727,25 +1728,36 @@ class AllReduceRunner(TunableRunner):
         )
 
         if workspace_size > max_workspace_size:
+            # When workspace is too large, only NCCL_SYMMETRIC and NCCL are supported
+            # NCCL_SYMMETRIC is always included as it's the fallback strategy
             print(
-                f"[AllReduceRunner.get_valid_tactics] Rank {rank}: workspace_size > max_workspace_size, returning early with strategies={valid_strategies}"
+                f"[AllReduceRunner.get_valid_tactics] Rank {rank}: workspace_size > max_workspace_size, returning early with strategies={valid_strategies} (includes NCCL_SYMMETRIC)"
             )
             return valid_strategies
 
+        # When workspace size allows, add ONESHOT and TWOSHOT strategies
+        # NCCL_SYMMETRIC remains in the list for auto-tuning comparison
         valid_strategies.append(AllReduceStrategy.ONESHOT.value)
         print(
-            f"[AllReduceRunner.get_valid_tactics] Rank {rank}: Added ONESHOT, valid_strategies={valid_strategies}"
+            f"[AllReduceRunner.get_valid_tactics] Rank {rank}: Added ONESHOT, valid_strategies={valid_strategies} (includes NCCL_SYMMETRIC)"
         )
 
         # Additional restrictions for TWOSHOT strategy
         if inputs[0].shape[0] >= self.tp_size:
             valid_strategies.append(AllReduceStrategy.TWOSHOT.value)
             print(
-                f"[AllReduceRunner.get_valid_tactics] Rank {rank}: Added TWOSHOT, valid_strategies={valid_strategies}"
+                f"[AllReduceRunner.get_valid_tactics] Rank {rank}: Added TWOSHOT, valid_strategies={valid_strategies} (includes NCCL_SYMMETRIC)"
+            )
+
+        # Ensure NCCL_SYMMETRIC is always in the list for auto-tuning
+        if AllReduceStrategy.NCCL_SYMMETRIC.value not in valid_strategies:
+            valid_strategies.insert(0, AllReduceStrategy.NCCL_SYMMETRIC.value)
+            print(
+                f"[AllReduceRunner.get_valid_tactics] Rank {rank}: NCCL_SYMMETRIC was missing, added it to valid_strategies"
             )
 
         print(
-            f"[AllReduceRunner.get_valid_tactics] Rank {rank}: Returning final valid_strategies={valid_strategies}"
+            f"[AllReduceRunner.get_valid_tactics] Rank {rank}: Returning final valid_strategies={valid_strategies} (NCCL_SYMMETRIC={'included' if AllReduceStrategy.NCCL_SYMMETRIC.value in valid_strategies else 'MISSING'})"
         )
         return valid_strategies
 
