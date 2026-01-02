@@ -767,6 +767,9 @@ private:
         std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
                   << ": Output window buffer created, windowBuffer1.ptr=" << windowBuffer1.ptr << std::endl
                   << std::flush;
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": normOut tensor: data_ptr=" << normOut.data_ptr()
+                  << ", use_count=" << normOut.use_count() << ", device=" << normOut.device() << std::endl
+                  << std::flush;
         void* outputPtr = windowBuffer1.ptr;
 
         // Perform allreduce
@@ -789,16 +792,31 @@ private:
         if (mOp == AllReduceFusionOp::NONE)
         {
             std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": mOp is NONE, returning normOut" << std::endl;
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                      << ": Before return - normOut use_count=" << normOut.use_count()
+                      << ", data_ptr=" << normOut.data_ptr() << std::endl
+                      << std::flush;
             return {normOut};
         }
 
         // Treat any other patterns as fallback cases.
         std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Calling fallbackRunSubsequentOps" << std::endl
                   << std::flush;
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                  << ": Before fallbackRunSubsequentOps - normOut use_count=" << normOut.use_count()
+                  << ", data_ptr=" << normOut.data_ptr() << std::endl
+                  << std::flush;
         auto result = fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, normOut);
         std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
                   << ": fallbackRunSubsequentOps returned, result.size()=" << result.size() << std::endl
                   << std::flush;
+        if (!result.empty())
+        {
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                      << ": Result tensor[0] use_count=" << result[0].use_count()
+                      << ", data_ptr=" << result[0].data_ptr() << std::endl
+                      << std::flush;
+        }
         std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": runNCCLAllReduceSymmetric completed successfully"
                   << std::endl
                   << std::flush;

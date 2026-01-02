@@ -361,6 +361,10 @@ private:
 // Creates a PyTorch tensor backed by an NCCL window buffer.
 // The tensor will automatically release the buffer back to the pool when destroyed.
 // This is analogous to torch_ext::create_userbuffers_tensor() but for NCCLWindowAllocator.
+//
+// IMPORTANT: The returned tensor must stay alive until all NCCL operations using the buffer
+// have completed. Since NCCL operations are asynchronous, ensure the tensor is kept alive
+// (e.g., by returning it from the function or storing it in a variable) until operations complete.
 inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
     ncclComm_t comm, at::IntArrayRef shape, torch::ScalarType dtype)
 {
@@ -419,11 +423,57 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
     }
 
     // Create custom deleter that releases the buffer
-    auto deleter = [comm, ptr = buffer.ptr](void*) { NCCLWindowAllocator::getInstance().releaseBuffer(comm, ptr); };
+    // Note: The deleter should only be called when the tensor is no longer needed.
+    // NCCL operations are asynchronous, so the tensor must stay alive until operations complete.
+    auto deleter = [comm, ptr = buffer.ptr, handle = buffer.handle](void* data)
+    {
+        int rank = -1;
+        if (comm != nullptr)
+        {
+            ncclCommUserRank(comm, &rank);
+        }
+        std::cout << "[NCCLWindowTensorDeleter] Rank " << rank << ": DELETER CALLED for buffer ptr=" << ptr
+                  << ", handle=" << handle << ", data=" << data << ", comm=" << static_cast<void*>(comm) << std::endl
+                  << std::flush;
+
+        // Print stack trace to understand when/why deleter is called
+        // This helps identify if deleter is called prematurely
+        std::cout << "[NCCLWindowTensorDeleter] Rank " << rank << ": Stack trace:" << std::endl;
+        // Note: Stack trace printing would require additional libraries, but we can at least log the call
+
+        // Validate comm and ptr before releasing
+        if (comm != nullptr && ptr != nullptr)
+        {
+            // Verify data pointer matches (PyTorch should pass the same pointer)
+            if (data != ptr)
+            {
+                std::cout << "[NCCLWindowTensorDeleter] Rank " << rank
+                          << ": WARNING - data pointer mismatch! data=" << data << ", expected ptr=" << ptr << std::endl
+                          << std::flush;
+            }
+            NCCLWindowAllocator::getInstance().releaseBuffer(comm, ptr);
+            std::cout << "[NCCLWindowTensorDeleter] Rank " << rank << ": releaseBuffer completed for ptr=" << ptr
+                      << std::endl
+                      << std::flush;
+        }
+        else
+        {
+            std::cout << "[NCCLWindowTensorDeleter] Rank " << rank
+                      << ": ERROR - Invalid comm or ptr in deleter! comm=" << static_cast<void*>(comm)
+                      << ", ptr=" << ptr << std::endl
+                      << std::flush;
+        }
+    };
 
     // Create tensor from the buffer
     std::cout << "[createNCCLWindowTensor] Rank " << rank << ": Creating tensor from buffer" << std::endl << std::flush;
     auto tensor = torch::from_blob(buffer.ptr, shape, strides_vec, deleter, torch::dtype(dtype).device(torch::kCUDA));
+
+    // Log tensor details for debugging
+    std::cout << "[createNCCLWindowTensor] Rank " << rank << ": Tensor created, data_ptr=" << tensor.data_ptr()
+              << ", use_count=" << tensor.use_count() << ", is_contiguous=" << tensor.is_contiguous() << std::endl
+              << std::flush;
+
     std::cout << "[createNCCLWindowTensor] Rank " << rank << ": createNCCLWindowTensor completed successfully"
               << std::endl
               << std::flush;

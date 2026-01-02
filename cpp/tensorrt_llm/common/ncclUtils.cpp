@@ -386,30 +386,73 @@ NCCLWindowBuffer NCCLWindowAllocator::searchBuffer(ncclComm_t comm, void* ptr) c
 
 void NCCLWindowAllocator::releaseBuffer(ncclComm_t comm, void* ptr)
 {
+    int rank = -1;
+    if (comm != nullptr)
+    {
+        ncclCommUserRank(comm, &rank);
+    }
+    std::cout << "[NCCLWindowAllocator::releaseBuffer] Rank " << rank
+              << ": Starting releaseBuffer, comm=" << static_cast<void*>(comm) << ", ptr=" << ptr << std::endl
+              << std::flush;
+
     if (!comm || !ptr)
     {
+        std::cout << "[NCCLWindowAllocator::releaseBuffer] Rank " << rank << ": Early return - invalid comm or ptr"
+                  << std::endl
+                  << std::flush;
         return;
     }
 
     std::lock_guard<std::mutex> lock(mMutex);
+    std::cout << "[NCCLWindowAllocator::releaseBuffer] Rank " << rank << ": Acquired mMutex" << std::endl << std::flush;
+
     auto commIt = mBufferPool.find(comm);
     if (commIt == mBufferPool.end())
     {
+        std::cout << "[NCCLWindowAllocator::releaseBuffer] Rank " << rank << ": WARNING - Unknown comm "
+                  << static_cast<void*>(comm) << std::endl
+                  << std::flush;
         TLLM_LOG_WARNING(
             "[NCCLUtil] Attempted to release buffer %p for unknown comm %p", ptr, static_cast<void*>(comm));
         return;
     }
 
+    std::cout << "[NCCLWindowAllocator::releaseBuffer] Rank " << rank
+              << ": Searching for buffer in pool, pool size=" << commIt->second.size() << std::endl
+              << std::flush;
+
     for (auto& entry : commIt->second)
     {
         if (entry.buffer.ptr == ptr)
         {
+            std::cout << "[NCCLWindowAllocator::releaseBuffer] Rank " << rank
+                      << ": Found buffer, handle=" << entry.buffer.handle << ", inUse=" << entry.inUse
+                      << ", window=" << static_cast<void*>(entry.buffer.window) << std::endl
+                      << std::flush;
+
+            // Defensive check: ensure buffer is actually marked as in use before releasing
+            if (!entry.inUse)
+            {
+                std::cout << "[NCCLWindowAllocator::releaseBuffer] Rank " << rank
+                          << ": WARNING - Buffer already marked as not in use (possible double-release?)" << std::endl
+                          << std::flush;
+                TLLM_LOG_WARNING(
+                    "[NCCLUtil] Attempted to release buffer %p for comm %p that is already marked as not in use", ptr,
+                    static_cast<void*>(comm));
+                return;
+            }
             entry.inUse = false;
+            std::cout << "[NCCLWindowAllocator::releaseBuffer] Rank " << rank
+                      << ": Buffer marked as not in use, handle=" << entry.buffer.handle << std::endl
+                      << std::flush;
             TLLM_LOG_TRACE("[NCCLUtil] Released NCCL window buffer for comm %p: ptr=%p", static_cast<void*>(comm), ptr);
             return;
         }
     }
 
+    std::cout << "[NCCLWindowAllocator::releaseBuffer] Rank " << rank
+              << ": WARNING - Buffer not found in pool for comm " << static_cast<void*>(comm) << std::endl
+              << std::flush;
     TLLM_LOG_WARNING("[NCCLUtil] Attempted to release unknown buffer %p for comm %p", ptr, static_cast<void*>(comm));
 }
 
