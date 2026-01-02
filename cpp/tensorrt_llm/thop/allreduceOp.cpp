@@ -767,7 +767,6 @@ private:
         std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
                   << ": Output window buffer created, windowBuffer1.ptr=" << windowBuffer1.ptr << std::endl
                   << std::flush;
-        torch::Tensor outputTensor = normOut;
         void* outputPtr = windowBuffer1.ptr;
 
         // Perform allreduce
@@ -789,15 +788,14 @@ private:
 
         if (mOp == AllReduceFusionOp::NONE)
         {
-            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": mOp is NONE, returning outputTensor"
-                      << std::endl;
-            return {outputTensor};
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": mOp is NONE, returning normOut" << std::endl;
+            return {normOut};
         }
 
         // Treat any other patterns as fallback cases.
         std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Calling fallbackRunSubsequentOps" << std::endl
                   << std::flush;
-        auto result = fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, outputTensor);
+        auto result = fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, normOut);
         std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
                   << ": fallbackRunSubsequentOps returned, result.size()=" << result.size() << std::endl
                   << std::flush;
