@@ -344,7 +344,7 @@ public:
         // Log runtime strategy
         auto const rank = getRank();
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
-        bool capturing = isCapturing(stream);
+        bool capturing = tensorrt_llm::common::isCapturing(stream);
         std::cout << "[AllreduceOp::run] Rank " << rank << ": Starting run, input shape=[" << input.size(0);
         for (int i = 1; i < input.dim(); ++i)
         {
@@ -600,7 +600,7 @@ private:
                       << std::flush;
             // ProcessGroup allreduce may use async operations, synchronize before logging completion
             auto pgStream = at::cuda::getCurrentCUDAStream(input.get_device());
-            bool capturing = isCapturing(pgStream);
+            bool capturing = tensorrt_llm::common::isCapturing(pgStream);
             std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": pgStream=" << pgStream
                       << ", capturing=" << (capturing ? "YES" : "NO") << std::endl
                       << std::flush;
@@ -640,7 +640,7 @@ private:
                       << ": fallbackRunSubsequentOps returned, result.size()=" << result.size() << std::endl
                       << std::flush;
             // Synchronize stream before logging completion - fallbackRunSubsequentOps launches GPU kernels
-            if (!isCapturing(pgStream))
+            if (!tensorrt_llm::common::isCapturing(pgStream))
             {
                 std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
                           << ": Synchronizing stream after fallbackRunSubsequentOps (ProcessGroup path, not capturing)"
@@ -675,7 +675,7 @@ private:
         using tensorrt_llm::common::nccl_util::createNCCLWindowTensor;
 
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
-        bool capturing = isCapturing(stream);
+        bool capturing = tensorrt_llm::common::isCapturing(stream);
         size_t bufferSizeBytes = size * input.element_size();
         std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Got CUDA stream=" << stream << ", size=" << size
                   << ", bufferSizeBytes=" << bufferSizeBytes << ", capturing=" << (capturing ? "YES" : "NO")
@@ -786,7 +786,7 @@ private:
                 std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Calling cudaMemcpyAsync" << std::endl;
                 TLLM_CUDA_CHECK(cudaMemcpyAsync(
                     symmetricBuffer0.ptr, input.data_ptr(), bufferSizeBytes, cudaMemcpyDeviceToDevice, stream));
-                if (!isCapturing(stream))
+                if (!tensorrt_llm::common::isCapturing(stream))
                 {
                     TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
                 }
@@ -834,7 +834,7 @@ private:
                   << ": ncclAllReduce call returned (operation queued to stream), opHash=0x" << std::hex << opHash
                   << std::dec << std::endl
                   << std::flush;
-        if (!isCapturing(stream))
+        if (!tensorrt_llm::common::isCapturing(stream))
         {
             std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Synchronizing stream (not capturing)"
                       << std::endl
@@ -866,7 +866,7 @@ private:
                   << ": fallbackRunSubsequentOps returned, result.size()=" << result.size() << std::endl
                   << std::flush;
         // Synchronize stream before logging completion - fallbackRunSubsequentOps launches GPU kernels
-        if (!isCapturing(stream))
+        if (!tensorrt_llm::common::isCapturing(stream))
         {
             std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
                       << ": Synchronizing stream after fallbackRunSubsequentOps (not capturing)" << std::endl
@@ -1153,7 +1153,7 @@ private:
         auto const size = input.numel();
         auto const hidden_size = input.size(-1);
         auto const stream = at::cuda::getCurrentCUDAStream(input.get_device());
-        bool capturing = isCapturing(stream);
+        bool capturing = tensorrt_llm::common::isCapturing(stream);
         std::cout << "[fallbackRunSubsequentOps] Rank " << rank << ": size=" << size << ", hidden_size=" << hidden_size
                   << ", stream=" << stream << ", capturing=" << (capturing ? "YES" : "NO")
                   << ", mOp=" << tensorrt_llm::kernels::toString(mOp) << std::endl
