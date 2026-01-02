@@ -598,29 +598,6 @@ private:
             std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": ProcessGroup->allreduce call returned"
                       << std::endl
                       << std::flush;
-            // ProcessGroup allreduce may use async operations, synchronize before logging completion
-            auto pgStream = at::cuda::getCurrentCUDAStream(input.get_device());
-            bool capturing = tensorrt_llm::common::isCapturing(pgStream);
-            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": pgStream=" << pgStream
-                      << ", capturing=" << (capturing ? "YES" : "NO") << std::endl
-                      << std::flush;
-            if (!capturing)
-            {
-                std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
-                          << ": Synchronizing stream after ProcessGroup->allreduce (not capturing)" << std::endl
-                          << std::flush;
-                TLLM_CUDA_CHECK(cudaStreamSynchronize(pgStream));
-                std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
-                          << ": Stream synchronized, ProcessGroup->allreduce completed" << std::endl
-                          << std::flush;
-            }
-            else
-            {
-                std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
-                          << ": Skipping synchronization after ProcessGroup->allreduce (capturing CUDA graph)"
-                          << std::endl
-                          << std::flush;
-            }
 
             if (mOp == AllReduceFusionOp::NONE)
             {
@@ -639,27 +616,6 @@ private:
             std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
                       << ": fallbackRunSubsequentOps returned, result.size()=" << result.size() << std::endl
                       << std::flush;
-            // Synchronize stream before logging completion - fallbackRunSubsequentOps launches GPU kernels
-            if (!tensorrt_llm::common::isCapturing(pgStream))
-            {
-                std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
-                          << ": Synchronizing stream after fallbackRunSubsequentOps (ProcessGroup path, not capturing)"
-                          << std::endl
-                          << std::flush;
-                TLLM_CUDA_CHECK(cudaStreamSynchronize(pgStream));
-                std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
-                          << ": Stream synchronized, fallbackRunSubsequentOps completed (ProcessGroup path)"
-                          << std::endl
-                          << std::flush;
-            }
-            else
-            {
-                std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
-                          << ": Skipping synchronization after fallbackRunSubsequentOps (ProcessGroup path, capturing "
-                             "CUDA graph)"
-                          << std::endl
-                          << std::flush;
-            }
             return result;
         }
 
@@ -786,10 +742,6 @@ private:
                 std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Calling cudaMemcpyAsync" << std::endl;
                 TLLM_CUDA_CHECK(cudaMemcpyAsync(
                     symmetricBuffer0.ptr, input.data_ptr(), bufferSizeBytes, cudaMemcpyDeviceToDevice, stream));
-                if (!tensorrt_llm::common::isCapturing(stream))
-                {
-                    TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
-                }
                 std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": cudaMemcpyAsync completed" << std::endl;
                 windowBuffer0 = symmetricBuffer0;
                 inputTensor = symmetricInput; // Swap to window-backed tensor
@@ -835,24 +787,6 @@ private:
                   << std::dec << std::endl
                   << std::flush;
 
-        if (!capturing)
-        {
-            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
-                      << ": Synchronizing stream (not capturing CUDA graph)" << std::endl
-                      << std::flush;
-            TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
-            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
-                      << ": Stream synchronized successfully, ncclAllReduce completed" << std::endl
-                      << std::flush;
-        }
-        else
-        {
-            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
-                      << ": Skipping synchronization (capturing CUDA graph - stream will be synced when graph ends)"
-                      << std::endl
-                      << std::flush;
-        }
-
         if (mOp == AllReduceFusionOp::NONE)
         {
             std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": mOp is NONE, returning outputTensor"
@@ -867,26 +801,6 @@ private:
         std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
                   << ": fallbackRunSubsequentOps returned, result.size()=" << result.size() << std::endl
                   << std::flush;
-        // Synchronize stream before logging completion - fallbackRunSubsequentOps launches GPU kernels
-        if (!tensorrt_llm::common::isCapturing(stream))
-        {
-            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
-                      << ": Synchronizing stream after fallbackRunSubsequentOps (not capturing CUDA graph)" << std::endl
-                      << std::flush;
-            TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
-            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
-                      << ": Stream synchronized successfully, fallbackRunSubsequentOps completed" << std::endl
-                      << std::flush;
-        }
-        else
-        {
-            std::cout
-                << "[runNCCLAllReduceSymmetric] Rank " << rank
-                << ": Skipping synchronization after fallbackRunSubsequentOps (capturing CUDA graph - stream will "
-                   "be synced when graph ends)"
-                << std::endl
-                << std::flush;
-        }
         std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": runNCCLAllReduceSymmetric completed successfully"
                   << std::endl
                   << std::flush;
@@ -1182,22 +1096,6 @@ private:
         std::cout << "[fallbackRunSubsequentOps] Rank " << rank
                   << ": residualRmsNorm kernel call returned (operation queued to stream)" << std::endl
                   << std::flush;
-        if (!capturing)
-        {
-            std::cout << "[fallbackRunSubsequentOps] Rank " << rank
-                      << ": Synchronizing stream after residualRmsNorm (not capturing)" << std::endl
-                      << std::flush;
-            TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
-            std::cout << "[fallbackRunSubsequentOps] Rank " << rank << ": Stream synchronized after residualRmsNorm"
-                      << std::endl
-                      << std::flush;
-        }
-        else
-        {
-            std::cout << "[fallbackRunSubsequentOps] Rank " << rank
-                      << ": Skipping synchronization after residualRmsNorm (capturing CUDA graph)" << std::endl
-                      << std::flush;
-        }
 
         // If no quantization is needed, return the norm and residual outputs.
         if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
@@ -1228,10 +1126,6 @@ private:
             std::cout << "[fallbackRunSubsequentOps] Rank " << rank
                       << ": symmetric_static_quantize_per_tensor completed" << std::endl
                       << std::flush;
-            if (!capturing)
-            {
-                TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
-            }
             return {quant_out, reduce_output};
         }
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4:
@@ -1242,10 +1136,6 @@ private:
                 = torch_ext::fp4_quantize(norm_out, scale.value(), sf_vecsize, sf_use_ue8m0, is_sf_swizzled_layout);
             std::cout << "[fallbackRunSubsequentOps] Rank " << rank << ": fp4_quantize completed" << std::endl
                       << std::flush;
-            if (!capturing)
-            {
-                TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
-            }
             return {quant_out, scale_out, reduce_output};
         }
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8:
@@ -1257,10 +1147,6 @@ private:
             std::cout << "[fallbackRunSubsequentOps] Rank " << rank
                       << ": symmetric_static_quantize_per_tensor completed" << std::endl
                       << std::flush;
-            if (!capturing)
-            {
-                TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
-            }
             return {norm_out, quant_out, reduce_output};
         }
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
@@ -1272,10 +1158,6 @@ private:
                 = torch_ext::fp4_quantize(norm_out, scale.value(), sf_vecsize, sf_use_ue8m0, is_sf_swizzled_layout);
             std::cout << "[fallbackRunSubsequentOps] Rank " << rank << ": fp4_quantize completed" << std::endl
                       << std::flush;
-            if (!capturing)
-            {
-                TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
-            }
             return {norm_out, quant_out, scale_out, reduce_output};
         }
         default: break;

@@ -1813,12 +1813,6 @@ class AllReduceRunner(TunableRunner):
             print(
                 f"[AllReduceRunner.forward] Rank {rank}: torch.ops.trtllm.allreduce returned, type={type(result)}, no shape attribute"
             )
-        # Synchronize CUDA stream to ensure all GPU work is complete before returning
-        if input.is_cuda:
-            torch.cuda.synchronize(input.device)
-            print(
-                f"[AllReduceRunner.forward] Rank {rank}: CUDA stream synchronized after allreduce"
-            )
         print(
             f"[AllReduceRunner.forward] Rank {rank}: AllReduceRunner.forward completed successfully, returning result"
         )
