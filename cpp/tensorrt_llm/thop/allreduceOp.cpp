@@ -515,7 +515,6 @@ private:
                       << std::endl;
             auto result = fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, reduceOutput);
             // Synchronize stream before logging completion - fallbackRunSubsequentOps launches GPU kernels
-            auto pgStream = at::cuda::getCurrentCUDAStream(input.get_device());
             TLLM_CUDA_CHECK(cudaStreamSynchronize(pgStream));
             std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
                       << ": fallbackRunSubsequentOps completed (ProcessGroup path)" << std::endl

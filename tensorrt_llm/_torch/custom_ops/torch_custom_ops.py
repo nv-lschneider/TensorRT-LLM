@@ -1690,7 +1690,14 @@ class AllReduceRunner(TunableRunner):
         profile: OptimizationProfile,
         **kwargs,
     ) -> List[int]:
-        rank = dist.get_rank() if dist.is_initialized() else -1
+        # Try to get rank from dist, fallback to group[0] if available, otherwise -1
+        if dist.is_initialized():
+            rank = dist.get_rank()
+        elif self.group and len(self.group) > 0:
+            # If dist not initialized, try to infer from group (not perfect but better than -1)
+            rank = self.group[0]  # This is just for logging, not accurate
+        else:
+            rank = -1
         print(
             f"[AllReduceRunner.get_valid_tactics] Rank {rank}: Starting get_valid_tactics, tp_size={self.tp_size}, op={self.op}, group={self.group}"
         )
@@ -1747,7 +1754,14 @@ class AllReduceRunner(TunableRunner):
         inputs: List[torch.Tensor],
         tactic: int = -1,
     ) -> torch.Tensor:
-        rank = dist.get_rank() if dist.is_initialized() else -1
+        # Try to get rank from dist, fallback to group[0] if available, otherwise -1
+        if dist.is_initialized():
+            rank = dist.get_rank()
+        elif self.group and len(self.group) > 0:
+            # If dist not initialized, try to infer from group (not perfect but better than -1)
+            rank = self.group[0]  # This is just for logging, not accurate
+        else:
+            rank = -1
         print(
             f"[AllReduceRunner.forward] Rank {rank}: Starting forward, tactic={tactic}, tp_size={self.tp_size}, op={self.op}, group={self.group}"
         )
@@ -1783,9 +1797,22 @@ class AllReduceRunner(TunableRunner):
             self.eps,
             self.trigger_completion_at_end,
         )
-        print(
-            f"[AllReduceRunner.forward] Rank {rank}: torch.ops.trtllm.allreduce returned, result type={type(result)}, result shape={result.shape if hasattr(result, 'shape') else 'N/A'}"
-        )
+        # Handle result which can be a list of tensors or a single tensor
+        if isinstance(result, (list, tuple)):
+            result_shapes = [
+                str(r.shape) if hasattr(r, 'shape') else 'N/A' for r in result
+            ]
+            print(
+                f"[AllReduceRunner.forward] Rank {rank}: torch.ops.trtllm.allreduce returned list/tuple with {len(result)} tensors, shapes={result_shapes}"
+            )
+        elif hasattr(result, 'shape'):
+            print(
+                f"[AllReduceRunner.forward] Rank {rank}: torch.ops.trtllm.allreduce returned single tensor, type={type(result)}, shape={result.shape}"
+            )
+        else:
+            print(
+                f"[AllReduceRunner.forward] Rank {rank}: torch.ops.trtllm.allreduce returned, type={type(result)}, no shape attribute"
+            )
         # Synchronize CUDA stream to ensure all GPU work is complete before returning
         if input.is_cuda:
             torch.cuda.synchronize(input.device)
@@ -1812,7 +1839,14 @@ def tunable_allreduce(
     tp_size: int,
     trigger_completion_at_end: bool,
 ) -> List[torch.Tensor]:
-    rank = dist.get_rank() if dist.is_initialized() else -1
+    # Try to get rank from dist, fallback to group[0] if available, otherwise -1
+    if dist.is_initialized():
+        rank = dist.get_rank()
+    elif group and len(group) > 0:
+        # If dist not initialized, try to infer from group (not perfect but better than -1)
+        rank = group[0]  # This is just for logging, not accurate
+    else:
+        rank = -1
     print(
         f"[tunable_allreduce] Rank {rank}: Starting tunable_allreduce, tp_size={tp_size}, op={op}, group={group}, trigger_completion_at_end={trigger_completion_at_end}"
     )
@@ -1850,9 +1884,22 @@ def tunable_allreduce(
         [input, residual, norm_weight, scale, bias, workspace],
         tactic=best_tactic,
     )
-    print(
-        f"[tunable_allreduce] Rank {rank}: allreduce_runner completed, result type={type(result)}"
-    )
+    # Handle result which can be a list of tensors or a single tensor
+    if isinstance(result, (list, tuple)):
+        result_shapes = [
+            str(r.shape) if hasattr(r, 'shape') else 'N/A' for r in result
+        ]
+        print(
+            f"[tunable_allreduce] Rank {rank}: allreduce_runner completed, returned list/tuple with {len(result)} tensors, shapes={result_shapes}"
+        )
+    elif hasattr(result, 'shape'):
+        print(
+            f"[tunable_allreduce] Rank {rank}: allreduce_runner completed, returned single tensor, type={type(result)}, shape={result.shape}"
+        )
+    else:
+        print(
+            f"[tunable_allreduce] Rank {rank}: allreduce_runner completed, result type={type(result)}, no shape attribute"
+        )
     return result
 
 
