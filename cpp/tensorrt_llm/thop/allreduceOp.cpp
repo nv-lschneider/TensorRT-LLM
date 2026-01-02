@@ -834,20 +834,22 @@ private:
                   << ": ncclAllReduce call returned (operation queued to stream), opHash=0x" << std::hex << opHash
                   << std::dec << std::endl
                   << std::flush;
-        if (!tensorrt_llm::common::isCapturing(stream))
+
+        if (!capturing)
         {
-            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Synchronizing stream (not capturing)"
-                      << std::endl
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                      << ": Synchronizing stream (not capturing CUDA graph)" << std::endl
                       << std::flush;
             TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
-            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Stream synchronized, ncclAllReduce completed"
-                      << std::endl
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                      << ": Stream synchronized successfully, ncclAllReduce completed" << std::endl
                       << std::flush;
         }
         else
         {
             std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
-                      << ": Skipping synchronization (capturing CUDA graph)" << std::endl
+                      << ": Skipping synchronization (capturing CUDA graph - stream will be synced when graph ends)"
+                      << std::endl
                       << std::flush;
         }
 
@@ -869,18 +871,21 @@ private:
         if (!tensorrt_llm::common::isCapturing(stream))
         {
             std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
-                      << ": Synchronizing stream after fallbackRunSubsequentOps (not capturing)" << std::endl
+                      << ": Synchronizing stream after fallbackRunSubsequentOps (not capturing CUDA graph)" << std::endl
                       << std::flush;
             TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
             std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
-                      << ": Stream synchronized, fallbackRunSubsequentOps completed" << std::endl
+                      << ": Stream synchronized successfully, fallbackRunSubsequentOps completed" << std::endl
                       << std::flush;
         }
         else
         {
-            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
-                      << ": Skipping synchronization after fallbackRunSubsequentOps (capturing CUDA graph)" << std::endl
-                      << std::flush;
+            std::cout
+                << "[runNCCLAllReduceSymmetric] Rank " << rank
+                << ": Skipping synchronization after fallbackRunSubsequentOps (capturing CUDA graph - stream will "
+                   "be synced when graph ends)"
+                << std::endl
+                << std::flush;
         }
         std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": runNCCLAllReduceSymmetric completed successfully"
                   << std::endl
