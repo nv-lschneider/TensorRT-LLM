@@ -54,8 +54,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <unordered_set>
 
 // using namespace nvinfer1;
@@ -239,6 +241,53 @@ std::set<int> getLocalGroupTorch(std::set<int> const& group)
     return localGroup;
 }
 
+// Compute a hash for an operation to help identify if ranks are out of sync
+inline uint64_t computeOpHash(size_t seq_len, size_t hidden_size, size_t size, int dtype,
+    AllReduceStrategyType strategy, AllReduceFusionOp op, bool has_residual, bool has_norm_weight, bool has_scale,
+    bool has_bias)
+{
+    std::hash<size_t> hasher;
+    uint64_t hash = 0;
+    hash ^= hasher(seq_len) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    hash ^= hasher(hidden_size) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    hash ^= hasher(size) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    hash ^= hasher(dtype) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    hash ^= hasher(static_cast<int>(strategy)) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    hash ^= hasher(static_cast<int>(op)) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    hash ^= hasher(has_residual ? 1 : 0) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    hash ^= hasher(has_norm_weight ? 1 : 0) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    hash ^= hasher(has_scale ? 1 : 0) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    hash ^= hasher(has_bias ? 1 : 0) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    return hash;
+}
+
+// Verify that all ranks have the same operation hash using NCCL
+inline void verifyOpHashSync(uint64_t localHash, ncclComm_t comm, cudaStream_t stream, int rank, char const* opName)
+{
+    // Use int64_t for NCCL (ncclUint64 may not be available in all NCCL versions)
+    // Cast is safe as we're just comparing values, not doing arithmetic
+    int64_t localHashInt = static_cast<int64_t>(localHash);
+    int64_t maxHashInt = localHashInt;
+    // Use AllReduce with MAX to detect if any rank has a different hash
+    // If all ranks have the same hash, maxHashInt will equal localHashInt
+    NCCLCHECK_THROW(ncclAllReduce(&localHashInt, &maxHashInt, 1, ncclInt64, ncclMax, comm, stream));
+
+    uint64_t maxHash = static_cast<uint64_t>(maxHashInt);
+    if (maxHash != localHash)
+    {
+        std::cout << "[verifyOpHashSync] Rank " << rank << ": WARNING - Hash mismatch detected for " << opName
+                  << "! Local hash=0x" << std::hex << localHash << ", Max hash across ranks=0x" << maxHash << std::dec
+                  << " (ranks may be out of sync)" << std::endl
+                  << std::flush;
+    }
+    else
+    {
+        std::cout << "[verifyOpHashSync] Rank " << rank << ": Hash verified for " << opName
+                  << ", all ranks synchronized, hash=0x" << std::hex << localHash << std::dec << std::endl
+                  << std::flush;
+    }
+}
+
 class AllreduceOp
 {
 public:
@@ -294,39 +343,76 @@ public:
 
         // Log runtime strategy
         auto const rank = getRank();
+        auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+        bool capturing = isCapturing(stream);
         std::cout << "[AllreduceOp::run] Rank " << rank << ": Starting run, input shape=[" << input.size(0);
         for (int i = 1; i < input.dim(); ++i)
         {
             std::cout << ", " << input.size(i);
         }
         std::cout << "], dtype=" << input.scalar_type() << ", size=" << size << ", seq_len=" << seq_len
-                  << ", hidden_size=" << hidden_size << ", bytes_per_element=" << bytes_per_element << std::endl;
+                  << ", hidden_size=" << hidden_size << ", bytes_per_element=" << bytes_per_element
+                  << ", stream=" << stream << ", capturing=" << (capturing ? "YES" : "NO") << std::endl;
         std::cout << "[AllreduceOp::run] Rank " << rank
-                  << ": runtime_strategy=" << tensorrt_llm::kernels::toString(runtime_strategy) << std::endl;
+                  << ": runtime_strategy=" << tensorrt_llm::kernels::toString(runtime_strategy)
+                  << ", trigger_completion_at_end=" << trigger_completion_at_end << std::endl;
         TLLM_LOG_DEBUG(
             "AllReduceOp runtime strategy for rank %d: " + tensorrt_llm::kernels::toString(runtime_strategy), rank);
 
         // Dispatch to different allreduce implementations
+        std::cout << "[AllreduceOp::run] Rank " << rank << ": About to dispatch to strategy implementation" << std::endl
+                  << std::flush;
+        std::vector<torch::Tensor> result;
         switch (runtime_strategy)
         {
         case AllReduceStrategyType::UB:
-            std::cout << "[AllreduceOp::run] Rank " << rank << ": Dispatching to runUBAllReduce" << std::endl;
-            return runUBAllReduce(input, residual, norm_weight, scale, bias);
+            std::cout << "[AllreduceOp::run] Rank " << rank << ": Dispatching to runUBAllReduce" << std::endl
+                      << std::flush;
+            result = runUBAllReduce(input, residual, norm_weight, scale, bias);
+            std::cout << "[AllreduceOp::run] Rank " << rank
+                      << ": runUBAllReduce returned, result.size()=" << result.size() << std::endl
+                      << std::flush;
+            return result;
         case AllReduceStrategyType::NCCL:
-            std::cout << "[AllreduceOp::run] Rank " << rank << ": Dispatching to runNCCLAllReduce" << std::endl;
-            return runNCCLAllReduce(input, residual, norm_weight, scale, bias);
+            std::cout << "[AllreduceOp::run] Rank " << rank << ": Dispatching to runNCCLAllReduce" << std::endl
+                      << std::flush;
+            result = runNCCLAllReduce(input, residual, norm_weight, scale, bias);
+            std::cout << "[AllreduceOp::run] Rank " << rank
+                      << ": runNCCLAllReduce returned, result.size()=" << result.size() << std::endl
+                      << std::flush;
+            return result;
         case AllReduceStrategyType::NCCL_SYMMETRIC:
-            std::cout << "[AllreduceOp::run] Rank " << rank << ": Dispatching to runNCCLAllReduceSymmetric"
-                      << std::endl;
-            return runNCCLAllReduceSymmetric(input, residual, norm_weight, scale, bias);
+            std::cout << "[AllreduceOp::run] Rank " << rank << ": Dispatching to runNCCLAllReduceSymmetric" << std::endl
+                      << std::flush;
+            result = runNCCLAllReduceSymmetric(input, residual, norm_weight, scale, bias);
+            std::cout << "[AllreduceOp::run] Rank " << rank
+                      << ": runNCCLAllReduceSymmetric returned, result.size()=" << result.size() << std::endl
+                      << std::flush;
+            return result;
         case AllReduceStrategyType::MIN_LATENCY:
         case AllReduceStrategyType::ONESHOT:
         case AllReduceStrategyType::TWOSHOT:
-            return runFusionAllReduce(
+            std::cout << "[AllreduceOp::run] Rank " << rank << ": Dispatching to runFusionAllReduce" << std::endl
+                      << std::flush;
+            result = runFusionAllReduce(
                 input, residual, norm_weight, scale, bias, trigger_completion_at_end, workspace, runtime_strategy);
+            std::cout << "[AllreduceOp::run] Rank " << rank
+                      << ": runFusionAllReduce returned, result.size()=" << result.size() << std::endl
+                      << std::flush;
+            return result;
         case AllReduceStrategyType::LOWPRECISION:
-            return runLowPrecisionAllReduce(input, residual, norm_weight, scale, bias);
-        default: TORCH_CHECK(false, "Invalid runtime strategy"); return {};
+            std::cout << "[AllreduceOp::run] Rank " << rank << ": Dispatching to runLowPrecisionAllReduce" << std::endl
+                      << std::flush;
+            result = runLowPrecisionAllReduce(input, residual, norm_weight, scale, bias);
+            std::cout << "[AllreduceOp::run] Rank " << rank
+                      << ": runLowPrecisionAllReduce returned, result.size()=" << result.size() << std::endl
+                      << std::flush;
+            return result;
+        default:
+            std::cout << "[AllreduceOp::run] Rank " << rank << ": ERROR - Invalid runtime strategy" << std::endl
+                      << std::flush;
+            TORCH_CHECK(false, "Invalid runtime strategy");
+            return {};
         }
     }
 
@@ -466,6 +552,15 @@ private:
         torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias)
     {
         auto const rank = getRank();
+        size_t seq_len = input.size(0);
+        size_t hidden_size = input.size(-1);
+        size_t size = input.numel();
+        int dtype_int = static_cast<int>(input.scalar_type());
+
+        // Compute operation hash
+        uint64_t opHash = computeOpHash(seq_len, hidden_size, size, dtype_int, AllReduceStrategyType::NCCL_SYMMETRIC,
+            mOp, residual.has_value(), norm_weight.has_value(), scale.has_value(), bias.has_value());
+
         std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Starting runNCCLAllReduceSymmetric" << std::endl;
         std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": input shape=[" << input.size(0);
         for (int i = 1; i < input.dim(); ++i)
@@ -477,7 +572,7 @@ private:
                   << ": residual=" << (residual.has_value() ? "yes" : "no")
                   << ", norm_weight=" << (norm_weight.has_value() ? "yes" : "no")
                   << ", scale=" << (scale.has_value() ? "yes" : "no") << ", bias=" << (bias.has_value() ? "yes" : "no")
-                  << std::endl;
+                  << ", opHash=0x" << std::hex << opHash << std::dec << std::endl;
         std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": mNcclComm.index()=" << mNcclComm.index()
                   << std::endl;
 
@@ -495,13 +590,37 @@ private:
             std::vector tensors{reduceOutput};
             std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Calling ProcessGroup->allreduce" << std::endl
                       << std::flush;
-            PGCHECK_THROW(torchPg->allreduce(tensors, {c10d::ReduceOp::SUM}));
-            // ProcessGroup allreduce may use async operations, synchronize before logging completion
-            auto pgStream = at::cuda::getCurrentCUDAStream(input.get_device());
-            TLLM_CUDA_CHECK(cudaStreamSynchronize(pgStream));
-            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": ProcessGroup->allreduce completed"
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                      << ": About to call ProcessGroup->allreduce (this may block if other ranks are not ready)"
                       << std::endl
                       << std::flush;
+            PGCHECK_THROW(torchPg->allreduce(tensors, {c10d::ReduceOp::SUM}));
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": ProcessGroup->allreduce call returned"
+                      << std::endl
+                      << std::flush;
+            // ProcessGroup allreduce may use async operations, synchronize before logging completion
+            auto pgStream = at::cuda::getCurrentCUDAStream(input.get_device());
+            bool capturing = isCapturing(pgStream);
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": pgStream=" << pgStream
+                      << ", capturing=" << (capturing ? "YES" : "NO") << std::endl
+                      << std::flush;
+            if (!capturing)
+            {
+                std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                          << ": Synchronizing stream after ProcessGroup->allreduce (not capturing)" << std::endl
+                          << std::flush;
+                TLLM_CUDA_CHECK(cudaStreamSynchronize(pgStream));
+                std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                          << ": Stream synchronized, ProcessGroup->allreduce completed" << std::endl
+                          << std::flush;
+            }
+            else
+            {
+                std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                          << ": Skipping synchronization after ProcessGroup->allreduce (capturing CUDA graph)"
+                          << std::endl
+                          << std::flush;
+            }
 
             if (mOp == AllReduceFusionOp::NONE)
             {
@@ -513,12 +632,34 @@ private:
             // Treat any other patterns as fallback cases.
             std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Calling fallbackRunSubsequentOps"
                       << std::endl;
-            auto result = fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, reduceOutput);
-            // Synchronize stream before logging completion - fallbackRunSubsequentOps launches GPU kernels
-            TLLM_CUDA_CHECK(cudaStreamSynchronize(pgStream));
             std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
-                      << ": fallbackRunSubsequentOps completed (ProcessGroup path)" << std::endl
+                      << ": Calling fallbackRunSubsequentOps (ProcessGroup path)" << std::endl
                       << std::flush;
+            auto result = fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, reduceOutput);
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                      << ": fallbackRunSubsequentOps returned, result.size()=" << result.size() << std::endl
+                      << std::flush;
+            // Synchronize stream before logging completion - fallbackRunSubsequentOps launches GPU kernels
+            if (!isCapturing(pgStream))
+            {
+                std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                          << ": Synchronizing stream after fallbackRunSubsequentOps (ProcessGroup path, not capturing)"
+                          << std::endl
+                          << std::flush;
+                TLLM_CUDA_CHECK(cudaStreamSynchronize(pgStream));
+                std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                          << ": Stream synchronized, fallbackRunSubsequentOps completed (ProcessGroup path)"
+                          << std::endl
+                          << std::flush;
+            }
+            else
+            {
+                std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                          << ": Skipping synchronization after fallbackRunSubsequentOps (ProcessGroup path, capturing "
+                             "CUDA graph)"
+                          << std::endl
+                          << std::flush;
+            }
             return result;
         }
 
@@ -534,10 +675,25 @@ private:
         using tensorrt_llm::common::nccl_util::createNCCLWindowTensor;
 
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
-        int size = input.numel();
+        bool capturing = isCapturing(stream);
         size_t bufferSizeBytes = size * input.element_size();
         std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Got CUDA stream=" << stream << ", size=" << size
-                  << ", bufferSizeBytes=" << bufferSizeBytes << std::endl;
+                  << ", bufferSizeBytes=" << bufferSizeBytes << ", capturing=" << (capturing ? "YES" : "NO")
+                  << std::endl
+                  << std::flush;
+
+        // Verify hash synchronization before proceeding (only if not capturing)
+        if (!capturing)
+        {
+            verifyOpHashSync(opHash, comm, stream, rank, "runNCCLAllReduceSymmetric");
+        }
+        else
+        {
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                      << ": Skipping hash verification (capturing CUDA graph), opHash=0x" << std::hex << opHash
+                      << std::dec << std::endl
+                      << std::flush;
+        }
 
         // Using unregistered input buffers with NCCL symmetric, requires a memcpy
         // This is an overhead introduced with using NCCL_SYMMTRIC over NCCL.
@@ -630,7 +786,10 @@ private:
                 std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Calling cudaMemcpyAsync" << std::endl;
                 TLLM_CUDA_CHECK(cudaMemcpyAsync(
                     symmetricBuffer0.ptr, input.data_ptr(), bufferSizeBytes, cudaMemcpyDeviceToDevice, stream));
-                TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+                if (!isCapturing(stream))
+                {
+                    TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+                }
                 std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": cudaMemcpyAsync completed" << std::endl;
                 windowBuffer0 = symmetricBuffer0;
                 inputTensor = symmetricInput; // Swap to window-backed tensor
@@ -666,11 +825,31 @@ private:
                   << ", outputPtr=" << outputPtr << ", size=" << size << ", dtype=" << static_cast<int>(mType)
                   << ", comm=" << comm << ", stream=" << stream << std::endl
                   << std::flush;
-        NCCLCHECK_THROW(ncclAllReduce(inputPtr, outputPtr, size, (*getDtypeMap())[mType], ncclSum, comm, stream));
-        TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
-        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": ncclAllReduce completed successfully"
-                  << std::endl
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                  << ": About to call ncclAllReduce (this may block if other ranks are not ready), opHash=0x"
+                  << std::hex << opHash << std::dec << std::endl
                   << std::flush;
+        NCCLCHECK_THROW(ncclAllReduce(inputPtr, outputPtr, size, (*getDtypeMap())[mType], ncclSum, comm, stream));
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                  << ": ncclAllReduce call returned (operation queued to stream), opHash=0x" << std::hex << opHash
+                  << std::dec << std::endl
+                  << std::flush;
+        if (!isCapturing(stream))
+        {
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Synchronizing stream (not capturing)"
+                      << std::endl
+                      << std::flush;
+            TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Stream synchronized, ncclAllReduce completed"
+                      << std::endl
+                      << std::flush;
+        }
+        else
+        {
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                      << ": Skipping synchronization (capturing CUDA graph)" << std::endl
+                      << std::flush;
+        }
 
         if (mOp == AllReduceFusionOp::NONE)
         {
@@ -680,13 +859,32 @@ private:
         }
 
         // Treat any other patterns as fallback cases.
-        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Calling fallbackRunSubsequentOps" << std::endl;
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": Calling fallbackRunSubsequentOps" << std::endl
+                  << std::flush;
         auto result = fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, outputTensor);
+        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                  << ": fallbackRunSubsequentOps returned, result.size()=" << result.size() << std::endl
+                  << std::flush;
         // Synchronize stream before logging completion - fallbackRunSubsequentOps launches GPU kernels
-        TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
-        std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": fallbackRunSubsequentOps completed" << std::endl;
+        if (!isCapturing(stream))
+        {
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                      << ": Synchronizing stream after fallbackRunSubsequentOps (not capturing)" << std::endl
+                      << std::flush;
+            TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                      << ": Stream synchronized, fallbackRunSubsequentOps completed" << std::endl
+                      << std::flush;
+        }
+        else
+        {
+            std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank
+                      << ": Skipping synchronization after fallbackRunSubsequentOps (capturing CUDA graph)" << std::endl
+                      << std::flush;
+        }
         std::cout << "[runNCCLAllReduceSymmetric] Rank " << rank << ": runNCCLAllReduceSymmetric completed successfully"
-                  << std::endl;
+                  << std::endl
+                  << std::flush;
         return result;
     }
 
@@ -947,11 +1145,19 @@ private:
         torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias,
         torch::Tensor& reduce_output)
     {
+        auto const rank = getRank();
+        std::cout << "[fallbackRunSubsequentOps] Rank " << rank << ": Starting fallbackRunSubsequentOps" << std::endl
+                  << std::flush;
         // If we reach here, it means the extra fallback operations are required.
         // All patterns are broken into ALlReduce + residual_rms_norm + following operations (quantization, etc.)
         auto const size = input.numel();
         auto const hidden_size = input.size(-1);
         auto const stream = at::cuda::getCurrentCUDAStream(input.get_device());
+        bool capturing = isCapturing(stream);
+        std::cout << "[fallbackRunSubsequentOps] Rank " << rank << ": size=" << size << ", hidden_size=" << hidden_size
+                  << ", stream=" << stream << ", capturing=" << (capturing ? "YES" : "NO")
+                  << ", mOp=" << tensorrt_llm::kernels::toString(mOp) << std::endl
+                  << std::flush;
 
         torch::Tensor norm_out = torch::empty_like(input);
 
@@ -965,11 +1171,35 @@ private:
         params.fusion_params.hidden_size = hidden_size;
         params.fusion_params.eps = mEps;
         params.fusion_params.intermediate_buffer = reduce_output.mutable_data_ptr();
+        std::cout << "[fallbackRunSubsequentOps] Rank " << rank << ": About to call residualRmsNorm kernel" << std::endl
+                  << std::flush;
         tensorrt_llm::kernels::residualRmsNorm(params, mType, stream, AllReduceFusionOp::RESIDUAL_RMS_NORM);
+        std::cout << "[fallbackRunSubsequentOps] Rank " << rank
+                  << ": residualRmsNorm kernel call returned (operation queued to stream)" << std::endl
+                  << std::flush;
+        if (!capturing)
+        {
+            std::cout << "[fallbackRunSubsequentOps] Rank " << rank
+                      << ": Synchronizing stream after residualRmsNorm (not capturing)" << std::endl
+                      << std::flush;
+            TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+            std::cout << "[fallbackRunSubsequentOps] Rank " << rank << ": Stream synchronized after residualRmsNorm"
+                      << std::endl
+                      << std::flush;
+        }
+        else
+        {
+            std::cout << "[fallbackRunSubsequentOps] Rank " << rank
+                      << ": Skipping synchronization after residualRmsNorm (capturing CUDA graph)" << std::endl
+                      << std::flush;
+        }
 
         // If no quantization is needed, return the norm and residual outputs.
         if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
         {
+            std::cout << "[fallbackRunSubsequentOps] Rank " << rank << ": mOp is RESIDUAL_RMS_NORM, returning early"
+                      << std::endl
+                      << std::flush;
             return {norm_out, reduce_output};
         }
 
@@ -979,33 +1209,76 @@ private:
         TORCH_CHECK(scale, "scale is required for quantization ops");
 
         // Attach the subsequent operations after the residual RMS norm all-reduce and return the final outputs.
+        std::cout << "[fallbackRunSubsequentOps] Rank " << rank
+                  << ": Processing quantization, mOp=" << tensorrt_llm::kernels::toString(mOp) << std::endl
+                  << std::flush;
         switch (mOp)
         {
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8:
         {
+            std::cout << "[fallbackRunSubsequentOps] Rank " << rank
+                      << ": Calling symmetric_static_quantize_per_tensor (FP8)" << std::endl
+                      << std::flush;
             auto [quant_out, scale_out] = torch_ext::symmetric_static_quantize_per_tensor(norm_out, scale.value());
+            std::cout << "[fallbackRunSubsequentOps] Rank " << rank
+                      << ": symmetric_static_quantize_per_tensor completed" << std::endl
+                      << std::flush;
+            if (!capturing)
+            {
+                TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+            }
             return {quant_out, reduce_output};
         }
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4:
         {
+            std::cout << "[fallbackRunSubsequentOps] Rank " << rank << ": Calling fp4_quantize" << std::endl
+                      << std::flush;
             auto [quant_out, scale_out]
                 = torch_ext::fp4_quantize(norm_out, scale.value(), sf_vecsize, sf_use_ue8m0, is_sf_swizzled_layout);
+            std::cout << "[fallbackRunSubsequentOps] Rank " << rank << ": fp4_quantize completed" << std::endl
+                      << std::flush;
+            if (!capturing)
+            {
+                TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+            }
             return {quant_out, scale_out, reduce_output};
         }
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8:
         {
+            std::cout << "[fallbackRunSubsequentOps] Rank " << rank
+                      << ": Calling symmetric_static_quantize_per_tensor (FP8, with norm_out)" << std::endl
+                      << std::flush;
             auto [quant_out, scale_out] = torch_ext::symmetric_static_quantize_per_tensor(norm_out, scale.value());
+            std::cout << "[fallbackRunSubsequentOps] Rank " << rank
+                      << ": symmetric_static_quantize_per_tensor completed" << std::endl
+                      << std::flush;
+            if (!capturing)
+            {
+                TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+            }
             return {norm_out, quant_out, reduce_output};
         }
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
         {
+            std::cout << "[fallbackRunSubsequentOps] Rank " << rank << ": Calling fp4_quantize (with norm_out)"
+                      << std::endl
+                      << std::flush;
             auto [quant_out, scale_out]
                 = torch_ext::fp4_quantize(norm_out, scale.value(), sf_vecsize, sf_use_ue8m0, is_sf_swizzled_layout);
+            std::cout << "[fallbackRunSubsequentOps] Rank " << rank << ": fp4_quantize completed" << std::endl
+                      << std::flush;
+            if (!capturing)
+            {
+                TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+            }
             return {norm_out, quant_out, scale_out, reduce_output};
         }
         default: break;
         }
 
+        std::cout << "[fallbackRunSubsequentOps] Rank " << rank
+                  << ": ERROR - Unsupported fusion operation: " << tensorrt_llm::kernels::toString(mOp) << std::endl
+                  << std::flush;
         TORCH_CHECK(false, "Unsupported fusion operation: " + tensorrt_llm::kernels::toString(mOp));
         return {};
     }

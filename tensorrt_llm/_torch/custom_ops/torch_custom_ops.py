@@ -1866,23 +1866,36 @@ def tunable_allreduce(
     )
     print(f"[tunable_allreduce] Rank {rank}: Created AllReduceRunner")
 
-    print(f"[tunable_allreduce] Rank {rank}: Calling tuner.choose_one")
+    print(
+        f"[tunable_allreduce] Rank {rank}: Calling tuner.choose_one (this may block during autotuning)"
+    )
+    import time
+    choose_start_time = time.time()
     _, best_tactic = tuner.choose_one(
         "trtllm::tunable_allreduce::allreduce",
         [allreduce_runner],
         AllReduceRunner.tuning_config,
         [input, residual, norm_weight, scale, bias, workspace],
     )
+    choose_end_time = time.time()
+    choose_duration = choose_end_time - choose_start_time
     print(
-        f"[tunable_allreduce] Rank {rank}: tuner.choose_one completed, best_tactic={best_tactic}"
+        f"[tunable_allreduce] Rank {rank}: tuner.choose_one completed after {choose_duration:.6f}s, best_tactic={best_tactic}"
     )
 
     print(
-        f"[tunable_allreduce] Rank {rank}: Calling allreduce_runner with best_tactic={best_tactic}"
+        f"[tunable_allreduce] Rank {rank}: Calling allreduce_runner with best_tactic={best_tactic} (this may block if other ranks are not ready)"
     )
+    import time
+    runner_start_time = time.time()
     result = allreduce_runner(
         [input, residual, norm_weight, scale, bias, workspace],
         tactic=best_tactic,
+    )
+    runner_end_time = time.time()
+    runner_duration = runner_end_time - runner_start_time
+    print(
+        f"[tunable_allreduce] Rank {rank}: allreduce_runner returned after {runner_duration:.6f}s"
     )
     # Handle result which can be a list of tensors or a single tensor
     if isinstance(result, (list, tuple)):
