@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from argparse import ArgumentParser
 from itertools import product
 
@@ -127,6 +128,9 @@ def allreduce_benchmark(
     explore_2d: bool = False,
     save_csv: str = None,
     enable_auto: bool = False,
+    shapes: str = None,
+    strategy_filter: str = None,
+    allow_mnnvl_single_node: bool = False,
 ):
     world_size = tllm.mpi_world_size()
     rank = tllm.mpi_rank()
@@ -135,6 +139,9 @@ def allreduce_benchmark(
 
     torch.cuda.set_device(local_rank)
     cudart.cudaSetDevice(local_rank)
+
+    if allow_mnnvl_single_node:
+        os.environ["TLLM_ALLOW_MNNVL_SINGLE_NODE"] = "1"
 
     mapping = Mapping(world_size, rank, gpus_per_node, tp_size=world_size)
 
@@ -156,7 +163,11 @@ def allreduce_benchmark(
     # generate shape list
     shape_list = []
 
-    if explore_2d:
+    if shapes is not None:
+        for shape in shapes.split(";"):
+            num_tokens, hidden_size = [int(i) for i in shape.split(",")]
+            shape_list.append((num_tokens, hidden_size))
+    elif explore_2d:
         num_tokens_list = [
             1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384
         ]
@@ -190,7 +201,11 @@ def allreduce_benchmark(
         AllReduceStrategy.ONESHOT,
         AllReduceStrategy.TWOSHOT,
         AllReduceStrategy.AUTO,
+        AllReduceStrategy.MNNVL,
     ]
+    if strategy_filter is not None:
+        strategy_enum = AllReduceStrategy[strategy_filter]
+        strategies = [strategy_enum]
     df = pd.DataFrame()
     for (num_tokens, hidden_size) in shape_list:
         message_size = num_tokens * hidden_size * torch.finfo(
@@ -285,6 +300,25 @@ if __name__ == "__main__":
     parser.add_argument("--enable_cudagraph", action="store_true")
     parser.add_argument("--save_csv", type=str, default=None)
     parser.add_argument("--enable_auto", action="store_true", default=False)
+    parser.add_argument(
+        "--shapes",
+        type=str,
+        default=None,
+        help="Semicolon-separated shapes: num_tokens,hidden_size;...",
+    )
+    parser.add_argument(
+        "--strategy",
+        type=str,
+        default=None,
+        choices=[s.name for s in AllReduceStrategy],
+        help="Run a single allreduce strategy",
+    )
+    parser.add_argument(
+        "--allow_mnnvl_single_node",
+        action="store_true",
+        default=False,
+        help="Allow MNNVL on a single node when supported",
+    )
 
     args = parser.parse_args()
 
@@ -295,4 +329,7 @@ if __name__ == "__main__":
         args.explore_2d,
         args.save_csv,
         args.enable_auto,
+        args.shapes,
+        args.strategy,
+        args.allow_mnnvl_single_node,
     )

@@ -544,10 +544,12 @@ class MNNVLAllReduce(nn.Module):
         is_on_aarch64 = "aarch64" in arch
         # Add a bypass so that we can run the unittest on single-node
         is_testing = os.environ.get("TLLM_TEST_MNNVL", "0") == "1"
-        return is_testing or (dtype in MNNVLAllReduce.get_supported_dtypes() and
-                              not mapping.has_cp() and mapping.is_multi_node()
-                              and MnnvlMemory.supports_mnnvl()
-                              and is_on_aarch64)
+        allow_single_node = os.environ.get("TLLM_ALLOW_MNNVL_SINGLE_NODE",
+                                           "0") == "1"
+        return is_testing or (dtype in MNNVLAllReduce.get_supported_dtypes()
+                              and not mapping.has_cp() and
+                              (mapping.is_multi_node() or allow_single_node) and
+                              MnnvlMemory.supports_mnnvl() and is_on_aarch64)
 
     @staticmethod
     def get_required_workspace_size(num_tokens: int, hidden_dim: int,
