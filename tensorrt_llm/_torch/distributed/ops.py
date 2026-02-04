@@ -552,6 +552,26 @@ class MNNVLAllReduce(nn.Module):
                               MnnvlMemory.supports_mnnvl() and is_on_aarch64)
 
     @staticmethod
+    def get_mnnvl_check_details(mapping: Mapping,
+                                dtype: torch.dtype) -> Dict[str, bool]:
+        from tensorrt_llm._mnnvl_utils import MnnvlMemory
+
+        arch = platform.machine().lower()
+        is_on_aarch64 = "aarch64" in arch
+        is_testing = os.environ.get("TLLM_TEST_MNNVL", "0") == "1"
+        allow_single_node = os.environ.get("TLLM_ALLOW_MNNVL_SINGLE_NODE",
+                                           "0") == "1"
+        return {
+            "is_testing": is_testing,
+            "dtype_supported": dtype in MNNVLAllReduce.get_supported_dtypes(),
+            "has_cp": mapping.has_cp(),
+            "is_multi_node": mapping.is_multi_node(),
+            "allow_single_node": allow_single_node,
+            "supports_mnnvl": MnnvlMemory.supports_mnnvl(),
+            "is_on_aarch64": is_on_aarch64,
+        }
+
+    @staticmethod
     def get_required_workspace_size(num_tokens: int, hidden_dim: int,
                                     group_size: int, dtype: torch.dtype) -> int:
         elem_size = torch.tensor([], dtype=dtype).element_size()
@@ -751,9 +771,11 @@ class AllReduce(nn.Module):
                         self.mnnvl_allreduce = None
                 else:
                     if self.strategy == AllReduceStrategy.MNNVL:
+                        details = MNNVLAllReduce.get_mnnvl_check_details(
+                            self.mapping, dtype)
                         raise RuntimeError(
-                            "MNNVL AllReduce required but is_mnnvl check failed."
-                        )
+                            "MNNVL AllReduce required but is_mnnvl check failed. "
+                            f"Details: {details}")
                     logger.debug(
                         f"MNNVLAllReduce can't be enabled due to failing the is_mnnvl check."
                     )
