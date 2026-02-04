@@ -130,6 +130,7 @@ def allreduce_benchmark(
     shapes: str = None,
     strategy_filter: str = None,
     fixed_hidden_size: int = None,
+    token_range: str = None,
 ):
     world_size = tllm.mpi_world_size()
     rank = tllm.mpi_rank()
@@ -172,7 +173,8 @@ def allreduce_benchmark(
                                                hidden_size_list):
             shape_list.append((num_tokens, hidden_size))
     elif fixed_hidden_size is not None:
-        min_tokens, max_tokens, ratio = [int(i) for i in test_range.split(",")]
+        sweep_range = token_range if token_range is not None else test_range
+        min_tokens, max_tokens, ratio = [int(i) for i in sweep_range.split(",")]
         num_tokens = min_tokens
         while num_tokens < max_tokens:
             num_tokens *= ratio
@@ -331,6 +333,13 @@ if __name__ == "__main__":
         help=
         "Sweep token sizes with a fixed hidden size (use --range for token sweep)",
     )
+    parser.add_argument(
+        "--token_range",
+        type=str,
+        default=None,
+        help=
+        "min_tokens,max_tokens,ratio for token sweep (only with --fixed_hidden_size)",
+    )
 
     args = parser.parse_args()
 
@@ -344,4 +353,5 @@ if __name__ == "__main__":
         args.shapes,
         args.strategy,
         args.fixed_hidden_size,
+        args.token_range,
     )
