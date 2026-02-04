@@ -197,6 +197,10 @@ def allreduce_benchmark(
         AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
         AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
     ]
+    mnnvl_supported_fusions = {
+        AllReduceFusionOp.NONE,
+        AllReduceFusionOp.RESIDUAL_RMS_NORM,
+    }
     strategies = [
         AllReduceStrategy.NCCL,
         AllReduceStrategy.NCCL_SYMMETRIC,
@@ -234,6 +238,9 @@ def allreduce_benchmark(
                 continue
 
             if fusion == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4 and sm_version < 100:
+                continue
+
+            if strategy == AllReduceStrategy.MNNVL and fusion not in mnnvl_supported_fusions:
                 continue
 
             if not enable_auto and strategy == AllReduceStrategy.AUTO:
