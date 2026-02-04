@@ -131,6 +131,7 @@ def allreduce_benchmark(
     shapes: str = None,
     strategy_filter: str = None,
     allow_mnnvl_single_node: bool = False,
+    fixed_hidden_size: int = None,
 ):
     world_size = tllm.mpi_world_size()
     rank = tllm.mpi_rank()
@@ -175,6 +176,12 @@ def allreduce_benchmark(
         for num_tokens, hidden_size in product(num_tokens_list,
                                                hidden_size_list):
             shape_list.append((num_tokens, hidden_size))
+    elif fixed_hidden_size is not None:
+        min_tokens, max_tokens, ratio = [int(i) for i in test_range.split(",")]
+        num_tokens = min_tokens
+        while num_tokens < max_tokens:
+            num_tokens *= ratio
+            shape_list.append((num_tokens, fixed_hidden_size))
     else:
         min_size, max_size, ratio = [int(i) for i in test_range.split(",")]
         size = min_size
@@ -314,6 +321,13 @@ if __name__ == "__main__":
         help="Run a single allreduce strategy",
     )
     parser.add_argument(
+        "--fixed_hidden_size",
+        type=int,
+        default=None,
+        help=
+        "Sweep token sizes with a fixed hidden size (use --range for token sweep)",
+    )
+    parser.add_argument(
         "--allow_mnnvl_single_node",
         action="store_true",
         default=False,
@@ -332,4 +346,5 @@ if __name__ == "__main__":
         args.shapes,
         args.strategy,
         args.allow_mnnvl_single_node,
+        args.fixed_hidden_size,
     )

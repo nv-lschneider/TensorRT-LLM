@@ -742,10 +742,18 @@ class AllReduce(nn.Module):
                         self.mnnvl_allreduce = MNNVLAllReduce(
                             self.mapping, dtype) if dtype else None
                     except Exception as e:
+                        if self.strategy == AllReduceStrategy.MNNVL:
+                            raise RuntimeError(
+                                f"MNNVL AllReduce required but failed to initialize: {e}"
+                            ) from e
                         logger.debug(
                             f"MNNVL AllReduce can't be enabled due to {e}.")
                         self.mnnvl_allreduce = None
                 else:
+                    if self.strategy == AllReduceStrategy.MNNVL:
+                        raise RuntimeError(
+                            "MNNVL AllReduce required but is_mnnvl check failed."
+                        )
                     logger.debug(
                         f"MNNVLAllReduce can't be enabled due to failing the is_mnnvl check."
                     )
@@ -815,6 +823,12 @@ class AllReduce(nn.Module):
                 input, all_reduce_params=all_reduce_params)
             if mnnvl_output is not None:
                 return mnnvl_output
+            if allreduce_strategy == AllReduceStrategy.MNNVL:
+                raise RuntimeError(
+                    "MNNVL AllReduce required but returned no output.")
+        elif allreduce_strategy == AllReduceStrategy.MNNVL:
+            raise RuntimeError(
+                "MNNVL AllReduce required but was not initialized.")
 
         # Fall back to regular AllReduce if specialized methods are not available or not applicable
         # Make sure the strategy is AUTO since allreduceOp does not have the branch for MNNVL/SYMM_MEM
