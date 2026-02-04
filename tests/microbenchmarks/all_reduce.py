@@ -210,8 +210,10 @@ def allreduce_benchmark(
         AllReduceStrategy.MNNVL,
     ]
     if strategy_filter is not None:
-        strategy_enum = AllReduceStrategy[strategy_filter]
-        strategies = [strategy_enum]
+        strategy_names = [
+            s.strip() for s in strategy_filter.split(",") if s.strip()
+        ]
+        strategies = [AllReduceStrategy[name] for name in strategy_names]
     df = pd.DataFrame()
     for (num_tokens, hidden_size) in shape_list:
         message_size = num_tokens * hidden_size * torch.finfo(
@@ -319,8 +321,8 @@ if __name__ == "__main__":
         "--strategy",
         type=str,
         default=None,
-        choices=[s.name for s in AllReduceStrategy],
-        help="Run a single allreduce strategy",
+        help=
+        "Comma-separated list of strategies (e.g. MNNVL,NCCL). Defaults to all.",
     )
     parser.add_argument(
         "--fixed_hidden_size",
