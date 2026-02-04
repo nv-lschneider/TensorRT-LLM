@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from argparse import ArgumentParser
 from itertools import product
 
@@ -139,9 +138,6 @@ def allreduce_benchmark(
 
     torch.cuda.set_device(local_rank)
     cudart.cudaSetDevice(local_rank)
-
-    if allow_mnnvl_single_node:
-        os.environ["TLLM_ALLOW_MNNVL_SINGLE_NODE"] = "1"
 
     mapping = Mapping(world_size, rank, gpus_per_node, tp_size=world_size)
 
