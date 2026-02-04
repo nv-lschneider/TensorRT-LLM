@@ -64,7 +64,7 @@ def profile_allreduce(
         bias=bias,
     )
 
-    allreduce = AllReduce(mapping=mapping, strategy=strategy)
+    allreduce = AllReduce(mapping=mapping, strategy=strategy, dtype=input.dtype)
 
     def func(x, loop_num=inner_loop):
         for _ in range(loop_num):
@@ -130,7 +130,6 @@ def allreduce_benchmark(
     enable_auto: bool = False,
     shapes: str = None,
     strategy_filter: str = None,
-    allow_mnnvl_single_node: bool = False,
     fixed_hidden_size: int = None,
 ):
     world_size = tllm.mpi_world_size()
@@ -327,12 +326,6 @@ if __name__ == "__main__":
         help=
         "Sweep token sizes with a fixed hidden size (use --range for token sweep)",
     )
-    parser.add_argument(
-        "--allow_mnnvl_single_node",
-        action="store_true",
-        default=False,
-        help="Allow MNNVL on a single node when supported",
-    )
 
     args = parser.parse_args()
 
@@ -345,6 +338,5 @@ if __name__ == "__main__":
         args.enable_auto,
         args.shapes,
         args.strategy,
-        args.allow_mnnvl_single_node,
         args.fixed_hidden_size,
     )
