@@ -423,8 +423,10 @@ def submit_job(config, log_dir, dry_run):
     gen_pp_size = worker_config['gen'].get('pipeline_parallel_size', 1)
     gen_world_size = gen_tp_size * gen_cp_size * gen_pp_size
     gen_nodes = calculate_nodes(gen_world_size, gen_num, gpus_per_node)
-    ucx_warmup_requests = 2 * ctx_world_size * \
+    default_ucx_warmup_requests = 2 * ctx_world_size * \
         gen_world_size if benchmark_config['mode'] == "e2e" else 0
+    ucx_warmup_requests = benchmark_config.get(
+        'ucx_warmup_requests', default_ucx_warmup_requests)
 
     total_nodes = ctx_nodes + gen_nodes
     total_tasks = total_nodes * gpus_per_node

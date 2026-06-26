@@ -50,6 +50,11 @@ from tensorrt_llm.serve.responses_utils import (
 from tensorrt_llm.serve.router import KvCacheAwareRouter, Router
 
 
+def _mooncake_paged_gin_diag_enabled() -> bool:
+    return os.getenv("TRTLLM_MOONCAKE_PAGED_GIN_DIAG", "").lower() in (
+        "1", "true", "yes", "on")
+
+
 class OpenAIDisaggregatedService(OpenAIService):
     def __init__(
         self,
@@ -136,16 +141,34 @@ class OpenAIDisaggregatedService(OpenAIService):
         ctx_response = None
         gen_req = request
         disagg_request_id = get_global_disagg_request_id(self._config.node_id)
+        if _mooncake_paged_gin_diag_enabled():
+            logger.info(
+                f"MOONCAKE_PAGED_GIN_DIAG ctx_first begin disagg_request_id={disagg_request_id} "
+                f"need_ctx={need_ctx} gen_server_reserved={gen_server} stream={request.stream}"
+            )
         if need_ctx:
             ctx_req = self._get_ctx_request(request, disagg_request_id)
             # ctx generator is empty
             ctx_server, _ = await self._ctx_router.get_next_server(
                 ctx_req, exclude_server=gen_server
             )
+            if _mooncake_paged_gin_diag_enabled():
+                logger.info(
+                    f"MOONCAKE_PAGED_GIN_DIAG ctx_first send_ctx disagg_request_id={disagg_request_id} "
+                    f"ctx_server={ctx_server}"
+                )
             ctx_response = await self._ctx_client.send_request(
                 ctx_req, server=ctx_server, hooks=hooks
             )
             await self._verify_ctx_response(ctx_response)
+            choice = ctx_response.choices[0]
+            if _mooncake_paged_gin_diag_enabled():
+                logger.info(
+                    f"MOONCAKE_PAGED_GIN_DIAG ctx_first ctx_done disagg_request_id={disagg_request_id} "
+                    f"ctx_request_id={getattr(choice.disaggregated_params, 'ctx_request_id', None)} "
+                    f"finish_reason={choice.finish_reason} "
+                    f"need_gen={choice.finish_reason in ['length', 'not_finished']}"
+                )
             gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
         else:
             # Clear synthetic disaggregated_params that may have been
@@ -162,12 +185,29 @@ class OpenAIDisaggregatedService(OpenAIService):
                 gen_req.disaggregated_params = None
         if ctx_response is None or self._need_gen(ctx_response):
             if not gen_server:
+                if _mooncake_paged_gin_diag_enabled():
+                    logger.info(
+                        f"MOONCAKE_PAGED_GIN_DIAG ctx_first route_gen_begin disagg_request_id={disagg_request_id} "
+                        f"ctx_server={ctx_server}"
+                    )
                 gen_server, _ = await self._gen_router.get_next_server(
                     gen_req, exclude_server=ctx_server
+                )
+            if _mooncake_paged_gin_diag_enabled():
+                logger.info(
+                    f"MOONCAKE_PAGED_GIN_DIAG ctx_first send_gen disagg_request_id={disagg_request_id} "
+                    f"ctx_request_id={getattr(gen_req.disaggregated_params, 'ctx_request_id', None)} "
+                    f"gen_server={gen_server}"
                 )
             gen_response = await self._gen_client.send_request(
                 gen_req, server=gen_server, hooks=hooks
             )
+            if _mooncake_paged_gin_diag_enabled():
+                logger.info(
+                    f"MOONCAKE_PAGED_GIN_DIAG ctx_first gen_done disagg_request_id={disagg_request_id} "
+                    f"ctx_request_id={getattr(gen_req.disaggregated_params, 'ctx_request_id', None)} "
+                    f"gen_server={gen_server}"
+                )
             return self._rewrite_disagg_usage(gen_response, ctx_response)
         else:
             if request.stream:

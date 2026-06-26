@@ -2656,7 +2656,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     """
 
     backend: Optional[Literal[
-        "DEFAULT", "UCX", "NIXL", "MOONCAKE", "MPI"]] = Field(
+        "DEFAULT", "UCX", "NIXL", "MOONCAKE", "MOONCAKE_PAGED_GIN", "MPI"]] = Field(
             default=None,
             description=
             "The communication backend type to use for the cache transceiver.")

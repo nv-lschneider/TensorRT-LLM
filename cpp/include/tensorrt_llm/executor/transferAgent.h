@@ -274,6 +274,68 @@ private:
     std::optional<SyncMessage> mSyncMessage;
 };
 
+struct PagedTransferMetadata
+{
+    std::vector<uintptr_t> mLayerPtrs;
+    std::vector<int32_t> mPageIndices;
+    size_t mPageBytes{0};
+    MemoryDesc mRegisteredMemory{static_cast<uintptr_t>(0), 0, 0};
+};
+
+class PagedTransferRequest
+{
+public:
+    PagedTransferRequest(std::vector<uintptr_t> srcLayerPtrs, std::vector<uintptr_t> dstLayerPtrs,
+        std::vector<int32_t> srcPageIndices, std::vector<int32_t> dstPageIndices, size_t pageBytes,
+        std::string const& remoteName)
+        : mSrcLayerPtrs{std::move(srcLayerPtrs)}
+        , mDstLayerPtrs{std::move(dstLayerPtrs)}
+        , mSrcPageIndices{std::move(srcPageIndices)}
+        , mDstPageIndices{std::move(dstPageIndices)}
+        , mPageBytes{pageBytes}
+        , mRemoteName{remoteName}
+    {
+    }
+
+    [[nodiscard]] std::vector<uintptr_t> const& getSrcLayerPtrs() const noexcept
+    {
+        return mSrcLayerPtrs;
+    }
+
+    [[nodiscard]] std::vector<uintptr_t> const& getDstLayerPtrs() const noexcept
+    {
+        return mDstLayerPtrs;
+    }
+
+    [[nodiscard]] std::vector<int32_t> const& getSrcPageIndices() const noexcept
+    {
+        return mSrcPageIndices;
+    }
+
+    [[nodiscard]] std::vector<int32_t> const& getDstPageIndices() const noexcept
+    {
+        return mDstPageIndices;
+    }
+
+    [[nodiscard]] size_t getPageBytes() const noexcept
+    {
+        return mPageBytes;
+    }
+
+    [[nodiscard]] std::string const& getRemoteName() const noexcept
+    {
+        return mRemoteName;
+    }
+
+private:
+    std::vector<uintptr_t> mSrcLayerPtrs;
+    std::vector<uintptr_t> mDstLayerPtrs;
+    std::vector<int32_t> mSrcPageIndices;
+    std::vector<int32_t> mDstPageIndices;
+    size_t mPageBytes;
+    std::string mRemoteName;
+};
+
 enum class TransferState : uint8_t
 {
     kIN_PROGRESS,
@@ -339,6 +401,13 @@ public:
     /// @param request Specify the transmission request.
     /// @return The status of the requests.
     [[nodiscard]] virtual std::unique_ptr<TransferStatus> submitTransferRequests(TransferRequest const& request) = 0;
+
+    /// @brief Submit a synchronous paged KV transfer. Only paged-capable agents implement this.
+    virtual void submitPagedTransferRequest(PagedTransferRequest const& request)
+    {
+        (void) request;
+        TLLM_THROW("Paged transfer is not supported by this transfer agent.");
+    }
 
     /// @brief Generate a notification, not bound to a transfer, e.g., for control.
     /// @param name Specify the name of the remote agent to which the information should be sent.
@@ -407,6 +476,14 @@ template <typename... Args>
         using CreateMooncakeFuncType = std::unique_ptr<BaseTransferAgent> (*)(BaseAgentConfig const*);
         auto* func = loader.getFunctionPointer<CreateMooncakeFuncType>(
             "libtensorrt_llm_mooncake_wrapper.so", "createMooncakeTransferAgent");
+        return func(std::forward<Args>(args)...);
+    }
+    if (backend == "mooncake_paged_gin")
+    {
+        auto& loader = DynLibLoader::getInstance();
+        using CreateMooncakePagedGinFuncType = std::unique_ptr<BaseTransferAgent> (*)(BaseAgentConfig const*);
+        auto* func = loader.getFunctionPointer<CreateMooncakePagedGinFuncType>(
+            "libtensorrt_llm_mooncake_paged_gin_wrapper.so", "createMooncakePagedGinTransferAgent");
         return func(std::forward<Args>(args)...);
     }
     TLLM_THROW("Unknown backend name.");

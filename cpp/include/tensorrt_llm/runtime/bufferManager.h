@@ -76,6 +76,9 @@ public:
     //! \brief Allocates an `ITensor` of the given dimensions on the GPU, using cudaMalloc.
     [[nodiscard]] static ITensorPtr gpuSync(nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE);
 
+    //! \brief Allocates an `ITensor` on the GPU using NCCL-window-compatible memory.
+    [[nodiscard]] static ITensorPtr ncclMem(nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE);
+
     //! \brief Allocates an `IBuffer` of the given size on the CPU.
     [[nodiscard]] static IBufferPtr cpu(std::size_t size, nvinfer1::DataType type = kBYTE_TYPE);
 

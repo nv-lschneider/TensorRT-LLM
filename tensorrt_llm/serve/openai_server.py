@@ -182,6 +182,11 @@ def _normalize_image_output(image) -> list:
     return [image]
 
 
+def _mooncake_paged_gin_diag_enabled() -> bool:
+    return os.getenv("TRTLLM_MOONCAKE_PAGED_GIN_DIAG", "").lower() in (
+        "1", "true", "yes", "on")
+
+
 class OpenAIServer:
 
     def __init__(
@@ -1282,12 +1287,34 @@ class OpenAIServer:
 
     async def openai_completion(self, request: CompletionRequest,
                                 raw_request: Request) -> Response:
+        request_dp = getattr(request, "disaggregated_params", None)
+        if _mooncake_paged_gin_diag_enabled():
+            logger.info(
+                f"MOONCAKE_PAGED_GIN_DIAG worker_completion_entry "
+                f"request_type={getattr(request_dp, 'request_type', None)} "
+                f"ctx_request_id={getattr(request_dp, 'ctx_request_id', None)} "
+                f"disagg_request_id={getattr(request_dp, 'disagg_request_id', None)} "
+                f"stream={request.stream}")
 
         async def completion_response(
                 promise: RequestOutput,
                 postproc_params: Optional[PostprocParams]
         ) -> CompletionResponse:
+            if _mooncake_paged_gin_diag_enabled():
+                logger.info(
+                    f"MOONCAKE_PAGED_GIN_DIAG worker_completion_await_begin "
+                    f"request_type={getattr(disaggregated_params, 'request_type', None)} "
+                    f"ctx_request_id={getattr(disaggregated_params, 'ctx_request_id', None)} "
+                    f"disagg_request_id={getattr(disaggregated_params, 'disagg_request_id', None)}"
+                )
             response = await promise
+            if _mooncake_paged_gin_diag_enabled():
+                logger.info(
+                    f"MOONCAKE_PAGED_GIN_DIAG worker_completion_await_end "
+                    f"request_type={getattr(disaggregated_params, 'request_type', None)} "
+                    f"ctx_request_id={getattr(disaggregated_params, 'ctx_request_id', None)} "
+                    f"disagg_request_id={getattr(disaggregated_params, 'disagg_request_id', None)} "
+                    f"has_error={response.error is not None}")
             if response.error is not None:
                 raise RuntimeError(f"Generation failed: {response.error}")
             if not self.postproc_worker_enabled:
@@ -1409,6 +1436,13 @@ class OpenAIServer:
                 sampling_params.return_perf_metrics = True
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
+            if _mooncake_paged_gin_diag_enabled():
+                logger.info(
+                    f"MOONCAKE_PAGED_GIN_DIAG worker_completion_converted "
+                    f"request_type={getattr(disaggregated_params, 'request_type', None)} "
+                    f"ctx_request_id={getattr(disaggregated_params, 'ctx_request_id', None)} "
+                    f"disagg_request_id={getattr(disaggregated_params, 'disagg_request_id', None)} "
+                    f"num_prompts={len(prompts)} stream={request.stream}")
             for idx, prompt in enumerate(prompts):
                 postproc_args = CompletionPostprocArgs.from_request(request)
                 postproc_args.prompt_idx = idx
@@ -1425,6 +1459,13 @@ class OpenAIServer:
 
                 prompt = prompt_inputs(prompt)
                 if prompt.get("prompt") is not None:
+                    if _mooncake_paged_gin_diag_enabled():
+                        logger.info(
+                            f"MOONCAKE_PAGED_GIN_DIAG worker_completion_preprocess_begin "
+                            f"idx={idx} request_type={getattr(disaggregated_params, 'request_type', None)} "
+                            f"ctx_request_id={getattr(disaggregated_params, 'ctx_request_id', None)} "
+                            f"disagg_request_id={getattr(disaggregated_params, 'disagg_request_id', None)}"
+                        )
                     prompt_token_ids, extra_processed_inputs = await asyncio.to_thread(
                         self.generator.input_processor, prompt, sampling_params)
                     tokens_prompt = TokensPrompt(
@@ -1434,7 +1475,22 @@ class OpenAIServer:
                         if extra_processed_inputs is not None else None)
                 else:
                     tokens_prompt = prompt
+                if _mooncake_paged_gin_diag_enabled():
+                    logger.info(
+                        f"MOONCAKE_PAGED_GIN_DIAG worker_completion_prompt_ready "
+                        f"idx={idx} request_type={getattr(disaggregated_params, 'request_type', None)} "
+                        f"ctx_request_id={getattr(disaggregated_params, 'ctx_request_id', None)} "
+                        f"disagg_request_id={getattr(disaggregated_params, 'disagg_request_id', None)} "
+                        f"token_count={len(getattr(tokens_prompt, 'prompt_token_ids', []) or [])}"
+                    )
 
+                if _mooncake_paged_gin_diag_enabled():
+                    logger.info(
+                        f"MOONCAKE_PAGED_GIN_DIAG worker_generate_async_begin "
+                        f"idx={idx} request_type={getattr(disaggregated_params, 'request_type', None)} "
+                        f"ctx_request_id={getattr(disaggregated_params, 'ctx_request_id', None)} "
+                        f"disagg_request_id={getattr(disaggregated_params, 'disagg_request_id', None)}"
+                    )
                 promise = self.generator.generate_async(
                     inputs=tokens_prompt,
                     sampling_params=sampling_params,
@@ -1443,6 +1499,13 @@ class OpenAIServer:
                     lora_request=request.lora_request,
                     disaggregated_params=disaggregated_params,
                     trace_headers=trace_headers)
+                if _mooncake_paged_gin_diag_enabled():
+                    logger.info(
+                        f"MOONCAKE_PAGED_GIN_DIAG worker_generate_async_end "
+                        f"idx={idx} request_type={getattr(disaggregated_params, 'request_type', None)} "
+                        f"ctx_request_id={getattr(disaggregated_params, 'ctx_request_id', None)} "
+                        f"disagg_request_id={getattr(disaggregated_params, 'disagg_request_id', None)}"
+                    )
                 asyncio.create_task(
                     self.await_disconnected(raw_request, promise))
                 if not self.postproc_worker_enabled:
@@ -1464,10 +1527,24 @@ class OpenAIServer:
                     content=generator_wrapper(response_generator),
                     media_type="text/event-stream")
             else:
+                if _mooncake_paged_gin_diag_enabled():
+                    logger.info(
+                        f"MOONCAKE_PAGED_GIN_DIAG worker_completion_gather_begin "
+                        f"request_type={getattr(disaggregated_params, 'request_type', None)} "
+                        f"ctx_request_id={getattr(disaggregated_params, 'ctx_request_id', None)} "
+                        f"disagg_request_id={getattr(disaggregated_params, 'disagg_request_id', None)} "
+                        f"promises={len(promises)}")
                 rsps = await asyncio.gather(*[
                     completion_response(promise, params) for promise, params in
                     zip(promises, postproc_params_collection)
                 ])
+                if _mooncake_paged_gin_diag_enabled():
+                    logger.info(
+                        f"MOONCAKE_PAGED_GIN_DIAG worker_completion_gather_end "
+                        f"request_type={getattr(disaggregated_params, 'request_type', None)} "
+                        f"ctx_request_id={getattr(disaggregated_params, 'ctx_request_id', None)} "
+                        f"disagg_request_id={getattr(disaggregated_params, 'disagg_request_id', None)}"
+                    )
                 response = merge_completion_responses(rsps) if len(
                     rsps) > 1 else rsps[0]
                 return JSONResponse(content=response.model_dump())

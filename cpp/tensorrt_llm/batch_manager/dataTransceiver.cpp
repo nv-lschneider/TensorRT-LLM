@@ -40,6 +40,16 @@ namespace tensorrt_llm::batch_manager
 
 using BlockRange = tensorrt_llm::batch_manager::kv_cache_manager::BlockRange;
 
+namespace
+{
+
+bool mooncakePagedGinDiagEnabled()
+{
+    return common::getBoolEnv("TRTLLM_MOONCAKE_PAGED_GIN_DIAG");
+}
+
+} // namespace
+
 std::vector<Connection const*> const& TransferSession::getConnections() const
 {
     return mConnections;
@@ -306,6 +316,11 @@ public:
                 std::scoped_lock lkResp(mSenderMutex);
                 mReadyResponses.emplace(
                     llmRequest.mRequestId, Response{std::addressof(llmRequest), std::move(promise)});
+                if (mooncakePagedGinDiagEnabled())
+                {
+                    TLLM_LOG_INFO("MOONCAKE_PAGED_GIN_DIAG sender_ready request_id=%zu ready_count=%zu",
+                        llmRequest.mRequestId, mReadyResponses.size());
+                }
             }
             std::unique_lock lkCond(mCondMutex);
             mAnyReady = true;
@@ -623,12 +638,21 @@ private:
                 }
                 if (!mReadyResponses.empty())
                 {
+                    if (mooncakePagedGinDiagEnabled())
+                    {
+                        TLLM_LOG_INFO("MOONCAKE_PAGED_GIN_DIAG sender_wait_request_info ready_count=%zu",
+                            mReadyResponses.size());
+                    }
                     auto const& requestInfo = recvRequestInfo();
                     if (mTerminate || !mManager->isRunning())
                     {
                         return;
                     }
                     auto reqId = requestInfo.getRequestId();
+                    if (mooncakePagedGinDiagEnabled())
+                    {
+                        TLLM_LOG_INFO("MOONCAKE_PAGED_GIN_DIAG sender_got_request_info request_id=%zu", reqId);
+                    }
 
                     {
                         std::scoped_lock lk(mSenderMutex);
@@ -846,6 +870,29 @@ public:
         }
 
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
+        std::optional<executor::kv_cache::PagedTransferMetadata> pagedTransferMetadata = std::nullopt;
+        if (agentConnectionManager && agentConnectionManager->supportsPagedTransfer())
+        {
+            if (mooncakePagedGinDiagEnabled())
+            {
+                TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+                    "MOONCAKE_PAGED_GIN_DIAG receiver_request_metadata_begin request_id=%lu",
+                    static_cast<unsigned long>(requestId));
+            }
+            pagedTransferMetadata = mCacheTransferLayer.getKvFormatter()->getPagedTransferMetadata(llmRequest, destCacheState);
+            TLLM_CHECK_WITH_INFO(pagedTransferMetadata.has_value(),
+                "MOONCAKE_PAGED_GIN requires generation-side paged KV metadata");
+            if (mooncakePagedGinDiagEnabled())
+            {
+                TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+                    "MOONCAKE_PAGED_GIN_DIAG receiver_request_metadata_end request_id=%lu layers=%lu pages=%lu page_bytes=%lu reg_addr=%p reg_len=%lu",
+                    static_cast<unsigned long>(requestId), pagedTransferMetadata->mLayerPtrs.size(),
+                    pagedTransferMetadata->mPageIndices.size(), pagedTransferMetadata->mPageBytes,
+                    reinterpret_cast<void*>(pagedTransferMetadata->mRegisteredMemory.getAddr()),
+                    pagedTransferMetadata->mRegisteredMemory.getLen());
+            }
+        }
+
         std::vector<std::optional<size_t>> cacheBufferIds;
         if (agentConnectionManager)
         {
@@ -931,8 +978,21 @@ public:
                 auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection);
                 TLLM_CHECK(agentConnection != nullptr);
 
+                if (mooncakePagedGinDiagEnabled())
+                {
+                    TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+                        "MOONCAKE_PAGED_GIN_DIAG receiver_send_request_info_begin request_id=%lu counterpart=%d valid_connection_idx=%d paged=%d",
+                        static_cast<unsigned long>(requestId), static_cast<int>(rank), validConnectionIdx,
+                        pagedTransferMetadata.has_value() ? 1 : 0);
+                }
                 const_cast<executor::kv_cache::AgentConnection*>(agentConnection)
-                    ->sendRequestAndBufferInfo(requestInfo, idsForRank, validConnectionIdx);
+                    ->sendRequestAndBufferInfo(requestInfo, idsForRank, validConnectionIdx, pagedTransferMetadata);
+                if (mooncakePagedGinDiagEnabled())
+                {
+                    TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+                        "MOONCAKE_PAGED_GIN_DIAG receiver_send_request_info_end request_id=%lu counterpart=%d",
+                        static_cast<unsigned long>(requestId), static_cast<int>(rank));
+                }
             }
             else
             {
@@ -1049,6 +1109,11 @@ public:
 private:
     void requestSync(LlmRequest& llmRequest)
     {
+        if (mooncakePagedGinDiagEnabled())
+        {
+            TLLM_LOG_INFO("MOONCAKE_PAGED_GIN_DIAG receiver_request_sync_begin request_id=%zu context_request_id=%zu",
+                llmRequest.mRequestId, llmRequest.getContextPhaseParams().value().getReqId());
+        }
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
             "Start calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
             llmRequest.getContextPhaseParams().value().getReqId());
@@ -1067,6 +1132,11 @@ private:
         receiveSync(session);
         llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
 
+        if (mooncakePagedGinDiagEnabled())
+        {
+            TLLM_LOG_INFO("MOONCAKE_PAGED_GIN_DIAG receiver_request_sync_end request_id=%zu context_request_id=%zu",
+                llmRequest.mRequestId, llmRequest.getContextPhaseParams().value().getReqId());
+        }
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
             "End calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
             llmRequest.getContextPhaseParams().value().getReqId());

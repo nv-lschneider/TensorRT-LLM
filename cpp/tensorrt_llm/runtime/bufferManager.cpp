@@ -83,6 +83,17 @@ BufferManager::ITensorPtr BufferManager::gpuSync(nvinfer1::Dims dims, nvinfer1::
     return std::make_unique<StaticDeviceTensor>(dims, type, CudaAllocator{});
 }
 
+BufferManager::ITensorPtr BufferManager::ncclMem(nvinfer1::Dims dims, nvinfer1::DataType type)
+{
+#if ENABLE_MULTI_DEVICE && NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+    return std::make_unique<StaticNcclMemDeviceTensor>(dims, type, NcclMemAllocator{});
+#else
+    (void) dims;
+    (void) type;
+    TLLM_THROW("NCCL-window-compatible allocation requires ENABLE_MULTI_DEVICE and NCCL >= 2.28");
+#endif
+}
+
 BufferManager::IBufferPtr BufferManager::cpu(std::size_t size, nvinfer1::DataType type)
 {
     return std::make_unique<HostBuffer>(size, type);

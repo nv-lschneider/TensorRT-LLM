@@ -23,6 +23,7 @@
 #include "tensorrt_llm/batch_manager/radixBlockTree.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/executor/executor.h"
@@ -35,6 +36,7 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <optional>
@@ -53,6 +55,11 @@ using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>
 
 namespace
 {
+
+bool useMooncakePagedGinNcclKvAlloc()
+{
+    return tc::getBoolEnv("TRTLLM_MOONCAKE_PAGED_GIN_NCCL_KV_ALLOC");
+}
 
 //! \brief Get all blocks in a sequence by traversing backwards from the last block.
 //! \param lastBlock is a BlockPtr to the last block in the sequence to start traversal from
@@ -1092,9 +1099,20 @@ void WindowBlockManager::allocatePools(bool useUvm)
             cacheShape.d[2], cacheShape.d[3], pool.layerFirstLayout ? " (layer-first)" : "");
 
         if (useUvm)
+        {
             pool.primaryPtr = BufferManager::managed(cacheShape, poolDtype);
+        }
+        else if (useMooncakePagedGinNcclKvAlloc() && !pool.containsBlockScales && !pool.containsIndexerKCache)
+        {
+            TLLM_LOG_INFO(
+                "[%s] Allocating primary KV pool with NCCL-window-compatible memory for MOONCAKE_PAGED_GIN PoC",
+                mLogPrefix.c_str());
+            pool.primaryPtr = BufferManager::ncclMem(cacheShape, poolDtype);
+        }
         else
+        {
             pool.primaryPtr = mBufferManager.gpuSync(cacheShape, poolDtype);
+        }
         if (mNumSecondaryBlocks > 0)
         {
             nvinfer1::Dims cacheShapeOffload = isRecurrentState()

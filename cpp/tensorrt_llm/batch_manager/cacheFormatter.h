@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <fstream>
 #include <numeric>
+#include <optional>
 #include <vector>
 
 // Forward declare TransferSession in the correct global namespace scope
@@ -221,6 +222,14 @@ public:
 
     [[nodiscard]] virtual BaseKVCacheManager* getCacheManager() const noexcept = 0;
 
+    [[nodiscard]] virtual std::optional<executor::kv_cache::PagedTransferMetadata> getPagedTransferMetadata(
+        LlmRequest const& llmRequest, CacheState const& srcConfig) const
+    {
+        (void) llmRequest;
+        (void) srcConfig;
+        return std::nullopt;
+    }
+
     /// @brief Pick receive connections and their corresponding local rank indices.
     /// @return Pair of (pickUpConnections, localRankIndices).
     [[nodiscard]] virtual std::pair<std::vector<size_t>, std::vector<size_t>> pickRecvConnections(size_t numConnections,
@@ -271,7 +280,53 @@ private:
     CacheTransBufferManager* mCacheTransBufferManager;
 };
 
+
+class PagedGinCacheFormatter final : public BaseCacheFormatter
+{
+public:
+    PagedGinCacheFormatter(BaseKVCacheManager* cacheManager, CacheTransBufferManager* cacheTransBufferManager)
+        : mCacheManager{cacheManager}
+        , mCacheTransBufferManager{cacheTransBufferManager}
+        , mSupportFormatter{cacheManager, cacheTransBufferManager}
+    {
+        TLLM_CHECK(mCacheManager);
+        TLLM_CHECK(mCacheTransBufferManager);
+    }
+
+    void format(tensorrt_llm::batch_manager::TransferSession& session) override;
+
+    void unformat(tensorrt_llm::batch_manager::TransferSession& session) override;
+
+    [[nodiscard]] bool inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const override;
+
+    [[nodiscard]] std::vector<SizeType32> getCounterparts(
+        CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig) const override
+    {
+        return executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx).mIRanks;
+    }
+
+    [[nodiscard]] BaseKVCacheManager* getCacheManager() const noexcept override
+    {
+        return mCacheManager;
+    }
+
+    [[nodiscard]] std::optional<executor::kv_cache::PagedTransferMetadata> getPagedTransferMetadata(
+        LlmRequest const& llmRequest, CacheState const& srcConfig) const override;
+
+    [[nodiscard]] std::pair<std::vector<size_t>, std::vector<size_t>> pickRecvConnections(size_t numConnections,
+        CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig,
+        std::vector<SizeType32> const& counterPartRanks) const override;
+
+private:
+    [[nodiscard]] executor::kv_cache::PagedTransferMetadata buildPagedTransferMetadata(BlockRange const& blockRange) const;
+
+    BaseKVCacheManager* mCacheManager;
+    CacheTransBufferManager* mCacheTransBufferManager;
+    CacheFormatter mSupportFormatter;
+};
+
 std::unique_ptr<BaseCacheFormatter> createCacheFormatter(BaseKVCacheManager* cacheManager,
-    std::vector<CacheTransBufferManager*> const& cacheTransBufferManagers, bool isMLA = false);
+    std::vector<CacheTransBufferManager*> const& cacheTransBufferManagers, bool isMLA = false,
+    bool usePagedGin = false);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

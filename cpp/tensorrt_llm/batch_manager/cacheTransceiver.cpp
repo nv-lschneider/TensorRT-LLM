@@ -251,6 +251,13 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
             mCacheTransBufferManagerPtrs, *mCacheState, "mooncake", rnnState);
         TLLM_LOG_INFO("MOONCAKE Connection Manager created");
     }
+    else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MOONCAKE_PAGED_GIN)
+    {
+        TLLM_CHECK_WITH_INFO(!mCacheState->hasRnnConfig(), "MOONCAKE_PAGED_GIN PoC does not support RNN state transfer");
+        mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
+            mCacheTransBufferManagerPtrs, *mCacheState, "mooncake_paged_gin", std::nullopt);
+        TLLM_LOG_INFO("MOONCAKE_PAGED_GIN Connection Manager created");
+    }
     else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MPI)
     {
         mMpiWorldComm = std::addressof(tensorrt_llm::mpi::MpiComm::world());
@@ -262,7 +269,9 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         TLLM_THROW("Unsupported cache transceiver backend type ");
     }
 
-    auto makeFormatter = [cacheManager, isMLA, this]()
+    bool const usePagedGin = backendType.value() == executor::CacheTransceiverConfig::BackendType::MOONCAKE_PAGED_GIN;
+
+    auto makeFormatter = [cacheManager, isMLA, usePagedGin, this]()
     {
         std::vector<kv_cache_manager::CacheTransBufferManager*> kvBufferPtrs;
         kvBufferPtrs.reserve(mCacheTransBufferManagers.size());
@@ -270,7 +279,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         {
             kvBufferPtrs.push_back(mgr.get());
         }
-        return createCacheFormatter(cacheManager, kvBufferPtrs, isMLA);
+        return createCacheFormatter(cacheManager, kvBufferPtrs, isMLA, usePagedGin);
     };
 
     auto makeRnnFormatter = [this]() -> std::unique_ptr<RnnCacheFormatter>

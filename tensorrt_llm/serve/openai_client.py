@@ -14,6 +14,7 @@
 
 # yapf: disable
 import asyncio
+import os
 import traceback
 from abc import ABC, abstractmethod
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, Type
@@ -39,6 +40,11 @@ from tensorrt_llm.serve.responses_utils import (
 from tensorrt_llm.serve.router import Router
 
 # yapf: enable
+
+
+def _mooncake_paged_gin_diag_enabled() -> bool:
+    return os.getenv("TRTLLM_MOONCAKE_PAGED_GIN_DIAG", "").lower() in (
+        "1", "true", "yes", "on")
 
 
 class OpenAIClient(ABC):
@@ -129,9 +135,14 @@ class OpenAIHttpClient(OpenAIClient):
         if server is None:
             server, _ = await self._router.get_next_server(request)
         url = f"http://{server}/{endpoint}"
-        logger.debug(
-            f"Sending {self._role} request {request.disaggregated_params.ctx_request_id} to {url}"
-        )
+        dp = getattr(request, "disaggregated_params", None)
+        if _mooncake_paged_gin_diag_enabled():
+            logger.info(
+                f"MOONCAKE_PAGED_GIN_DIAG client_send role={self._role} url={url} "
+                f"request_type={getattr(dp, 'request_type', None)} "
+                f"ctx_request_id={getattr(dp, 'ctx_request_id', None)} "
+                f"disagg_request_id={getattr(dp, 'disagg_request_id', None)} stream={request.stream}"
+            )
         try:
             self._metrics_collector.total_requests.inc()
             resp_generator = self._post_with_retry(server, url, request, hooks)

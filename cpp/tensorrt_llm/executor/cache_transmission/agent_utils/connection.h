@@ -25,6 +25,8 @@
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 #include <map>
+#include <optional>
+#include <unordered_set>
 
 namespace tensorrt_llm::executor::kv_cache
 {
@@ -44,6 +46,33 @@ struct RequestAndBufferInfo
     std::optional<std::string> mMetadata;
     int mValidConnectionIdx;
     std::vector<uint8_t> mBufferKinds;
+    std::optional<PagedTransferMetadata> mPagedTransferMetadata;
+
+    static void serializePagedTransferMetadata(PagedTransferMetadata const& metadata, std::ostream& os)
+    {
+        namespace su = executor::serialize_utils;
+        su::serialize(metadata.mLayerPtrs, os);
+        su::serialize(metadata.mPageIndices, os);
+        su::serialize(metadata.mPageBytes, os);
+        MemoryDesc::serialize(metadata.mRegisteredMemory, os);
+    }
+
+    static PagedTransferMetadata deserializePagedTransferMetadata(std::istream& is)
+    {
+        namespace su = executor::serialize_utils;
+        auto layerPtrs = su::deserialize<std::vector<uintptr_t>>(is);
+        auto pageIndices = su::deserialize<std::vector<int32_t>>(is);
+        auto pageBytes = su::deserialize<size_t>(is);
+        auto registeredMemory = MemoryDesc::deserialize(is);
+        return PagedTransferMetadata{std::move(layerPtrs), std::move(pageIndices), pageBytes, registeredMemory};
+    }
+
+    static size_t serializedSizePagedTransferMetadata(PagedTransferMetadata const& metadata)
+    {
+        namespace su = executor::serialize_utils;
+        return su::serializedSize(metadata.mLayerPtrs) + su::serializedSize(metadata.mPageIndices)
+            + su::serializedSize(metadata.mPageBytes) + MemoryDesc::serializedSize(metadata.mRegisteredMemory);
+    }
 
     static void serialize(RequestAndBufferInfo const& requestAndBufferInfo, std::ostream& os)
     {
@@ -62,6 +91,11 @@ struct RequestAndBufferInfo
         for (auto kind : requestAndBufferInfo.mBufferKinds)
         {
             su::serialize(kind, os);
+        }
+        su::serialize(requestAndBufferInfo.mPagedTransferMetadata.has_value(), os);
+        if (requestAndBufferInfo.mPagedTransferMetadata.has_value())
+        {
+            serializePagedTransferMetadata(requestAndBufferInfo.mPagedTransferMetadata.value(), os);
         }
     }
 
@@ -87,8 +121,13 @@ struct RequestAndBufferInfo
         {
             bufferKinds.push_back(su::deserialize<uint8_t>(is));
         }
-        return RequestAndBufferInfo{
-            agentName, address, requestInfo, bufferDescs, metadata, validConnectionIdx, bufferKinds};
+        std::optional<PagedTransferMetadata> pagedTransferMetadata = std::nullopt;
+        if (su::deserialize<bool>(is))
+        {
+            pagedTransferMetadata = deserializePagedTransferMetadata(is);
+        }
+        return RequestAndBufferInfo{agentName, address, requestInfo, bufferDescs, metadata, validConnectionIdx,
+            bufferKinds, std::move(pagedTransferMetadata)};
     }
 
     static size_t serializedSize(RequestAndBufferInfo const& requestAndBufferInfo)
@@ -107,6 +146,11 @@ struct RequestAndBufferInfo
         totalSize += su::serializedSize(requestAndBufferInfo.mValidConnectionIdx);
         totalSize += su::serializedSize(requestAndBufferInfo.mBufferKinds.size());
         totalSize += requestAndBufferInfo.mBufferKinds.size() * su::serializedSize(uint8_t{});
+        totalSize += su::serializedSize(requestAndBufferInfo.mPagedTransferMetadata.has_value());
+        if (requestAndBufferInfo.mPagedTransferMetadata.has_value())
+        {
+            totalSize += serializedSizePagedTransferMetadata(requestAndBufferInfo.mPagedTransferMetadata.value());
+        }
         return totalSize;
     }
 };
@@ -260,7 +304,12 @@ public:
     void send(DataContext const& ctx, void const* data, size_t size) const override;
     void recv(DataContext const& ctx, void* data, size_t size) const override;
     void sendRequestAndBufferInfo(batch_manager::RequestInfo& requestInfo,
-        std::vector<std::optional<size_t>> const& cacheBufferIds, int validConnectionIdx);
+        std::vector<std::optional<size_t>> const& cacheBufferIds, int validConnectionIdx,
+        std::optional<PagedTransferMetadata> pagedTransferMetadata = std::nullopt);
+    void sendPagedTransfer(DataContext const& ctx, PagedTransferMetadata const& localMetadata) const;
+    [[nodiscard]] std::optional<PagedTransferMetadata> const& getPagedTransferMetadata() const;
+    void setPagedTransferMetadata(std::optional<PagedTransferMetadata> pagedTransferMetadata);
+    void registerMemoryForPagedTransfer(MemoryDesc const& desc) const;
     void setSenderState(std::vector<MemoryDesc> cacheReceiverBufferDescs, int valideSegmentIdx,
         std::vector<std::pair<size_t, size_t>> offsetRatios, std::vector<uint8_t> bufferKinds);
     void setHasLoadRemoteAgent(bool hasLoadRemoteAgent);
@@ -294,6 +343,7 @@ private:
     std::vector<std::optional<size_t>> mCacheBufferIds;
     std::vector<uint8_t> mBufferKinds;
     mutable SenderState mSenderState;
+    std::optional<PagedTransferMetadata> mPagedTransferMetadata;
     bool mNeedSendMetadata{true};
     bool mHasLoadRemoteAgent{false};
 };
@@ -312,6 +362,8 @@ public:
         batch_manager::RequestInfo& requestInfo, std::atomic<bool> const& terminateFlag);
     [[nodiscard]] std::vector<batch_manager::BaseTransBufferManager*> const& getCacheTransBufferManagers() const;
     [[nodiscard]] std::vector<uint8_t> const& getBufferKinds() const;
+    [[nodiscard]] bool supportsPagedTransfer() const;
+    void registerMemoryForPagedTransfer(MemoryDesc const& desc);
     void updateUnhandledNotifications();
     [[nodiscard]] BaseTransferAgent* getAgent() const;
     AgentConnection* connect(std::string const& remoteAgentName, std::string const& address,
@@ -333,6 +385,7 @@ private:
     std::mutex mConnectionsMutex;
     CommState mCommState;
     CacheState mCacheState;
+    std::string mBackendType;
     std::optional<CacheState::RnnCacheState> mRnnCacheState;
     std::vector<batch_manager::BaseTransBufferManager*> mCacheTransBufferManagers;
     std::vector<uint8_t> mBufferKinds;
@@ -342,6 +395,9 @@ private:
     int mDeviceId;
     std::string mAgentName;
     MemoryDescs mRegMemDescs;
+    std::vector<MemoryDesc> mPagedRegMemDescs;
+    std::unordered_set<uintptr_t> mPagedRegAddrs;
+    std::mutex mPagedRegMutex;
     std::atomic<bool> mIsRunning{true};
 };
 

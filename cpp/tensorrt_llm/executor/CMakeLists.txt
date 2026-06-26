@@ -92,4 +92,5 @@ target_compile_definitions(${EXECUTOR_STATIC_TARGET}
 
 add_subdirectory(cache_transmission/ucx_utils)
 add_subdirectory(cache_transmission/mooncake_utils)
+add_subdirectory(cache_transmission/mooncake_paged_gin_utils)
 add_subdirectory(cache_transmission/nixl_utils)

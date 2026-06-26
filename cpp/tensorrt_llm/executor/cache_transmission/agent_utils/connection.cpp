@@ -25,6 +25,16 @@
 
 namespace tensorrt_llm::executor::kv_cache
 {
+namespace
+{
+
+bool mooncakePagedGinDiagEnabled()
+{
+    return common::getBoolEnv("TRTLLM_MOONCAKE_PAGED_GIN_DIAG");
+}
+
+} // namespace
+
 
 std::string genUniqueAgentName()
 {
@@ -157,9 +167,19 @@ void AgentConnection::recv(DataContext const& ctx, void* data, size_t size) cons
 }
 
 void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& requestInfo,
-    std::vector<std::optional<size_t>> const& cacheBufferIds, int connectionIdx)
+    std::vector<std::optional<size_t>> const& cacheBufferIds, int connectionIdx,
+    std::optional<PagedTransferMetadata> pagedTransferMetadata)
 {
     TLLM_CHECK(!common::getEnvTryZCopyForKVCacheTransfer());
+
+    auto const diagRequestId = requestInfo.getRequestId();
+    if (mooncakePagedGinDiagEnabled())
+    {
+        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+            "MOONCAKE_PAGED_GIN_DIAG agent_send_request_info_enter request_id=%lu remote=%s connection_idx=%d paged=%d",
+            static_cast<unsigned long>(diagRequestId), mRemoteAgentName.c_str(), connectionIdx,
+            pagedTransferMetadata.has_value() ? 1 : 0);
+    }
 
     TLLM_CHECK(!cacheBufferIds.empty());
     TLLM_CHECK(cacheBufferIds.size() <= mCacheTransBufferManagers.size());
@@ -204,12 +224,44 @@ void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& reque
         mNeedSendMetadata = false;
     }
 
-    RequestAndBufferInfo requestAndBufferInfo{
-        mAgentName, address, requestInfo, bufferDescs, metadataOpt, connectionIdx, activeKinds};
+    if (pagedTransferMetadata.has_value())
+    {
+        if (mooncakePagedGinDiagEnabled())
+        {
+            TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+                "MOONCAKE_PAGED_GIN_DIAG agent_register_dest_begin request_id=%lu addr=%p len=%lu",
+                static_cast<unsigned long>(diagRequestId),
+                reinterpret_cast<void*>(pagedTransferMetadata->mRegisteredMemory.getAddr()),
+                pagedTransferMetadata->mRegisteredMemory.getLen());
+        }
+        registerMemoryForPagedTransfer(pagedTransferMetadata->mRegisteredMemory);
+        if (mooncakePagedGinDiagEnabled())
+        {
+            TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+                "MOONCAKE_PAGED_GIN_DIAG agent_register_dest_end request_id=%lu",
+                static_cast<unsigned long>(diagRequestId));
+        }
+    }
+
+    RequestAndBufferInfo requestAndBufferInfo{mAgentName, address, requestInfo, bufferDescs, metadataOpt, connectionIdx,
+        activeKinds, std::move(pagedTransferMetadata)};
     std::stringstream ss;
     NotificationInfo notificationInfo{requestAndBufferInfo};
     NotificationInfo::serialize(notificationInfo, ss);
-    mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
+    auto payload = ss.str();
+    if (mooncakePagedGinDiagEnabled())
+    {
+        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+            "MOONCAKE_PAGED_GIN_DIAG agent_notify_request_info_begin request_id=%lu remote=%s bytes=%lu",
+            static_cast<unsigned long>(diagRequestId), mRemoteAgentName.c_str(), payload.size());
+    }
+    mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, payload);
+    if (mooncakePagedGinDiagEnabled())
+    {
+        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+            "MOONCAKE_PAGED_GIN_DIAG agent_notify_request_info_end request_id=%lu remote=%s",
+            static_cast<unsigned long>(diagRequestId), mRemoteAgentName.c_str());
+    }
 }
 
 void AgentConnection::setSenderState(std::vector<MemoryDesc> cacheReceiverBufferDescs, int validSegmentIdx,
@@ -223,6 +275,72 @@ void AgentConnection::setSenderState(std::vector<MemoryDesc> cacheReceiverBuffer
     mSenderState.mOffsetRatios = std::move(offsetRatios);
     mSenderState.setActiveBufferIdx(0);
     mBufferKinds = std::move(bufferKinds);
+}
+
+void AgentConnection::sendPagedTransfer(DataContext const& ctx, PagedTransferMetadata const& localMetadata) const
+{
+    TLLM_CHECK_WITH_INFO(mPagedTransferMetadata.has_value(),
+        "MOONCAKE_PAGED_GIN sender did not receive destination paged KV metadata");
+    auto const& remoteMetadata = mPagedTransferMetadata.value();
+    TLLM_CHECK_WITH_INFO(localMetadata.mPageBytes == remoteMetadata.mPageBytes,
+        "MOONCAKE_PAGED_GIN source/destination page size mismatch: %lu vs %lu", localMetadata.mPageBytes,
+        remoteMetadata.mPageBytes);
+    TLLM_CHECK_WITH_INFO(localMetadata.mPageIndices.size() == remoteMetadata.mPageIndices.size(),
+        "MOONCAKE_PAGED_GIN source/destination page table size mismatch: %lu vs %lu",
+        localMetadata.mPageIndices.size(), remoteMetadata.mPageIndices.size());
+    TLLM_CHECK_WITH_INFO(localMetadata.mLayerPtrs.size() == remoteMetadata.mLayerPtrs.size(),
+        "MOONCAKE_PAGED_GIN source/destination layer pointer count mismatch: %lu vs %lu",
+        localMetadata.mLayerPtrs.size(), remoteMetadata.mLayerPtrs.size());
+
+    if (mooncakePagedGinDiagEnabled())
+    {
+        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+            "MOONCAKE_PAGED_GIN_DIAG agent_register_source_begin tag=%lu addr=%p len=%lu",
+            static_cast<unsigned long>(ctx.getTag()), reinterpret_cast<void*>(localMetadata.mRegisteredMemory.getAddr()),
+            localMetadata.mRegisteredMemory.getLen());
+    }
+    registerMemoryForPagedTransfer(localMetadata.mRegisteredMemory);
+    if (mooncakePagedGinDiagEnabled())
+    {
+        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+            "MOONCAKE_PAGED_GIN_DIAG agent_register_source_end tag=%lu", static_cast<unsigned long>(ctx.getTag()));
+    }
+    PagedTransferRequest request{localMetadata.mLayerPtrs, remoteMetadata.mLayerPtrs, localMetadata.mPageIndices,
+        remoteMetadata.mPageIndices, localMetadata.mPageBytes, mRemoteAgentName};
+    if (mooncakePagedGinDiagEnabled())
+    {
+        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+            "MOONCAKE_PAGED_GIN_DIAG agent_submit_paged_begin tag=%lu remote=%s pages=%lu",
+            static_cast<unsigned long>(ctx.getTag()), mRemoteAgentName.c_str(), localMetadata.mPageIndices.size());
+    }
+    mAgentConnectionManager->getAgent()->submitPagedTransferRequest(request);
+    if (mooncakePagedGinDiagEnabled())
+    {
+        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+            "MOONCAKE_PAGED_GIN_DIAG agent_submit_paged_end tag=%lu remote=%s", static_cast<unsigned long>(ctx.getTag()),
+            mRemoteAgentName.c_str());
+    }
+
+    NotificationSyncInfo syncInfo{mRemoteAgentName, ctx};
+    NotificationInfo notificationInfo{syncInfo};
+    std::stringstream ss;
+    NotificationInfo::serialize(notificationInfo, ss);
+    mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
+}
+
+std::optional<PagedTransferMetadata> const& AgentConnection::getPagedTransferMetadata() const
+{
+    return mPagedTransferMetadata;
+}
+
+void AgentConnection::setPagedTransferMetadata(std::optional<PagedTransferMetadata> pagedTransferMetadata)
+{
+    mPagedTransferMetadata = std::move(pagedTransferMetadata);
+}
+
+void AgentConnection::registerMemoryForPagedTransfer(MemoryDesc const& desc) const
+{
+    mAgentConnectionManager->registerMemoryForPagedTransfer(desc);
 }
 
 void AgentConnection::setHasLoadRemoteAgent(bool hasLoadRemoteAgent)
@@ -279,6 +397,7 @@ AgentConnectionManager::AgentConnectionManager(
     std::vector<batch_manager::BaseTransBufferManager*> cacheTransBufferManagers, CacheState cacheState,
     std::string const& backendType, std::optional<CacheState::RnnCacheState> rnnCacheState)
     : mCacheState(std::move(cacheState))
+    , mBackendType(backendType)
     , mRnnCacheState(std::move(rnnCacheState))
     , mCacheTransBufferManagers(std::move(cacheTransBufferManagers))
     , mRegMemDescs(MemoryType::kVRAM, {})
@@ -391,6 +510,14 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                     auto metadataOpt = requestAndBufferInfo.mMetadata;
                     auto connectionIdx = requestAndBufferInfo.mValidConnectionIdx;
                     auto remoteAgentName = requestAndBufferInfo.mAgentName;
+                    auto pagedTransferMetadata = std::move(requestAndBufferInfo.mPagedTransferMetadata);
+                    if (mooncakePagedGinDiagEnabled())
+                    {
+                        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+                            "MOONCAKE_PAGED_GIN_DIAG manager_recv_request_info request_id=%lu remote=%s paged=%d buffers=%lu address=%s",
+                            static_cast<unsigned long>(requestInfo.getRequestId()), remoteAgentName.c_str(),
+                            pagedTransferMetadata.has_value() ? 1 : 0, bufferDescs.size(), address.c_str());
+                    }
                     TLLM_LOG_DEBUG(" recv Address:%s", address.c_str());
                     auto connection = connect(remoteAgentName, address, metadataOpt, true);
                     auto bufferKinds = std::move(requestAndBufferInfo.mBufferKinds);
@@ -440,6 +567,7 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                     }
                     connection->setSenderState(
                         std::move(bufferDescs), connectionIdx, std::move(offsetRatios), std::move(bufferKinds));
+                    connection->setPagedTransferMetadata(std::move(pagedTransferMetadata));
                     notifIt = notifs.erase(notifIt);
                     if (notifs.empty())
                     {
@@ -506,6 +634,27 @@ std::vector<batch_manager::BaseTransBufferManager*> const& AgentConnectionManage
 std::vector<uint8_t> const& AgentConnectionManager::getBufferKinds() const
 {
     return mBufferKinds;
+}
+
+bool AgentConnectionManager::supportsPagedTransfer() const
+{
+    return mBackendType == "mooncake_paged_gin";
+}
+
+void AgentConnectionManager::registerMemoryForPagedTransfer(MemoryDesc const& desc)
+{
+    TLLM_CHECK_WITH_INFO(supportsPagedTransfer(),
+        "registerMemoryForPagedTransfer is only supported by MOONCAKE_PAGED_GIN");
+    TLLM_CHECK_WITH_INFO(desc.getAddr() != 0 && desc.getLen() != 0,
+        "MOONCAKE_PAGED_GIN cannot register an empty KV memory descriptor");
+    std::lock_guard<std::mutex> lock(mPagedRegMutex);
+    if (!mPagedRegAddrs.insert(desc.getAddr()).second)
+    {
+        return;
+    }
+    MemoryDescs descs{MemoryType::kVRAM, {desc}};
+    m_Agent->registerMemory(descs);
+    mPagedRegMemDescs.push_back(desc);
 }
 
 AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentName, std::string const& connectionInfo,
@@ -691,6 +840,10 @@ std::string const& AgentConnectionManager::getAgentName() const
 AgentConnectionManager::~AgentConnectionManager()
 {
     mIsRunning = false;
+    if (!mPagedRegMemDescs.empty())
+    {
+        m_Agent->deregisterMemory(MemoryDescs{MemoryType::kVRAM, mPagedRegMemDescs});
+    }
     m_Agent->deregisterMemory(mRegMemDescs);
 }
 

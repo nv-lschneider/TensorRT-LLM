@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/runtime/cudaMemPool.h"
@@ -29,6 +30,9 @@
 
 #include <NvInferRuntime.h>
 #include <cuda_runtime_api.h>
+#if ENABLE_MULTI_DEVICE
+#include <nccl.h>
+#endif
 
 #include <algorithm>
 #include <cstdlib>
@@ -136,6 +140,45 @@ private:
     CudaStreamPtr mCudaStream;
     CudaPoolPtr mMemPool;
 };
+
+#if ENABLE_MULTI_DEVICE && NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+// Allocates NCCL-window-compatible memory only. Collective ncclCommWindowRegister
+// must happen later in the transfer path, when TENT has the producer/consumer NCCL session.
+class NcclMemAllocator : public BaseAllocator<NcclMemAllocator, MemoryType::kGPU>
+{
+    friend class BaseAllocator<NcclMemAllocator, MemoryType::kGPU>;
+
+public:
+    NcclMemAllocator() noexcept = default;
+
+protected:
+    void allocateImpl(PointerType* ptr, std::size_t n) // NOLINT(readability-convert-member-functions-to-static)
+    {
+        int runtimeVersion = 0;
+        auto const versionResult = ncclGetVersion(&runtimeVersion);
+        TLLM_CHECK_WITH_INFO(versionResult == ncclSuccess,
+            "ncclGetVersion failed while allocating NCCL-window-compatible memory: %s",
+            ncclGetErrorString(versionResult));
+        TLLM_CHECK_WITH_INFO(runtimeVersion >= NCCL_VERSION(2, 28, 0),
+            "NCCL-window-compatible KV allocation requires NCCL runtime >= 2.28, got version code %d", runtimeVersion);
+
+        auto const result = ncclMemAlloc(ptr, n);
+        TLLM_CHECK_WITH_INFO(
+            result == ncclSuccess, "ncclMemAlloc(%zu) failed: %s", n, ncclGetErrorString(result));
+        TLLM_LOG_DEBUG("Allocated NCCL-window-compatible device memory ptr=%p bytes=%zu", *ptr, n);
+    }
+
+    void deallocateImpl(
+        PointerType ptr, [[maybe_unused]] std::size_t n) // NOLINT(readability-convert-member-functions-to-static)
+    {
+        auto const result = ncclMemFree(ptr);
+        if (TLLM_UNLIKELY(result != ncclSuccess))
+        {
+            TLLM_LOG_WARNING("ncclMemFree(%p) failed for %zu bytes: %s", ptr, n, ncclGetErrorString(result));
+        }
+    }
+};
+#endif
 
 class UVMAllocator : public BaseAllocator<UVMAllocator, MemoryType::kUVM>
 {
@@ -860,6 +903,9 @@ private:
 
 using DeviceBuffer = GenericBuffer<CudaAllocatorAsync>;
 using StaticDeviceBuffer = GenericBuffer<CudaAllocator>;
+#if ENABLE_MULTI_DEVICE && NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+using StaticNcclMemDeviceBuffer = GenericBuffer<NcclMemAllocator>;
+#endif
 using HostBuffer = GenericBuffer<HostAllocator>;
 using PinnedBuffer = GenericBuffer<PinnedAllocator>;
 using PinnedPoolBuffer = GenericBuffer<PinnedPoolAllocator>;
@@ -1096,6 +1142,9 @@ private:
 
 using DeviceTensor = GenericTensor<CudaAllocatorAsync>;
 using StaticDeviceTensor = GenericTensor<CudaAllocator>;
+#if ENABLE_MULTI_DEVICE && NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+using StaticNcclMemDeviceTensor = GenericTensor<NcclMemAllocator>;
+#endif
 using HostTensor = GenericTensor<HostAllocator>;
 using PinnedTensor = GenericTensor<PinnedAllocator>;
 using PinnedPoolTensor = GenericTensor<PinnedPoolAllocator>;
