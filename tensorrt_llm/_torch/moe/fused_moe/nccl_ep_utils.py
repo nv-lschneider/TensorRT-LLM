@@ -140,6 +140,9 @@ class NcclEpContext:
         # routing ids and avoids the per-iter widening conversion.
         self.topk_idx_dtype = torch.int32 if _nccl_ep_supports_int32_topk_idx() else torch.int64
         self._v0_2_features_enabled = self.topk_idx_dtype == torch.int32
+        # v0.2+ resets all inactive rank-major recv_topk_idx rows in the
+        # dispatch kernel. Keep the host-side fallback for v0.1 wheels.
+        self._kernel_resets_recv_topk_idx = self._v0_2_features_enabled
 
         # NCCL-EP v0.2+ may expose a configurable receive expert-id kind.
         # Within that version-gated path, detect whether the linked binding supports a

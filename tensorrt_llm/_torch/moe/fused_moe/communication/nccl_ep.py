@@ -227,14 +227,10 @@ class NcclEP(Communication):
         input_tokens_nd = Tensor(hidden_states_c)
         input_topk_weights_nd = Tensor(weights_f32_c)
 
-        # Mark padding rows with the -1 sentinel so fused_moe skips them.
-        # The dispatch kernel only writes recv_topk_idx for slots that
-        # received tokens; rows beyond `recv_rank_counter[r]` keep stale
-        # data from prior dispatches. recv_rank_counter is written fresh
-        # by the dispatch kernel (low_latency.cu:877) so it does not need
-        # pre-zeroing, and recv_topk_weights on -1 rows is don't-care
-        # (fused_moe ignores the weight when the expert id is -1).
-        ctx.recv_topk_idx_buf.fill_(-1)
+        # NCCL-EP v0.2+ resets inactive rank-major recv_topk_idx rows in
+        # the dispatch kernel. Older wheels retain this host-side fallback.
+        if not ctx._kernel_resets_recv_topk_idx:
+            ctx.recv_topk_idx_buf.fill_(-1)
 
         outputs = DispatchOutputs(
             tokens=ctx.output_tokens_nd,

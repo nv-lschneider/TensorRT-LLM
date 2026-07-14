@@ -2585,6 +2585,36 @@ class TestMoEComm:
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(
         "mpi_pool_executor,group",
+        [
+            pytest.param(
+                2,
+                CommTestGroup(
+                    configs=[
+                        CommTestConfig(
+                            comm_type=COMM_NCCL_EP,
+                            ep_size=2,
+                            num_experts=FIXED_NUM_EXPERTS,
+                            top_k=2,
+                            hidden_size=DEFAULT_HIDDEN_SIZE,
+                            all_num_tokens=[16, 16],
+                        )
+                    ]
+                ),
+                id="NcclEP_capability_e2e",
+            ),
+        ],
+        indirect=["mpi_pool_executor"],
+    )
+    def test_nccl_ep_capability_e2e(self, mpi_pool_executor, group: CommTestGroup):
+        """Exercise the public NCCL-EP capability path end-to-end."""
+        from nccl.ep import ExpertIdKind, LayoutInfo
+        layout_info = LayoutInfo(recv_topk_idx_kind=ExpertIdKind.GLOBAL)
+        assert int(layout_info._lowpp.recv_topk_idx_kind) == int(ExpertIdKind.GLOBAL)
+        _run_full_test_group(mpi_pool_executor, group)
+
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize(
+        "mpi_pool_executor,group",
         _make_boundary_test_params(),
         indirect=["mpi_pool_executor"],
     )
