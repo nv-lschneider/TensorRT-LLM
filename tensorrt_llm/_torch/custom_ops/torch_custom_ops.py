@@ -509,6 +509,22 @@ class FP8RowwiseGemmRunner(TunableRunner):
             self.group,
         )
 
+    def forward_out(
+        self,
+        inputs: List[torch.Tensor],
+        output: torch.Tensor,
+        tactic: int = -1,
+    ) -> None:
+        mat1, mat2, mat1_scale, mat2_scale = inputs
+        self.fp8_rowwise_gemm_runner.run_gemm_out(
+            mat1,
+            mat2,
+            mat1_scale,
+            mat2_scale,
+            output,
+            tactic,
+        )
+
 
 @torch.library.custom_op("trtllm::fp8_rowwise_gemm", mutates_args=())
 def fp8_rowwise_gemm(
@@ -539,6 +555,24 @@ def fp8_rowwise_gemm(
         inputs=[act, weight, act_scale, weight_scale], tactic=best_tactic)
 
 
+@torch.library.custom_op("trtllm::fp8_rowwise_gemm_out",
+                         mutates_args=("output", ))
+def fp8_rowwise_gemm_out(
+    act: torch.Tensor,
+    weight: torch.Tensor,
+    act_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    """Run tuned FP8-rowwise GEMM into caller-owned output storage."""
+    runner = FP8RowwiseGemmRunner(int(BufferKind.DEFAULT), output.dtype)
+    inputs = [act, weight, act_scale, weight_scale]
+    _, best_tactic = AutoTuner.get().choose_one(
+        "trtllm::fp8_rowwise_gemm::gemm", [runner],
+        FP8RowwiseGemmRunner.tuning_config, inputs)
+    runner.forward_out(inputs, output, tactic=best_tactic)
+
+
 @fp8_rowwise_gemm.register_fake
 def _(
     act: torch.Tensor,
@@ -550,6 +584,17 @@ def _(
     group: Optional[List[int]] = None,
 ) -> torch.Tensor:
     return act.new_empty((act.size(0), weight.size(0)), dtype=output_dtype)
+
+
+@fp8_rowwise_gemm_out.register_fake
+def _(
+    act: torch.Tensor,
+    weight: torch.Tensor,
+    act_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    return None
 
 
 class FP4GemmRunner(TunableRunner):

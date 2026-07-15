@@ -85,6 +85,10 @@ class AttentionBlock(Attention):
             reduce_output=reduce_output,
             use_custom_cublas_mm=use_custom_cublas_mm,
         )
+        # TransformerBlock owns the TP allreduce so it can fuse the following
+        # RMSNorm. Retain the o_proj output wrapper across this short boundary
+        # and let that parent collective consume it immediately.
+        self.o_proj.enable_nccl_window_output_handoff = True
 
         if self.attn_backend != "TRTLLM":
             raise ValueError(

@@ -557,7 +557,8 @@ class PyTorchModelEngine(ModelEngine):
         if self.llm_args.lora_config is None:
             for module in self.model.modules():
                 if (isinstance(module, Linear)
-                        and module._can_use_nccl_window_output()
+                        and (module._can_use_nccl_window_output()
+                             or module._can_use_nccl_window_output_handoff())
                         and module.mapping.tp_group
                         == self.mapping.tp_group):
                     self.nccl_window_tensor_pool.register(

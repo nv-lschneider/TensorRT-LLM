@@ -51,9 +51,9 @@ void check_input_dtypes(torch::Tensor const& mat, torch::Tensor const& matScale)
 } // namespace
 
 template <typename OutputType>
-torch::Tensor fp8_rowwise_gemm_launch(torch::Tensor const& mat1, torch::Tensor const& mat2,
-    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, int64_t output_buffer_kind = 0,
-    tkc::CutlassGemmConfig const* maybe_config = nullptr, c10::optional<torch::List<int64_t>> group = c10::nullopt)
+void fp8_rowwise_gemm_launch_out(torch::Tensor const& mat1, torch::Tensor const& mat2,
+    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, torch::Tensor const& out,
+    tkc::CutlassGemmConfig const* maybe_config = nullptr)
 {
     check_input_dtypes(mat1, mat1Scale);
     check_input_dtypes(mat2, mat2Scale);
@@ -73,8 +73,11 @@ torch::Tensor fp8_rowwise_gemm_launch(torch::Tensor const& mat1, torch::Tensor c
     auto const k = mat1.sizes()[1];
     static constexpr auto outType
         = std::is_same<OutputType, half>::value ? at::ScalarType::Half : at::ScalarType::BFloat16;
-    auto [out, _] = torch_ext::allocate_output(
-        {m, n}, outType, mat1.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group);
+    TORCH_CHECK(out.scalar_type() == outType, "output dtype does not match FP8 rowwise GEMM output dtype");
+    TORCH_CHECK(out.device() == mat1.device(), "output must be on the same device as mat1");
+    TORCH_CHECK(out.is_contiguous(), "output must be contiguous");
+    TORCH_CHECK(out.dim() == 2 && out.sizes()[0] == m && out.sizes()[1] == n,
+        "output must have shape [", m, ", ", n, "]");
 
     static_assert(std::is_same<OutputType, half>::value || std::is_same<OutputType, __nv_bfloat16>::value,
         "Output type must be half or bfloat16");
@@ -97,6 +100,20 @@ torch::Tensor fp8_rowwise_gemm_launch(torch::Tensor const& mat1, torch::Tensor c
     mGemmRunner->gemm(outPtr, mat1Ptr, mat2Ptr, nullptr, quantMode, m, n, k, mat1ScalePtr, mat2ScalePtr, gemmConfig,
         workspacePtr, wsSize, stream);
 
+}
+
+template <typename OutputType>
+torch::Tensor fp8_rowwise_gemm_launch(torch::Tensor const& mat1, torch::Tensor const& mat2,
+    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, int64_t output_buffer_kind = 0,
+    tkc::CutlassGemmConfig const* maybe_config = nullptr, c10::optional<torch::List<int64_t>> group = c10::nullopt)
+{
+    auto const m = mat1.sizes()[0];
+    auto const n = mat2.sizes()[0];
+    static constexpr auto outType
+        = std::is_same<OutputType, half>::value ? at::ScalarType::Half : at::ScalarType::BFloat16;
+    auto [out, _] = torch_ext::allocate_output(
+        {m, n}, outType, mat1.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group);
+    fp8_rowwise_gemm_launch_out<OutputType>(mat1, mat2, mat1Scale, mat2Scale, out, maybe_config);
     return out;
 }
 
@@ -165,6 +182,29 @@ public:
             mat1, mat2, mat1Scale, mat2Scale, mOutputDtype, output_buffer_kind, config, group);
     }
 
+    void runGemmOut(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
+        at::Tensor const& mat2Scale, at::Tensor const& output, int64_t configIdx) const
+    {
+        tkc::CutlassGemmConfig const* config = nullptr;
+        if (configIdx != -1)
+        {
+            TORCH_CHECK(configIdx >= 0 && configIdx < getNumConfigs());
+            config = &mConfigs.at(configIdx);
+        }
+        switch (mOutputDtype)
+        {
+        case at::ScalarType::Half:
+            fp8_rowwise_gemm_launch_out<half>(mat1, mat2, mat1Scale, mat2Scale, output, config);
+            return;
+#ifdef ENABLE_BF16
+        case at::ScalarType::BFloat16:
+            fp8_rowwise_gemm_launch_out<__nv_bfloat16>(mat1, mat2, mat1Scale, mat2Scale, output, config);
+            return;
+#endif
+        default: TORCH_CHECK(false, "Unsupported output dtype for FP8 rowwise GEMM");
+        }
+    }
+
     at::ScalarType getOutputDtype() const
     {
         return mOutputDtype;
@@ -189,5 +229,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.class_<tensorrt_llm::torch_ext::FP8RowwiseGemmRunner>("FP8RowwiseGemmRunner")
         .def(torch::init<at::ScalarType>())
         .def("run_gemm", &tensorrt_llm::torch_ext::FP8RowwiseGemmRunner::runGemm)
+        .def("run_gemm_out", &tensorrt_llm::torch_ext::FP8RowwiseGemmRunner::runGemmOut)
         .def("get_num_configs", &tensorrt_llm::torch_ext::FP8RowwiseGemmRunner::getNumConfigs);
 }
