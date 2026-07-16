@@ -122,6 +122,27 @@ void waitForStartupPath(std::filesystem::path const& path, std::chrono::steady_c
     }
 }
 
+std::vector<char> serializeStartupPeerState(DataTransceiverState const& state, MemoryDesc const& pool)
+{
+    namespace su = executor::serialize_utils;
+    auto const statePayload = Serialization::serialize(state);
+    std::ostringstream output;
+    su::serialize(statePayload, output);
+    MemoryDesc::serialize(pool, output);
+    auto const serialized = output.str();
+    return std::vector<char>(serialized.begin(), serialized.end());
+}
+
+std::pair<DataTransceiverState, MemoryDesc> deserializeStartupPeerState(std::vector<char>& payload)
+{
+    namespace su = executor::serialize_utils;
+    su::VectorWrapBuf<char> buffer(payload);
+    std::istream input(&buffer);
+    auto statePayload = su::deserialize<std::vector<char>>(input);
+    auto pool = MemoryDesc::deserialize(input);
+    return {Serialization::deserializeDataTransceiverState(statePayload), pool};
+}
+
 } // namespace
 
 
@@ -359,6 +380,13 @@ void AgentConnection::preconnect() const
     mAgentConnectionManager->getAgent()->preconnectRemoteAgent(mRemoteAgentName);
 }
 
+void AgentConnection::preconnect(MemoryDesc const& remotePool) const
+{
+    TLLM_CHECK(mAgentConnectionManager->supportsPagedTransfer());
+    mAgentConnectionManager->getAgent()->preconnectPagedRemoteAgent(
+        mRemoteAgentName, mAgentConnectionManager->getPagedPoolMemory(), remotePool);
+}
+
 void AgentConnection::setSenderState(std::vector<MemoryDesc> cacheReceiverBufferDescs, int validSegmentIdx,
     std::vector<std::pair<size_t, size_t>> offsetRatios, std::vector<uint8_t> bufferKinds)
 {
@@ -496,12 +524,14 @@ std::optional<size_t> AgentConnection::getPreAssignedBufferId(uint8_t kind) cons
 
 AgentConnectionManager::AgentConnectionManager(
     std::vector<batch_manager::BaseTransBufferManager*> cacheTransBufferManagers, CacheState cacheState,
-    std::string const& backendType, std::optional<CacheState::RnnCacheState> rnnCacheState)
+    std::string const& backendType, std::optional<CacheState::RnnCacheState> rnnCacheState,
+    std::optional<MemoryDesc> pagedPoolMemory)
     : mCacheState(std::move(cacheState))
     , mBackendType(backendType)
     , mRnnCacheState(std::move(rnnCacheState))
     , mCacheTransBufferManagers(std::move(cacheTransBufferManagers))
     , mRegMemDescs(MemoryType::kVRAM, {})
+    , mPagedPoolMemory(std::move(pagedPoolMemory))
 {
     TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
     TLLM_CHECK(mDeviceId != -1);
@@ -532,6 +562,12 @@ AgentConnectionManager::AgentConnectionManager(
     }
     mRegMemDescs = MemoryDescs{MemoryType::kVRAM, memDescs};
     m_Agent->registerMemory(mRegMemDescs);
+    if (supportsPagedTransfer())
+    {
+        TLLM_CHECK_WITH_INFO(mPagedPoolMemory.has_value(),
+            "MOONCAKE_PAGED_GIN requires primary KV-pool memory during connection-manager startup");
+        registerMemoryForPagedTransfer(mPagedPoolMemory.value());
+    }
 
     AgentState localAgentState{mAgentName, m_Agent->getLocalConnectionInfo()};
     std::vector<AgentState> agentStates(mpi::MpiComm::session().getSize());
@@ -623,7 +659,8 @@ void AgentConnectionManager::runStartupPreconnect()
         if (sessionRank == 0)
         {
             auto localState = DataTransceiverState{mCacheState, mCommState};
-            auto payload = Serialization::serialize(localState);
+            TLLM_CHECK(mPagedPoolMemory.has_value());
+            auto payload = serializeStartupPeerState(localState, mPagedPoolMemory.value());
             auto const statePath = contextStatePath(instanceId);
             writeStartupFile(statePath, payload);
             TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
@@ -709,7 +746,7 @@ void AgentConnectionManager::runStartupPreconnect()
         session.barrier();
         for (auto& peerPayload : peerStatePayloads)
         {
-            auto peerState = Serialization::deserializeDataTransceiverState(peerPayload);
+            auto [peerState, peerPool] = deserializeStartupPeerState(peerPayload);
             TLLM_CHECK(peerState.getCacheState().has_value());
             TLLM_CHECK(peerState.getCommState().has_value());
             auto const counterparts
@@ -723,7 +760,7 @@ void AgentConnectionManager::runStartupPreconnect()
                 auto const* connection = connections.at(counterpart);
                 auto const* agentConnection = dynamic_cast<AgentConnection const*>(connection);
                 TLLM_CHECK(agentConnection != nullptr);
-                agentConnection->preconnect();
+                agentConnection->preconnect(peerPool);
             }
         }
         session.barrier();
@@ -907,6 +944,12 @@ std::vector<uint8_t> const& AgentConnectionManager::getBufferKinds() const
 bool AgentConnectionManager::supportsPagedTransfer() const
 {
     return mBackendType == "mooncake_paged_gin";
+}
+
+MemoryDesc const& AgentConnectionManager::getPagedPoolMemory() const
+{
+    TLLM_CHECK_WITH_INFO(mPagedPoolMemory.has_value(), "Paged KV-pool memory is unavailable");
+    return mPagedPoolMemory.value();
 }
 
 void AgentConnectionManager::registerMemoryForPagedTransfer(MemoryDesc const& desc)

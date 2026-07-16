@@ -442,6 +442,42 @@ void MooncakePagedGinTransferAgent::preconnectRemoteAgent(std::string const& nam
         mLocalAgentName.c_str(), name.c_str(), static_cast<unsigned long>(segmentId));
 }
 
+void MooncakePagedGinTransferAgent::preconnectPagedRemoteAgent(
+    std::string const& name, MemoryDesc const& localPool, MemoryDesc const& remotePool)
+{
+    mooncake::tent::SegmentID segmentId{};
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto const it = mConnectedAgents.find(name);
+        TLLM_CHECK_WITH_INFO(it != mConnectedAgents.end(), "Remote agent %s not found", name.c_str());
+        if (it->second.pagedWindowPreconnected)
+        {
+            return;
+        }
+        segmentId = it->second.segmentId;
+    }
+
+    TLLM_LOG_INFO(
+        "MOONCAKE_PAGED_GIN eager pool-window preconnect begin: local=%s remote=%s segment=%lu local_pool=%p local_len=%lu remote_pool=%p remote_len=%lu",
+        mLocalAgentName.c_str(), name.c_str(), static_cast<unsigned long>(segmentId),
+        reinterpret_cast<void*>(localPool.getAddr()), localPool.getLen(), reinterpret_cast<void*>(remotePool.getAddr()),
+        remotePool.getLen());
+    auto const status = mEngine->preconnectPagedSegment(segmentId, reinterpret_cast<void*>(localPool.getAddr()),
+        localPool.getLen(), remotePool.getAddr(), remotePool.getLen());
+    checkStatus(status, "MOONCAKE_PAGED_GIN preconnectPagedSegment");
+
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto const it = mConnectedAgents.find(name);
+        TLLM_CHECK_WITH_INFO(it != mConnectedAgents.end() && it->second.segmentId == segmentId,
+            "Remote agent %s changed during pool-window preconnect", name.c_str());
+        it->second.preconnected = true;
+        it->second.pagedWindowPreconnected = true;
+    }
+    TLLM_LOG_INFO("MOONCAKE_PAGED_GIN eager pool-window preconnect ready: local=%s remote=%s segment=%lu",
+        mLocalAgentName.c_str(), name.c_str(), static_cast<unsigned long>(segmentId));
+}
+
 void MooncakePagedGinTransferAgent::invalidateRemoteAgent(std::string const& name)
 {
     std::lock_guard<std::mutex> lock(mMutex);

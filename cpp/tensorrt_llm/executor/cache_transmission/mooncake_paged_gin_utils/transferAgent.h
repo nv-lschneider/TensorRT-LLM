@@ -89,6 +89,8 @@ public:
     void loadRemoteAgent(std::string const& name, AgentDesc const& agentDesc) override;
     void loadRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo) override;
     void preconnectRemoteAgent(std::string const& name) override;
+    void preconnectPagedRemoteAgent(
+        std::string const& name, MemoryDesc const& localPool, MemoryDesc const& remotePool) override;
     void invalidateRemoteAgent(std::string const& name) override;
 
     AgentDesc getLocalAgentDesc() override;
@@ -107,6 +109,7 @@ private:
     {
         mooncake::tent::SegmentID segmentId;
         bool preconnected{false};
+        bool pagedWindowPreconnected{false};
     };
 
     [[nodiscard]] mooncake::tent::SegmentID getRemoteSegmentId(std::string const& name) const;

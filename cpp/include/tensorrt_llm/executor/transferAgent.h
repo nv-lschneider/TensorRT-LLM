@@ -393,6 +393,15 @@ public:
         (void) name;
     }
 
+    /// @brief Eagerly establish a persistent paged-transfer window.
+    virtual void preconnectPagedRemoteAgent(
+        std::string const& name, MemoryDesc const& localPool, MemoryDesc const& remotePool)
+    {
+        (void) localPool;
+        (void) remotePool;
+        preconnectRemoteAgent(name);
+    }
+
     /// @brief Invalidate a connection with a remote agent.
     /// @param name Specify the name of the remote agent.
     virtual void invalidateRemoteAgent(std::string const& name) = 0;

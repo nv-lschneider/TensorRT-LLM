@@ -311,6 +311,7 @@ public:
         std::vector<std::optional<size_t>> const& cacheBufferIds, int validConnectionIdx,
         std::optional<PagedTransferMetadata> pagedTransferMetadata = std::nullopt);
     void preconnect() const;
+    void preconnect(MemoryDesc const& remotePool) const;
     void sendPagedTransfer(DataContext const& ctx, PagedTransferMetadata const& localMetadata) const;
     [[nodiscard]] std::optional<PagedTransferMetadata> const& getPagedTransferMetadata() const;
     void setPagedTransferMetadata(std::optional<PagedTransferMetadata> pagedTransferMetadata);
@@ -358,7 +359,8 @@ class AgentConnectionManager : public ConnectionManager
 public:
     AgentConnectionManager(std::vector<batch_manager::BaseTransBufferManager*> cacheTransBufferManagers,
         CacheState cacheState, std::string const& backendType,
-        std::optional<CacheState::RnnCacheState> rnnCacheState = std::nullopt);
+        std::optional<CacheState::RnnCacheState> rnnCacheState = std::nullopt,
+        std::optional<MemoryDesc> pagedPoolMemory = std::nullopt);
     ~AgentConnectionManager();
     AgentConnection* recvConnect(DataContext const& ctx, void* data, size_t size) override;
     [[nodiscard]] std::vector<Connection const*> getConnections(CommState const& state) override;
@@ -368,6 +370,7 @@ public:
     [[nodiscard]] std::vector<batch_manager::BaseTransBufferManager*> const& getCacheTransBufferManagers() const;
     [[nodiscard]] std::vector<uint8_t> const& getBufferKinds() const;
     [[nodiscard]] bool supportsPagedTransfer() const;
+    [[nodiscard]] MemoryDesc const& getPagedPoolMemory() const;
     void registerMemoryForPagedTransfer(MemoryDesc const& desc);
     void updateUnhandledNotifications();
     [[nodiscard]] BaseTransferAgent* getAgent() const;
@@ -403,6 +406,7 @@ private:
     std::string mAgentName;
     MemoryDescs mRegMemDescs;
     std::vector<MemoryDesc> mPagedRegMemDescs;
+    std::optional<MemoryDesc> mPagedPoolMemory;
     std::unordered_set<uintptr_t> mPagedRegAddrs;
     std::mutex mPagedRegMutex;
     std::atomic<bool> mIsRunning{true};

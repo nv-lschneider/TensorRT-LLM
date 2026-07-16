@@ -216,6 +216,23 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         mCacheTransBufferManagerPtrs.push_back(mRnnCacheTransBufferManager.get());
     }
 
+    bool const usePagedGin = backendType.value() == executor::CacheTransceiverConfig::BackendType::MOONCAKE_PAGED_GIN;
+    std::optional<executor::kv_cache::MemoryDesc> pagedPoolMemory;
+    if (usePagedGin)
+    {
+        auto const& blockManager = cacheManager->getBlockManager();
+        auto const numPools
+            = blockManager.getNumPools(/*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
+        TLLM_CHECK_WITH_INFO(numPools == 1,
+            "MOONCAKE_PAGED_GIN startup requires exactly one regular KV pool, got %d", numPools);
+        auto primaryPool = blockManager.getPrimaryPool(/*poolIdx=*/0);
+        TLLM_CHECK(primaryPool != nullptr);
+        auto const poolBytes = primaryPool->getSizeInBytes();
+        TLLM_CHECK_WITH_INFO(poolBytes > 0, "MOONCAKE_PAGED_GIN startup found an empty primary KV pool");
+        auto const deviceId = static_cast<uint32_t>(blockManager.getStreamDevice());
+        pagedPoolMemory.emplace(primaryPool->data(), poolBytes, deviceId);
+    }
+
     if (backendType.value() == executor::CacheTransceiverConfig::BackendType::UCX)
     {
         std::lock_guard<std::mutex> lock(mDllMutex);
@@ -255,7 +272,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     {
         TLLM_CHECK_WITH_INFO(!mCacheState->hasRnnConfig(), "MOONCAKE_PAGED_GIN PoC does not support RNN state transfer");
         mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
-            mCacheTransBufferManagerPtrs, *mCacheState, "mooncake_paged_gin", std::nullopt);
+            mCacheTransBufferManagerPtrs, *mCacheState, "mooncake_paged_gin", std::nullopt, pagedPoolMemory);
         TLLM_LOG_INFO("MOONCAKE_PAGED_GIN Connection Manager created");
     }
     else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MPI)
@@ -268,8 +285,6 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     {
         TLLM_THROW("Unsupported cache transceiver backend type ");
     }
-
-    bool const usePagedGin = backendType.value() == executor::CacheTransceiverConfig::BackendType::MOONCAKE_PAGED_GIN;
 
     auto makeFormatter = [cacheManager, isMLA, usePagedGin, this]()
     {
