@@ -8,7 +8,7 @@ trap 'echo "Error occurred at line $LINENO"; exit 1' ERR
 # Add parameter validation
 if [ "$#" -lt 10 ]; then
     echo "Error: Missing required arguments, got $# arguments, args: $@"
-    echo "Usage: $0 model_name dataset_file multi_round num_gen_servers concurrency_list streaming log_path hostname port ucx_warmup_requests"
+    echo "Usage: $0 model_name dataset_file multi_round num_gen_servers concurrency_list streaming log_path hostname port ucx_warmup_requests [exact_warmup_rounds]"
     exit 1
 fi
 
@@ -22,6 +22,16 @@ log_path=$7
 hostname=$8
 port=$9
 ucx_warmup_requests=${10}
+exact_warmup_rounds=${11:-0}
+
+if ! [[ "${multi_round}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "multi_round must be a positive integer, got ${multi_round}" >&2
+    exit 1
+fi
+if ! [[ "${exact_warmup_rounds}" =~ ^[0-9]+$ ]]; then
+    echo "exact_warmup_rounds must be a non-negative integer, got ${exact_warmup_rounds}" >&2
+    exit 1
+fi
 
 # check process id is not 0
 if [[ ${SLURM_PROCID} != "0" ]]; then
@@ -109,12 +119,62 @@ do_process_all_logs(){
     fi
 }
 
+run_benchmark_phase(){
+    local phase_dataset=$1
+    local prompt_count=$2
+    local concurrency=$3
+    local result_dir=$4
+
+    python -m tensorrt_llm.serve.scripts.benchmark_serving \
+        --model ${model_name} \
+        --backend openai \
+        --host ${hostname} \
+        --port ${port} \
+        --dataset-name "trtllm_custom" \
+        --dataset-path ${phase_dataset} \
+        --num-prompts ${prompt_count} \
+        --max-concurrency ${concurrency} \
+        --trust-remote-code \
+        --ignore-eos \
+        --no-test-input \
+        --save-result \
+        --result-dir "${result_dir}" \
+        --result-filename "result.json" \
+        --percentile-metrics "ttft,tpot,itl,e2el" \
+        $(if [ "${streaming}" = "false" ]; then echo "--non-streaming"; fi)
+}
+
+validate_benchmark_result(){
+    local result_file=$1
+    local expected=$2
+    local phase=$3
+
+    python3 - "${result_file}" "${expected}" "${phase}" <<'PY'
+import json
+import sys
+
+result_path, expected, phase = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+with open(result_path) as result_file:
+    result = json.load(result_file)
+
+completed = result.get("completed", 0)
+failed = result.get("num_prompts", expected) - completed
+if completed != expected or failed:
+    print(
+        f"{phase} failure: completed={completed}/{expected}, failed={failed}; "
+        "terminating the allocation.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+}
+
 tmp_start_logs=/tmp/${SLURM_JOB_ID}/start_logs
 mkdir -p ${tmp_start_logs}
 cp ${log_path}/3_output_CTX_*.log ${tmp_start_logs}/ 2>/dev/null || true
 cp ${log_path}/3_output_GEN_*.log ${tmp_start_logs}/ 2>/dev/null || true
 
-# warmup requests for ucx connections
+# Legacy UCX-only warmup. Final comparisons use the exact-shape warmup below.
 if [ "${ucx_warmup_requests}" -gt 0 ]; then
     echo "warming up ucx connections with small requests... ${ucx_warmup_requests}"
     python -m tensorrt_llm.serve.scripts.benchmark_serving \
@@ -136,46 +196,41 @@ echo "Starting benchmark..."
 for concurrency in ${concurrency_list}; do
     concurrency=$((concurrency * num_gen_servers))
     num_prompts=$((concurrency * multi_round))
+    measurement_dataset=${dataset_file}
+
+    if [ "${exact_warmup_rounds}" -gt 0 ]; then
+        warmup_prompts=$((concurrency * exact_warmup_rounds))
+        required_dataset_rows=$((warmup_prompts + num_prompts))
+        available_dataset_rows=$(wc -l < "${dataset_file}")
+        if [ "${available_dataset_rows}" -lt "${required_dataset_rows}" ]; then
+            echo "Dataset has ${available_dataset_rows} rows but warmup plus measurement requires ${required_dataset_rows}" >&2
+            exit 1
+        fi
+
+        dataset_dir="${log_path}/request_datasets"
+        warmup_dataset="${dataset_dir}/warmup_concurrency_${concurrency}.jsonl"
+        measurement_dataset="${dataset_dir}/measurement_concurrency_${concurrency}.jsonl"
+        mkdir -p "${dataset_dir}"
+        sed -n "1,${warmup_prompts}p" "${dataset_file}" > "${warmup_dataset}"
+        sed -n "$((warmup_prompts + 1)),${required_dataset_rows}p" "${dataset_file}" > "${measurement_dataset}"
+
+        warmup_dir="${log_path}/warmup_concurrency_${concurrency}"
+        mkdir -p "${warmup_dir}"
+        do_process_all_logs "${log_path}/" "${warmup_dir}" "line"
+        echo "Warming up exact request shape with concurrency ${concurrency} ... ${warmup_prompts} prompts"
+        run_benchmark_phase "${warmup_dataset}" "${warmup_prompts}" "${concurrency}" "${warmup_dir}"
+        validate_benchmark_result "${warmup_dir}/result.json" "${warmup_prompts}" "Exact-shape warmup"
+        do_process_all_logs "${log_path}/" "${warmup_dir}" "log"
+        echo "Exact-shape warmup with concurrency ${concurrency} done"
+    fi
+
     echo "Benchmarking with concurrency ${concurrency} ... ${num_prompts} prompts"
     mkdir -p ${log_path}/concurrency_${concurrency}
     do_process_all_logs ${log_path}/ ${log_path}/concurrency_${concurrency} "line"
-    python -m tensorrt_llm.serve.scripts.benchmark_serving \
-        --model ${model_name} \
-        --backend openai \
-        --host ${hostname} \
-        --port ${port} \
-        --dataset-name "trtllm_custom" \
-        --dataset-path ${dataset_file} \
-        --num-prompts ${num_prompts} \
-        --max-concurrency ${concurrency} \
-        --trust-remote-code \
-        --ignore-eos \
-        --no-test-input \
-        --save-result \
-        --result-dir "${log_path}/concurrency_${concurrency}" \
-        --result-filename "result.json" \
-        --percentile-metrics "ttft,tpot,itl,e2el" \
-        $(if [ "${streaming}" = "false" ]; then echo "--non-streaming"; fi)
+    run_benchmark_phase "${measurement_dataset}" "${num_prompts}" "${concurrency}" "${log_path}/concurrency_${concurrency}"
 
     result_file="${log_path}/concurrency_${concurrency}/result.json"
-    python3 - "${result_file}" "${num_prompts}" <<'PY'
-import json
-import sys
-
-result_path, expected = sys.argv[1], int(sys.argv[2])
-with open(result_path) as result_file:
-    result = json.load(result_file)
-
-completed = result.get("completed", 0)
-failed = result.get("num_prompts", expected) - completed
-if completed != expected or failed:
-    print(
-        f"Benchmark failure: completed={completed}/{expected}, "
-        f"failed={failed}; terminating the allocation.",
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
-PY
+    validate_benchmark_result "${result_file}" "${num_prompts}" "Benchmark"
     echo "Benchmark with concurrency ${concurrency} done"
     do_process_all_logs ${log_path}/ ${log_path}/concurrency_${concurrency} "log"
 done

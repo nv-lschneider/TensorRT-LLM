@@ -430,6 +430,9 @@ def submit_job(config, log_dir, dry_run):
         gen_world_size if benchmark_config['mode'] == "e2e" else 0
     ucx_warmup_requests = benchmark_config.get(
         'ucx_warmup_requests', default_ucx_warmup_requests)
+    exact_warmup_rounds = benchmark_config.get('exact_warmup_rounds', 0)
+    if not isinstance(exact_warmup_rounds, int) or exact_warmup_rounds < 0:
+        raise ValueError('benchmark.exact_warmup_rounds must be a non-negative integer')
 
     total_nodes = ctx_nodes + gen_nodes
     total_tasks = total_nodes * gpus_per_node
@@ -672,7 +675,7 @@ def submit_job(config, log_dir, dry_run):
         else:
             benchmark_cmd = [
                 f"bash {os.path.join(script_dir, 'run_benchmark.sh')}",
-                f"'{env_config['model_path']}' '{benchmark_config['dataset_file']}' {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port} {ucx_warmup_requests}",
+                f"'{env_config['model_path']}' '{benchmark_config['dataset_file']}' {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port} {ucx_warmup_requests} {exact_warmup_rounds}",
                 f"&> {log_dir}/6_bench.log"
             ]
             client_cmds.append(" ".join(benchmark_prefix + benchmark_cmd))
