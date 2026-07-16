@@ -50,6 +50,28 @@ bool mooncakePagedGinDiagEnabled()
     return common::getBoolEnv("TRTLLM_MOONCAKE_PAGED_GIN_DIAG");
 }
 
+uint64_t pagedGinLayoutFingerprint(bool isMLA, nvinfer1::DataType dataType,
+    kv_cache_manager::KVCacheBlockPool const& pool, size_t pageBytes)
+{
+    uint64_t fingerprint = 1469598103934665603ULL;
+    auto mix = [&fingerprint](uint64_t value)
+    {
+        fingerprint ^= value;
+        fingerprint *= 1099511628211ULL;
+    };
+    mix(1); // Layout fingerprint version.
+    mix(isMLA ? 1 : 0);
+    mix(static_cast<uint64_t>(dataType));
+    mix(static_cast<uint64_t>(pool.numLayers));
+    mix(static_cast<uint64_t>(pool.kvFactor));
+    mix(static_cast<uint64_t>(pool.numKvHeads));
+    mix(static_cast<uint64_t>(pool.sizePerHead));
+    mix(static_cast<uint64_t>(pool.tokensPerBlock));
+    mix(static_cast<uint64_t>(pool.blockSize));
+    mix(static_cast<uint64_t>(pageBytes));
+    return fingerprint;
+}
+
 } // namespace
 
 /// Used for KV and RNN cache format()
@@ -1008,9 +1030,10 @@ executor::kv_cache::PagedTransferMetadata PagedGinCacheFormatter::buildPagedTran
         * static_cast<size_t>(pool.blockSize) * elemBytes;
     TLLM_CHECK_WITH_INFO(pageBytes > 0, "MOONCAKE_PAGED_GIN computed empty page size");
     auto const poolBytes = primaryPool->getSizeInBytes();
-    TLLM_CHECK_WITH_INFO(poolBytes >= static_cast<size_t>(numPrimaryBlocks) * pageBytes,
-        "MOONCAKE_PAGED_GIN primary pool is smaller than expected: pool=%lu blocks=%d pageBytes=%lu", poolBytes,
-        numPrimaryBlocks, pageBytes);
+    auto const expectedPoolBytes = static_cast<size_t>(numPrimaryBlocks) * pageBytes;
+    TLLM_CHECK_WITH_INFO(poolBytes == expectedPoolBytes,
+        "MOONCAKE_PAGED_GIN primary pool geometry mismatch: pool=%lu expected=%lu blocks=%d pageBytes=%lu", poolBytes,
+        expectedPoolBytes, numPrimaryBlocks, pageBytes);
 
     std::vector<int32_t> pageIndices;
     pageIndices.reserve(blockIds.size());
@@ -1024,7 +1047,19 @@ executor::kv_cache::PagedTransferMetadata PagedGinCacheFormatter::buildPagedTran
 
     auto const deviceId = static_cast<uint32_t>(blockManager.getStreamDevice());
     auto const poolAddr = reinterpret_cast<uintptr_t>(primaryPool->data());
-    return executor::kv_cache::PagedTransferMetadata{{poolAddr}, std::move(pageIndices), pageBytes,
+    auto const layoutFingerprint = pagedGinLayoutFingerprint(mIsMLA, primaryPool->getDataType(), pool, pageBytes);
+    if (mooncakePagedGinDiagEnabled())
+    {
+        auto const shape = primaryPool->getShape();
+        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+            "MOONCAKE_PAGED_GIN_DIAG layout mla=%d shape={%d,%d,%d,%d} layers=%d kv_factor=%d heads=%d "
+            "size_per_head=%d tokens_per_block=%d block_size=%d elem_bytes=%lu page_bytes=%lu pool_bytes=%lu "
+            "pages=%lu layout=%llu",
+            mIsMLA ? 1 : 0, shape.d[0], shape.d[1], shape.d[2], shape.d[3], pool.numLayers, pool.kvFactor,
+            pool.numKvHeads, pool.sizePerHead, pool.tokensPerBlock, pool.blockSize, elemBytes, pageBytes, poolBytes,
+            pageIndices.size(), static_cast<unsigned long long>(layoutFingerprint));
+    }
+    return executor::kv_cache::PagedTransferMetadata{{poolAddr}, std::move(pageIndices), pageBytes, layoutFingerprint,
         executor::kv_cache::MemoryDesc{poolAddr, poolBytes, deviceId}};
 }
 
@@ -1046,18 +1081,31 @@ void PagedGinCacheFormatter::format(tensorrt_llm::batch_manager::TransferSession
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
 
     auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
-    if (!cache_formatter_utils::needSendCache(selfConfig, destConfig, selfIdx, targetInfo))
+    auto const needSend = mIsMLA ? MLACacheFormatter::needSendCache(selfConfig, destConfig, selfIdx)
+                                 : cache_formatter_utils::needSendCache(selfConfig, destConfig, selfIdx, targetInfo);
+    if (!needSend)
     {
         return;
     }
 
-    TLLM_CHECK_WITH_INFO(targetInfo.mIRanks.size() == 1,
-        "MOONCAKE_PAGED_GIN PoC currently supports one KV target rank per source rank, got %lu",
-        targetInfo.mIRanks.size());
-    auto pickUpConnections = cache_formatter_utils::pickSendConnections(
-        session.getConnections().size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks(), targetInfo);
-    TLLM_CHECK_WITH_INFO(pickUpConnections.size() == 1,
-        "MOONCAKE_PAGED_GIN PoC currently supports one picked send connection, got %lu", pickUpConnections.size());
+    std::vector<size_t> pickUpConnections;
+    if (mIsMLA)
+    {
+        MLACacheFormatter mlaFormatter(mCacheManager, {mCacheTransBufferManager});
+        pickUpConnections = mlaFormatter.pickSendConnections(
+            session.getConnections().size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(targetInfo.mIRanks.size() == 1,
+            "MOONCAKE_PAGED_GIN PoC currently supports one KV target rank per source rank, got %lu",
+            targetInfo.mIRanks.size());
+        pickUpConnections = cache_formatter_utils::pickSendConnections(
+            session.getConnections().size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks(), targetInfo);
+        TLLM_CHECK_WITH_INFO(pickUpConnections.size() == 1,
+            "MOONCAKE_PAGED_GIN PoC currently supports one picked send connection, got %lu", pickUpConnections.size());
+    }
+    TLLM_CHECK_WITH_INFO(!pickUpConnections.empty(), "MOONCAKE_PAGED_GIN found no send connection");
 
     auto const lastBlockKey = session.getLastBlockKey();
     auto const indexFromEnd = session.getIndexFromEnd();
@@ -1066,16 +1114,26 @@ void PagedGinCacheFormatter::format(tensorrt_llm::batch_manager::TransferSession
     auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest, lastBlockKey, indexFromEnd, recvSideHasCP, ppSize);
     auto localMetadata = buildPagedTransferMetadata(blockRange);
 
-    auto const* conn = session.getConnections().at(pickUpConnections.front());
-    auto const* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(conn);
-    TLLM_CHECK_WITH_INFO(agentConnection != nullptr,
-        "MOONCAKE_PAGED_GIN requires AgentConnection with a paged-capable Mooncake backend");
-
     session.setTime(TransferSession::kTimePreprocess);
-    auto startTime = LlmRequest::getSteadyClockNow();
-    agentConnection->sendPagedTransfer(session.getDataContext(), localMetadata);
-    auto endTime = LlmRequest::getSteadyClockNow();
-    session.appendMeasure(startTime, endTime, localMetadata.mPageBytes * localMetadata.mPageIndices.size());
+    for (auto connectionIdx : pickUpConnections)
+    {
+        auto const* conn = session.getConnections().at(connectionIdx);
+        auto const* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(conn);
+        TLLM_CHECK_WITH_INFO(agentConnection != nullptr,
+            "MOONCAKE_PAGED_GIN requires AgentConnection with a paged-capable Mooncake backend");
+        if (mooncakePagedGinDiagEnabled())
+        {
+            TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+                "MOONCAKE_PAGED_GIN_DIAG sender_submit request=%ld connection=%lu destinations=%lu pages=%lu "
+                "page_bytes=%lu layout=%llu",
+                llmRequest.mRequestId, connectionIdx, pickUpConnections.size(), localMetadata.mPageIndices.size(),
+                localMetadata.mPageBytes, static_cast<unsigned long long>(localMetadata.mLayoutFingerprint));
+        }
+        auto startTime = LlmRequest::getSteadyClockNow();
+        agentConnection->sendPagedTransfer(session.getDataContext(), localMetadata);
+        auto endTime = LlmRequest::getSteadyClockNow();
+        session.appendMeasure(startTime, endTime, localMetadata.mPageBytes * localMetadata.mPageIndices.size());
+    }
     session.setTime(TransferSession::kTimeTransmissions);
 }
 
@@ -1117,9 +1175,55 @@ void PagedGinCacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSessi
 
 bool PagedGinCacheFormatter::inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const
 {
-    if (!mSupportFormatter.inquireSupport(selfConfig, destConfig))
+    auto unsupported = [](char const* reason)
+    {
+        TLLM_LOG_WARNING("PagedGinCacheFormatter::inquireSupport: %s", reason);
+        return false;
+    };
+
+    if (!mIsMLA && !mSupportFormatter.inquireSupport(selfConfig, destConfig))
     {
         return false;
+    }
+    if (mIsMLA)
+    {
+        if (selfConfig.getAttentionConfig().mAttentionType != CacheState::AttentionType::kMLA
+            || destConfig.getAttentionConfig().mAttentionType != CacheState::AttentionType::kMLA)
+        {
+            return unsupported("MLA formatter requires MLA on both peers");
+        }
+        if (selfConfig.getDataType() != destConfig.getDataType())
+        {
+            return unsupported("MLA direct pages require matching data types");
+        }
+        if (!(selfConfig.getModelConfig() == destConfig.getModelConfig()))
+        {
+            return unsupported("MLA direct pages require matching model cache geometry");
+        }
+        if (!(selfConfig.getAttentionConfig() == destConfig.getAttentionConfig()))
+        {
+            return unsupported("MLA direct pages require matching attention cache geometry");
+        }
+        auto const& selfParallel = selfConfig.getParallelConfig();
+        auto const& destParallel = destConfig.getParallelConfig();
+        if (selfParallel.mTensorParallelism != destParallel.mTensorParallelism
+            || selfParallel.mPipelineParallelism != 1 || destParallel.mPipelineParallelism != 1
+            || selfParallel.mContextParallelism != 1 || destParallel.mContextParallelism != 1
+            || selfParallel.mAttentionLayerNumPerPP != destParallel.mAttentionLayerNumPerPP)
+        {
+            return unsupported("MLA direct pages currently require equal TP with PP1 and CP1");
+        }
+        if (selfParallel.mEnableAttentionDP && destParallel.mEnableAttentionDP)
+        {
+            return unsupported("MLA direct pages do not support attention-DP on both peers");
+        }
+        for (auto const* parallel : {&selfParallel, &destParallel})
+        {
+            if (parallel->mEnableAttentionDP && parallel->mDPsize != parallel->mTensorParallelism)
+            {
+                return unsupported("MLA direct attention-DP requires DP size equal to TP size");
+            }
+        }
     }
     auto const& blockManager = mCacheManager->getBlockManager();
     if (blockManager.isVariableWindow())
@@ -1137,6 +1241,47 @@ bool PagedGinCacheFormatter::inquireSupport(CacheState const& selfConfig, CacheS
         TLLM_LOG_WARNING("PagedGinCacheFormatter::inquireSupport: indexer K cache is not supported yet");
         return false;
     }
+    auto const regularPools
+        = blockManager.getNumPools(/*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
+    if (blockManager.getNumPools(/*includeBlockScalePools=*/true, /*includeIndexerKCachePools=*/false) != regularPools)
+    {
+        return unsupported("block-scale pools are not supported yet");
+    }
+    if (blockManager.getNumSecondaryBlocks() != 0)
+    {
+        return unsupported("secondary/offloaded KV blocks are not supported yet");
+    }
+    auto primaryPool = blockManager.getPrimaryPool(/*poolIdx=*/0);
+    if (primaryPool == nullptr)
+    {
+        return unsupported("primary KV pool is not allocated");
+    }
+    auto const& pool = blockManager.getPool(/*poolIdx=*/0);
+    auto const shape = primaryPool->getShape();
+    if (pool.layerFirstLayout || shape.nbDims != 4 || shape.d[0] != blockManager.getNumPrimaryBlocks()
+        || shape.d[1] != pool.numLayers || shape.d[2] != pool.kvFactor || shape.d[3] != pool.blockSize)
+    {
+        return unsupported("primary KV pool is not the expected block-major layout");
+    }
+    if (mIsMLA)
+    {
+        auto const& model = selfConfig.getModelConfig();
+        if (pool.numLayers != static_cast<SizeType32>(model.mNbKvHeadsPerLayer.size())
+            || pool.kvFactor != selfConfig.getAttentionConfig().mKvFactor
+            || pool.tokensPerBlock != model.mTokensPerBlock || pool.sizePerHead != model.mSizePerHead)
+        {
+            return unsupported("local MLA pool metadata does not match the advertised cache state");
+        }
+    }
+    if (mooncakePagedGinDiagEnabled())
+    {
+        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+            "MOONCAKE_PAGED_GIN_DIAG support mla=%d tp=%d pp=%d cp=%d attention_dp=%d pools=%d shape={%d,%d,%d,%d}",
+            mIsMLA ? 1 : 0, selfConfig.getParallelConfig().mTensorParallelism,
+            selfConfig.getParallelConfig().mPipelineParallelism, selfConfig.getParallelConfig().mContextParallelism,
+            selfConfig.getParallelConfig().mEnableAttentionDP ? 1 : 0, regularPools, shape.d[0], shape.d[1], shape.d[2],
+            shape.d[3]);
+    }
     return true;
 }
 
@@ -1144,6 +1289,11 @@ std::pair<std::vector<size_t>, std::vector<size_t>> PagedGinCacheFormatter::pick
     CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig,
     std::vector<SizeType32> const& counterPartRanks) const
 {
+    if (mIsMLA)
+    {
+        MLACacheFormatter mlaFormatter(mCacheManager, {mCacheTransBufferManager});
+        return mlaFormatter.pickRecvConnections(numConnections, selfConfig, selfIdx, destConfig, counterPartRanks);
+    }
     return cache_formatter_utils::pickRecvConnections(numConnections, selfConfig, selfIdx, destConfig, counterPartRanks);
 }
 
@@ -1217,8 +1367,7 @@ std::unique_ptr<BaseCacheFormatter> createCacheFormatter(BaseKVCacheManager* cac
     TLLM_CHECK(!cacheTransBufferManagers.empty());
     if (usePagedGin)
     {
-        TLLM_CHECK_WITH_INFO(!isMLA, "MOONCAKE_PAGED_GIN PoC does not support MLA KV cache");
-        return std::make_unique<PagedGinCacheFormatter>(cacheManager, cacheTransBufferManagers[0]);
+        return std::make_unique<PagedGinCacheFormatter>(cacheManager, cacheTransBufferManagers[0], isMLA);
     }
     if (isMLA)
     {

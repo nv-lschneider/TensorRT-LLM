@@ -284,10 +284,12 @@ private:
 class PagedGinCacheFormatter final : public BaseCacheFormatter
 {
 public:
-    PagedGinCacheFormatter(BaseKVCacheManager* cacheManager, CacheTransBufferManager* cacheTransBufferManager)
+    PagedGinCacheFormatter(
+        BaseKVCacheManager* cacheManager, CacheTransBufferManager* cacheTransBufferManager, bool isMLA = false)
         : mCacheManager{cacheManager}
         , mCacheTransBufferManager{cacheTransBufferManager}
         , mSupportFormatter{cacheManager, cacheTransBufferManager}
+        , mIsMLA{isMLA}
     {
         TLLM_CHECK(mCacheManager);
         TLLM_CHECK(mCacheTransBufferManager);
@@ -323,6 +325,7 @@ private:
     BaseKVCacheManager* mCacheManager;
     CacheTransBufferManager* mCacheTransBufferManager;
     CacheFormatter mSupportFormatter;
+    bool mIsMLA;
 };
 
 std::unique_ptr<BaseCacheFormatter> createCacheFormatter(BaseKVCacheManager* cacheManager,

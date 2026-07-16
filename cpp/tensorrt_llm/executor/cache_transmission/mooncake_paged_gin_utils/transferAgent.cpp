@@ -409,7 +409,37 @@ void MooncakePagedGinTransferAgent::loadRemoteAgent(std::string const& name, Con
     checkStatus(status, "MOONCAKE_PAGED_GIN openSegment");
 
     std::lock_guard<std::mutex> lock(mMutex);
-    mConnectedAgents[name].segmentId = segmentId;
+    mConnectedAgents[name] = AgentInfo{segmentId, false};
+}
+
+void MooncakePagedGinTransferAgent::preconnectRemoteAgent(std::string const& name)
+{
+    mooncake::tent::SegmentID segmentId{};
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto const it = mConnectedAgents.find(name);
+        TLLM_CHECK_WITH_INFO(it != mConnectedAgents.end(), "Remote agent %s not found", name.c_str());
+        if (it->second.preconnected)
+        {
+            return;
+        }
+        segmentId = it->second.segmentId;
+    }
+
+    TLLM_LOG_INFO("MOONCAKE_PAGED_GIN eager preconnect begin: local=%s remote=%s segment=%lu",
+        mLocalAgentName.c_str(), name.c_str(), static_cast<unsigned long>(segmentId));
+    auto const status = mEngine->preconnectSegment(segmentId);
+    checkStatus(status, "MOONCAKE_PAGED_GIN preconnectSegment");
+
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto const it = mConnectedAgents.find(name);
+        TLLM_CHECK_WITH_INFO(it != mConnectedAgents.end() && it->second.segmentId == segmentId,
+            "Remote agent %s changed during preconnect", name.c_str());
+        it->second.preconnected = true;
+    }
+    TLLM_LOG_INFO("MOONCAKE_PAGED_GIN eager preconnect ready: local=%s remote=%s segment=%lu",
+        mLocalAgentName.c_str(), name.c_str(), static_cast<unsigned long>(segmentId));
 }
 
 void MooncakePagedGinTransferAgent::invalidateRemoteAgent(std::string const& name)

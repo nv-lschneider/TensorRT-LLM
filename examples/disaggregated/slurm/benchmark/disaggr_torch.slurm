@@ -1,6 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
+# Partial-GPU allocations on this B200 cluster inherit a CPU affinity mask
+# that cannot satisfy nested srun steps. Full-node TP8 runs are unaffected.
+export SLURM_CPU_BIND=none
+
 # Parse named arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -170,10 +174,25 @@ echo "Server is ready!"
 
 # Start client commands
 echo "Starting client commands from ${client_cmds_file}..."
+client_command_timeout_s="${TRTLLM_DISAGG_CLIENT_COMMAND_TIMEOUT:-0}"
+if ! [[ "${client_command_timeout_s}" =~ ^[0-9]+$ ]]; then
+    cleanup_on_failure "TRTLLM_DISAGG_CLIENT_COMMAND_TIMEOUT must be a positive integer or 0"
+fi
+if [ "${client_command_timeout_s}" -gt 0 ]; then
+    echo "Client command watchdog enabled: ${client_command_timeout_s}s after server readiness"
+fi
 while read -r cmd <&3; do
     echo "Starting client command: ${cmd}"
-    eval "${cmd}"
-    if [ $? -ne 0 ]; then
+    if [ "${client_command_timeout_s}" -gt 0 ]; then
+        timeout_status=0
+        timeout --signal=TERM --kill-after=30s "${client_command_timeout_s}" bash -c "${cmd}" || timeout_status=$?
+        if [ "${timeout_status}" -eq 124 ]; then
+            cleanup_on_failure "Client command exceeded ${client_command_timeout_s}s after server readiness: ${cmd}"
+        fi
+        if [ "${timeout_status}" -ne 0 ]; then
+            cleanup_on_failure "Command failed with status ${timeout_status}: ${cmd}"
+        fi
+    elif ! eval "${cmd}"; then
         cleanup_on_failure "Command failed: ${cmd}."
     fi
 done 3< "${client_cmds_file}"

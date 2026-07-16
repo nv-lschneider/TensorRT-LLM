@@ -156,6 +156,26 @@ for concurrency in ${concurrency_list}; do
         --result-filename "result.json" \
         --percentile-metrics "ttft,tpot,itl,e2el" \
         $(if [ "${streaming}" = "false" ]; then echo "--non-streaming"; fi)
+
+    result_file="${log_path}/concurrency_${concurrency}/result.json"
+    python3 - "${result_file}" "${num_prompts}" <<'PY'
+import json
+import sys
+
+result_path, expected = sys.argv[1], int(sys.argv[2])
+with open(result_path) as result_file:
+    result = json.load(result_file)
+
+completed = result.get("completed", 0)
+failed = result.get("num_prompts", expected) - completed
+if completed != expected or failed:
+    print(
+        f"Benchmark failure: completed={completed}/{expected}, "
+        f"failed={failed}; terminating the allocation.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
     echo "Benchmark with concurrency ${concurrency} done"
     do_process_all_logs ${log_path}/ ${log_path}/concurrency_${concurrency} "log"
 done

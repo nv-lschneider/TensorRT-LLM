@@ -133,6 +133,7 @@ else:
         'tensorrt_llm_transfer_agent_binding*.so',
         'tensorrt_llm_transfer_agent_binding.pyi',
         'libs/libtensorrt_llm_mooncake_wrapper.so',
+        'libs/libtensorrt_llm_mooncake_paged_gin_wrapper.so',
         'libs/ucx/**/*',
         'libs/libpg_utils.so',
         'libs/libdecoder_attention_1.so',

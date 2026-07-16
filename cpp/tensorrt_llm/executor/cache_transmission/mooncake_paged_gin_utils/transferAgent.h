@@ -88,6 +88,7 @@ public:
 
     void loadRemoteAgent(std::string const& name, AgentDesc const& agentDesc) override;
     void loadRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo) override;
+    void preconnectRemoteAgent(std::string const& name) override;
     void invalidateRemoteAgent(std::string const& name) override;
 
     AgentDesc getLocalAgentDesc() override;
@@ -105,6 +106,7 @@ private:
     struct AgentInfo
     {
         mooncake::tent::SegmentID segmentId;
+        bool preconnected{false};
     };
 
     [[nodiscard]] mooncake::tent::SegmentID getRemoteSegmentId(std::string const& name) const;

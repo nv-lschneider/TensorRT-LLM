@@ -18,8 +18,16 @@
 #include "connection.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
+#include "tensorrt_llm/executor/serialization.h"
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <utility>
 
@@ -31,6 +39,87 @@ namespace
 bool mooncakePagedGinDiagEnabled()
 {
     return common::getBoolEnv("TRTLLM_MOONCAKE_PAGED_GIN_DIAG");
+}
+
+std::string requireStartupEnv(char const* name)
+{
+    auto const* value = std::getenv(name);
+    TLLM_CHECK_WITH_INFO(value != nullptr && value[0] != '\0', "Missing required startup preconnect environment %s", name);
+    return value;
+}
+
+int getStartupEnvInt(char const* name, int defaultValue)
+{
+    auto const* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0')
+    {
+        return defaultValue;
+    }
+    try
+    {
+        auto const parsed = std::stoi(value);
+        TLLM_CHECK_WITH_INFO(parsed > 0, "Startup preconnect environment %s must be positive", name);
+        return parsed;
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_THROW("Invalid startup preconnect environment %s=%s: %s", name, value, e.what());
+    }
+}
+
+void writeStartupFile(std::filesystem::path const& path, std::vector<char> const& payload)
+{
+    std::filesystem::create_directories(path.parent_path());
+    auto temporary = path;
+    temporary += "." + std::to_string(static_cast<unsigned long>(::getpid())) + ".tmp";
+    {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        TLLM_CHECK_WITH_INFO(output.is_open(), "Unable to open startup preconnect file %s", temporary.c_str());
+        output.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+        TLLM_CHECK_WITH_INFO(output.good(), "Unable to write startup preconnect file %s", temporary.c_str());
+    }
+    std::error_code error;
+    std::filesystem::rename(temporary, path, error);
+    TLLM_CHECK_WITH_INFO(!error, "Unable to publish startup preconnect file %s: %s", path.c_str(),
+        error.message().c_str());
+}
+
+void writeStartupMarkerNoThrow(std::filesystem::path const& path, std::string const& message) noexcept
+{
+    try
+    {
+        writeStartupFile(path, std::vector<char>(message.begin(), message.end()));
+    }
+    catch (...)
+    {
+    }
+}
+
+std::vector<char> readStartupFile(std::filesystem::path const& path)
+{
+    std::ifstream input(path, std::ios::binary);
+    TLLM_CHECK_WITH_INFO(input.is_open(), "Unable to open startup preconnect file %s", path.c_str());
+    auto payload
+        = std::vector<char>(std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{});
+    TLLM_CHECK_WITH_INFO(input.good() || input.eof(), "Unable to read startup preconnect file %s", path.c_str());
+    return payload;
+}
+
+bool startupPathExists(std::filesystem::path const& path)
+{
+    std::error_code error;
+    auto const exists = std::filesystem::is_regular_file(path, error);
+    return !error && exists;
+}
+
+void waitForStartupPath(std::filesystem::path const& path, std::chrono::steady_clock::time_point deadline)
+{
+    while (!startupPathExists(path))
+    {
+        TLLM_CHECK_WITH_INFO(std::chrono::steady_clock::now() < deadline,
+            "Timed out waiting for startup preconnect file %s", path.c_str());
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
 }
 
 } // namespace
@@ -264,6 +353,12 @@ void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& reque
     }
 }
 
+void AgentConnection::preconnect() const
+{
+    TLLM_CHECK(mAgentConnectionManager->supportsPagedTransfer());
+    mAgentConnectionManager->getAgent()->preconnectRemoteAgent(mRemoteAgentName);
+}
+
 void AgentConnection::setSenderState(std::vector<MemoryDesc> cacheReceiverBufferDescs, int validSegmentIdx,
     std::vector<std::pair<size_t, size_t>> offsetRatios, std::vector<uint8_t> bufferKinds)
 {
@@ -291,6 +386,11 @@ void AgentConnection::sendPagedTransfer(DataContext const& ctx, PagedTransferMet
     TLLM_CHECK_WITH_INFO(localMetadata.mLayerPtrs.size() == remoteMetadata.mLayerPtrs.size(),
         "MOONCAKE_PAGED_GIN source/destination layer pointer count mismatch: %lu vs %lu",
         localMetadata.mLayerPtrs.size(), remoteMetadata.mLayerPtrs.size());
+    TLLM_CHECK_WITH_INFO(localMetadata.mLayoutFingerprint != 0
+            && localMetadata.mLayoutFingerprint == remoteMetadata.mLayoutFingerprint,
+        "MOONCAKE_PAGED_GIN source/destination layout fingerprint mismatch: %llu vs %llu",
+        static_cast<unsigned long long>(localMetadata.mLayoutFingerprint),
+        static_cast<unsigned long long>(remoteMetadata.mLayoutFingerprint));
 
     if (mooncakePagedGinDiagEnabled())
     {
@@ -310,8 +410,9 @@ void AgentConnection::sendPagedTransfer(DataContext const& ctx, PagedTransferMet
     if (mooncakePagedGinDiagEnabled())
     {
         TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-            "MOONCAKE_PAGED_GIN_DIAG agent_submit_paged_begin tag=%lu remote=%s pages=%lu",
-            static_cast<unsigned long>(ctx.getTag()), mRemoteAgentName.c_str(), localMetadata.mPageIndices.size());
+            "MOONCAKE_PAGED_GIN_DIAG agent_submit_paged_begin tag=%lu remote=%s pages=%lu layout=%llu",
+            static_cast<unsigned long>(ctx.getTag()), mRemoteAgentName.c_str(), localMetadata.mPageIndices.size(),
+            static_cast<unsigned long long>(localMetadata.mLayoutFingerprint));
     }
     mAgentConnectionManager->getAgent()->submitPagedTransferRequest(request);
     if (mooncakePagedGinDiagEnabled())
@@ -476,6 +577,173 @@ AgentConnectionManager::AgentConnectionManager(
     mCommState = CommState(agentStates, mpi::MpiComm::session().getRank());
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         " ***** AgentConnectionManager::AgentConnectionManager    mCommState: %s", mCommState.toString().c_str());
+    runStartupPreconnect();
+}
+
+void AgentConnectionManager::runStartupPreconnect()
+{
+    if (!supportsPagedTransfer() || !common::getBoolEnv("TRTLLM_MOONCAKE_PAGED_GIN_STARTUP_PRECONNECT"))
+    {
+        return;
+    }
+
+    namespace fs = std::filesystem;
+    namespace su = executor::serialize_utils;
+    static std::atomic<int> nextStartupEpoch{0};
+    auto& session = mpi::MpiComm::session();
+    auto const sessionRank = session.getRank();
+    auto const startupEpoch = nextStartupEpoch.fetch_add(1, std::memory_order_relaxed);
+    auto const role = requireStartupEnv("TRTLLM_MOONCAKE_PAGED_GIN_PRECONNECT_ROLE");
+    auto const directory = fs::path(requireStartupEnv("TRTLLM_MOONCAKE_PAGED_GIN_PRECONNECT_DIR"));
+    auto const instanceId = getStartupEnvInt("TRTLLM_MOONCAKE_PAGED_GIN_PRECONNECT_INSTANCE", 1) - 1;
+    auto const contextInstances = getStartupEnvInt("TRTLLM_MOONCAKE_PAGED_GIN_CTX_INSTANCES", 1);
+    auto const generationInstances = getStartupEnvInt("TRTLLM_MOONCAKE_PAGED_GIN_GEN_INSTANCES", 1);
+    auto const rendezvousTimeout
+        = std::chrono::seconds(getStartupEnvInt("TRTLLM_MOONCAKE_PAGED_GIN_RENDEZVOUS_TIMEOUT_SECONDS", 900));
+    auto const initTimeout
+        = std::chrono::seconds(getStartupEnvInt("TRTLLM_MOONCAKE_PAGED_GIN_INIT_TIMEOUT_SECONDS", 120));
+    auto const rendezvousDeadline = std::chrono::steady_clock::now() + rendezvousTimeout;
+    auto const contextStatePath = [&](int context)
+    {
+        return directory / ("ctx-" + std::to_string(context) + "-epoch-" + std::to_string(startupEpoch) + ".state");
+    };
+    auto const generationMarkerPath = [&](int generation, char const* suffix)
+    {
+        return directory
+            / ("gen-" + std::to_string(generation) + "-epoch-" + std::to_string(startupEpoch) + suffix);
+    };
+
+    TLLM_CHECK_WITH_INFO(role == "CTX" || role == "GEN", "Invalid startup preconnect role %s", role.c_str());
+    TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+        "MOONCAKE_PAGED_GIN startup preconnect enter role=%s instance=%d epoch=%d local_rank=%d ctx_instances=%d gen_instances=%d dir=%s",
+        role.c_str(), instanceId, startupEpoch, sessionRank, contextInstances, generationInstances, directory.c_str());
+
+    if (role == "CTX")
+    {
+        if (sessionRank == 0)
+        {
+            auto localState = DataTransceiverState{mCacheState, mCommState};
+            auto payload = Serialization::serialize(localState);
+            auto const statePath = contextStatePath(instanceId);
+            writeStartupFile(statePath, payload);
+            TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+                "MOONCAKE_PAGED_GIN startup preconnect published context state instance=%d epoch=%d bytes=%zu path=%s",
+                instanceId, startupEpoch, payload.size(), statePath.c_str());
+
+            for (int generation = 0; generation < generationInstances; ++generation)
+            {
+                auto const readyPath = generationMarkerPath(generation, ".ready");
+                auto const failedPath = generationMarkerPath(generation, ".failed");
+                while (!startupPathExists(readyPath))
+                {
+                    TLLM_CHECK_WITH_INFO(!startupPathExists(failedPath),
+                        "Generation instance %d epoch %d failed during startup preconnect; see %s", generation,
+                        startupEpoch, failedPath.c_str());
+                    TLLM_CHECK_WITH_INFO(std::chrono::steady_clock::now() < rendezvousDeadline,
+                        "Timed out waiting for generation instance %d epoch %d startup preconnect", generation,
+                        startupEpoch);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                }
+            }
+        }
+        session.barrier();
+        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+            "MOONCAKE_PAGED_GIN startup preconnect complete role=CTX instance=%d epoch=%d local_rank=%d", instanceId,
+            startupEpoch, sessionRank);
+        return;
+    }
+
+    std::vector<char> peerStateBundle;
+    if (sessionRank == 0)
+    {
+        std::vector<std::vector<char>> peerStatePayloads;
+        peerStatePayloads.reserve(contextInstances);
+        for (int context = 0; context < contextInstances; ++context)
+        {
+            auto const statePath = contextStatePath(context);
+            waitForStartupPath(statePath, rendezvousDeadline);
+            peerStatePayloads.emplace_back(readStartupFile(statePath));
+        }
+        std::ostringstream output;
+        su::serialize(peerStatePayloads, output);
+        auto const serialized = output.str();
+        peerStateBundle.assign(serialized.begin(), serialized.end());
+    }
+    session.bcast(peerStateBundle, 0);
+
+    su::VectorWrapBuf<char> bundleBuffer(peerStateBundle);
+    std::istream bundleInput(&bundleBuffer);
+    auto peerStatePayloads = su::deserialize<std::vector<std::vector<char>>>(bundleInput);
+    TLLM_CHECK_WITH_INFO(static_cast<int>(peerStatePayloads.size()) == contextInstances,
+        "Startup preconnect received %zu context states, expected %d", peerStatePayloads.size(), contextInstances);
+
+    std::mutex watchdogMutex;
+    std::condition_variable watchdogCv;
+    bool watchdogDone{false};
+    auto const readyPath = generationMarkerPath(instanceId, ".ready");
+    auto const failedPath = generationMarkerPath(instanceId, ".failed");
+    std::thread watchdog([&]()
+    {
+        std::unique_lock lock(watchdogMutex);
+        if (!watchdogCv.wait_for(lock, initTimeout, [&]() { return watchdogDone; }))
+        {
+            writeStartupMarkerNoThrow(failedPath, "NCCL startup preconnect timed out\n");
+            TLLM_LOG_ERROR(mpi::MpiComm::world().getRank(),
+                "MOONCAKE_PAGED_GIN startup preconnect timed out after %lld seconds role=GEN instance=%d epoch=%d local_rank=%d",
+                static_cast<long long>(initTimeout.count()), instanceId, startupEpoch, sessionRank);
+            std::_Exit(124);
+        }
+    });
+    auto stopWatchdog = [&]()
+    {
+        {
+            std::lock_guard lock(watchdogMutex);
+            watchdogDone = true;
+        }
+        watchdogCv.notify_all();
+        watchdog.join();
+    };
+
+    try
+    {
+        session.barrier();
+        for (auto& peerPayload : peerStatePayloads)
+        {
+            auto peerState = Serialization::deserializeDataTransceiverState(peerPayload);
+            TLLM_CHECK(peerState.getCacheState().has_value());
+            TLLM_CHECK(peerState.getCommState().has_value());
+            auto const counterparts
+                = targetIRanks(peerState.getCacheState().value(), mCacheState, mCommState.getSelfIdx()).mIRanks;
+            auto const connections = getConnections(peerState.getCommState().value());
+            TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+                "MOONCAKE_PAGED_GIN startup preconnect pairs=%zu role=GEN instance=%d epoch=%d local_rank=%d peer=%s",
+                counterparts.size(), instanceId, startupEpoch, sessionRank, peerState.getCommState()->toString().c_str());
+            for (auto const counterpart : counterparts)
+            {
+                auto const* connection = connections.at(counterpart);
+                auto const* agentConnection = dynamic_cast<AgentConnection const*>(connection);
+                TLLM_CHECK(agentConnection != nullptr);
+                agentConnection->preconnect();
+            }
+        }
+        session.barrier();
+        if (sessionRank == 0)
+        {
+            writeStartupFile(readyPath, std::vector<char>{'O', 'K', '\n'});
+        }
+        session.barrier();
+        stopWatchdog();
+    }
+    catch (...)
+    {
+        writeStartupMarkerNoThrow(failedPath, "Startup preconnect failed\n");
+        stopWatchdog();
+        throw;
+    }
+
+    TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+        "MOONCAKE_PAGED_GIN startup preconnect complete role=GEN instance=%d epoch=%d local_rank=%d", instanceId,
+        startupEpoch, sessionRank);
 }
 
 AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(

@@ -927,6 +927,31 @@ public:
             allConnections.emplace_back(connection);
         }
 
+        if (agentConnectionManager && agentConnectionManager->supportsPagedTransfer())
+        {
+            if (mooncakePagedGinDiagEnabled())
+            {
+                TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+                    "MOONCAKE_PAGED_GIN_DIAG receiver_preconnect_phase_begin request_id=%lu pairs=%lu",
+                    static_cast<unsigned long>(requestId), allConnections.size());
+            }
+            // The generation side owns initialization. Complete every selected
+            // pair before publishing any request metadata to context workers.
+            for (auto const* connection : allConnections)
+            {
+                auto const* agentConnection
+                    = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection);
+                TLLM_CHECK(agentConnection != nullptr);
+                agentConnection->preconnect();
+            }
+            if (mooncakePagedGinDiagEnabled())
+            {
+                TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+                    "MOONCAKE_PAGED_GIN_DIAG receiver_preconnect_phase_end request_id=%lu pairs=%lu",
+                    static_cast<unsigned long>(requestId), allConnections.size());
+            }
+        }
+
         for (size_t ci = 0; ci < allCounterparts.size(); ci++)
         {
             auto rank = allCounterparts[ci];

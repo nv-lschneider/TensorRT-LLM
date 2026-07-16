@@ -166,7 +166,9 @@ def upsert_env_config(env_config, config_key, key_name, value_str):
 
 
 def convert_envs_to_str(env_vars: Dict[str, str]) -> str:
-    return ','.join([f"{key}='{value}'" for key, value in env_vars.items()])
+    # The complete export string is already shell-quoted by the generated srun
+    # command; embedded single quotes become literal characters in the value.
+    return ','.join([f"{key}={value}" for key, value in env_vars.items()])
 
 
 def replace_env_in_file(log_dir, file_path, env_var):
@@ -368,6 +370,7 @@ def submit_job(config, log_dir, dry_run):
     # Extract configurations
     slurm_config = config['slurm']
     slurm_config.setdefault('extra_args', '')
+    slurm_config.setdefault('comment', '')
     slurm_config.setdefault('set_segment', True)
 
     hw_config = config['hardware']
@@ -501,6 +504,7 @@ def submit_job(config, log_dir, dry_run):
         num_ctx_servers=ctx_num,
         gen_world_size=gen_world_size,
         ctx_world_size=ctx_world_size,
+        base_port=int(config.get('worker_port_base', 8000)),
     )
     with open(os.path.join(log_dir, "allocations.json"), "w") as f:
         json.dump(allocations, f, indent=2)
@@ -508,7 +512,9 @@ def submit_job(config, log_dir, dry_run):
     # Generate disagg server config
     router_config = config.get('router_config', None)
     server_config = convert_allocations_to_server_config(
-        allocations, router_config=router_config)
+        allocations,
+        server_port=int(config.get('server_port', 8333)),
+        router_config=router_config)
     # Merge server_config_extra into disagg server config
     if 'server_config_extra' in config:
         server_config.update(config['server_config_extra'])
@@ -576,6 +582,8 @@ def submit_job(config, log_dir, dry_run):
                 str(profiling_config['nsys_on']).lower(),
                 server_cfg['config_path'],
                 cuda_devices,
+                str(ctx_num),
+                str(gen_num),
                 f"&> {log_dir}/3_output_{server_type}_{server_id}.log &",
             ]
             start_server_cmds.append(" ".join(cmd))
@@ -607,12 +615,21 @@ def submit_job(config, log_dir, dry_run):
     )
 
     # Generate wait server command (use script_dir for wait_server.sh)
+    # The waiter runs in its own Pyxis step. Do not pass server cache-home
+    # variables here: Pyxis interprets those paths as host mount sources.
+    wait_env = {}
+    if 'TRTLLM_DISAGG_SERVER_HEALTH_TIMEOUT' in server_env:
+        wait_env['TRTLLM_DISAGG_SERVER_HEALTH_TIMEOUT'] = server_env[
+            'TRTLLM_DISAGG_SERVER_HEALTH_TIMEOUT']
+    wait_export_str = format_export_string(wait_env)
     cmd = [
         "srun -l",
         f"--container-name={container_name}",
         f"--container-mounts={container_mount_str}",
+        f"--export=\"{wait_export_str}\"",
         f"--mpi=pmix --overlap -N 1 -n 1",
-        f"bash {os.path.join(script_dir, 'wait_server.sh')} {disagg_server_hostname} {disagg_server_port}",
+        f"bash {os.path.join(script_dir, 'wait_server.sh')} {disagg_server_hostname} {disagg_server_port} "
+        f"{os.path.join(log_dir, 'mooncake-paged-gin-preconnect')}",
         f"&> {log_dir}/5_wait_server.log",
     ]
     start_server_cmds.append(" ".join(cmd))
@@ -659,6 +676,23 @@ def submit_job(config, log_dir, dry_run):
                 f"&> {log_dir}/6_bench.log"
             ]
             client_cmds.append(" ".join(benchmark_prefix + benchmark_cmd))
+
+    # Run this after the timed benchmark so semantic validation cannot warm or
+    # otherwise perturb the measured point.
+    if benchmark_config.get('semantic_canary', False):
+        env_var = config['benchmark'].get('env_var', {})
+        canary_prefix = client_slurm_prefix + [
+            f"--export \"{convert_envs_to_str(env_var)}\""
+        ]
+        canary_cmd = [
+            f"python3 {os.path.join(script_dir, 'semantic_canary.py')}",
+            f"--host {disagg_server_hostname}",
+            f"--port {disagg_server_port}",
+            f"--model '{env_config['model_path']}'",
+            f"--output '{log_dir}/semantic_canary.json'",
+            f"&> {log_dir}/7_semantic_canary.log",
+        ]
+        client_cmds.append(" ".join(canary_prefix + canary_cmd))
 
     # Append accuracy test commands
     if config['accuracy']['enable_accuracy_test']:
@@ -729,6 +763,8 @@ def submit_job(config, log_dir, dry_run):
           else [f'--segment={total_nodes}']),
         f'--output={log_dir}/slurm-%j.out',
         f'--error={log_dir}/slurm-%j.err',
+        *([] if not slurm_config['comment'] else
+          [f'--comment={slurm_config["comment"]}']),
         *([arg for arg in slurm_config['extra_args'].split() if arg]),
         slurm_script_file,
 

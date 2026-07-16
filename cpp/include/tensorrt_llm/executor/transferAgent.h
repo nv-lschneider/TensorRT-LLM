@@ -279,6 +279,7 @@ struct PagedTransferMetadata
     std::vector<uintptr_t> mLayerPtrs;
     std::vector<int32_t> mPageIndices;
     size_t mPageBytes{0};
+    uint64_t mLayoutFingerprint{0};
     MemoryDesc mRegisteredMemory{static_cast<uintptr_t>(0), 0, 0};
 };
 
@@ -384,6 +385,13 @@ public:
     /// @param name Specify the name of the remote agent.
     /// @param connectionInfo Provide the necessary communication details for connecting to the remote agent.
     virtual void loadRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo) = 0;
+
+    /// @brief Eagerly establish backend transport state for an already loaded remote agent.
+    /// @param name Specify the name of the remote agent.
+    virtual void preconnectRemoteAgent(std::string const& name)
+    {
+        (void) name;
+    }
 
     /// @brief Invalidate a connection with a remote agent.
     /// @param name Specify the name of the remote agent.

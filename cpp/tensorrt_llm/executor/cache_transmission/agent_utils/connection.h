@@ -54,6 +54,7 @@ struct RequestAndBufferInfo
         su::serialize(metadata.mLayerPtrs, os);
         su::serialize(metadata.mPageIndices, os);
         su::serialize(metadata.mPageBytes, os);
+        su::serialize(metadata.mLayoutFingerprint, os);
         MemoryDesc::serialize(metadata.mRegisteredMemory, os);
     }
 
@@ -63,15 +64,18 @@ struct RequestAndBufferInfo
         auto layerPtrs = su::deserialize<std::vector<uintptr_t>>(is);
         auto pageIndices = su::deserialize<std::vector<int32_t>>(is);
         auto pageBytes = su::deserialize<size_t>(is);
+        auto layoutFingerprint = su::deserialize<uint64_t>(is);
         auto registeredMemory = MemoryDesc::deserialize(is);
-        return PagedTransferMetadata{std::move(layerPtrs), std::move(pageIndices), pageBytes, registeredMemory};
+        return PagedTransferMetadata{
+            std::move(layerPtrs), std::move(pageIndices), pageBytes, layoutFingerprint, registeredMemory};
     }
 
     static size_t serializedSizePagedTransferMetadata(PagedTransferMetadata const& metadata)
     {
         namespace su = executor::serialize_utils;
         return su::serializedSize(metadata.mLayerPtrs) + su::serializedSize(metadata.mPageIndices)
-            + su::serializedSize(metadata.mPageBytes) + MemoryDesc::serializedSize(metadata.mRegisteredMemory);
+            + su::serializedSize(metadata.mPageBytes) + su::serializedSize(metadata.mLayoutFingerprint)
+            + MemoryDesc::serializedSize(metadata.mRegisteredMemory);
     }
 
     static void serialize(RequestAndBufferInfo const& requestAndBufferInfo, std::ostream& os)
@@ -306,6 +310,7 @@ public:
     void sendRequestAndBufferInfo(batch_manager::RequestInfo& requestInfo,
         std::vector<std::optional<size_t>> const& cacheBufferIds, int validConnectionIdx,
         std::optional<PagedTransferMetadata> pagedTransferMetadata = std::nullopt);
+    void preconnect() const;
     void sendPagedTransfer(DataContext const& ctx, PagedTransferMetadata const& localMetadata) const;
     [[nodiscard]] std::optional<PagedTransferMetadata> const& getPagedTransferMetadata() const;
     void setPagedTransferMetadata(std::optional<PagedTransferMetadata> pagedTransferMetadata);
@@ -381,6 +386,8 @@ public:
     [[nodiscard]] bool isRunning() const override;
 
 private:
+    void runStartupPreconnect();
+
     std::map<std::string, std::shared_ptr<AgentConnection>> mConnections;
     std::mutex mConnectionsMutex;
     CommState mCommState;

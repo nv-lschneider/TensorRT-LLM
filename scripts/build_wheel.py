@@ -945,6 +945,14 @@ def main(*,
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/mooncake_utils/libtensorrt_llm_mooncake_wrapper.so",
                 lib_dir / "libtensorrt_llm_mooncake_wrapper.so")
+        if os.path.exists(
+                build_dir /
+                "tensorrt_llm/executor/cache_transmission/mooncake_paged_gin_utils/libtensorrt_llm_mooncake_paged_gin_wrapper.so"
+        ):
+            install_file(
+                build_dir /
+                "tensorrt_llm/executor/cache_transmission/mooncake_paged_gin_utils/libtensorrt_llm_mooncake_paged_gin_wrapper.so",
+                lib_dir / "libtensorrt_llm_mooncake_paged_gin_wrapper.so")
         install_file(
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/libdecoder_attention_0.so",
