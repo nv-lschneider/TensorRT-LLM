@@ -178,6 +178,12 @@ def inplace_info():
             5: "acceptIndex",
             6: "acceptTokenNum",
             7: "acceptToken"
+        },
+        torch.ops.trtllm.cublas_mm_out.default: {
+            3: "out"
+        },
+        torch.ops.trtllm.cublas_scaled_mm_out.default: {
+            5: "out"
         }
     }
     optional_inplace_infos = {

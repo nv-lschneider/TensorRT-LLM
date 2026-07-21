@@ -241,6 +241,10 @@ def _register_fake():
         ret = mat_a.new_empty(shape, dtype=out_dtype)
         return ret
 
+    @torch.library.register_fake("trtllm::cublas_scaled_mm_out")
+    def _(mat_a, mat_b, scale_a, scale_b, bias, out):
+        return out
+
     @torch.library.register_fake("trtllm::cuda_scaled_mm")
     def _(
         mat_a: torch.Tensor,

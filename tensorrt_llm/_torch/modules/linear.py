@@ -755,6 +755,33 @@ class UnquantizedLinearMethod(LinearMethodBase):
 class FP8QDQLinearMethod(UnquantizedLinearMethod):
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
+    nccl_window_tensor_pool_method: ClassVar[str] = "fp8_qdq_cublas"
+
+    def can_apply_out(self, module: Linear) -> bool:
+        return not module.enable_cuda_core and module.out_features % 16 == 0
+
+    def apply_out(self, module: Linear, input: torch.Tensor,
+                  bias: Optional[torch.Tensor], output: torch.Tensor) -> None:
+        input_scale = self.get_static_input_scale(module)
+        if input.dtype == torch.float8_e4m3fn:
+            qinput = input
+            input_scale = module.input_scale
+        elif input_scale is not None:
+            qinput, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                input, input_scale)
+        else:
+            qinput, input_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(
+                input)
+            input_scale = input_scale.to(torch.float32)
+        torch.ops.trtllm.cublas_scaled_mm_out(
+            qinput,
+            module.weight.t(),
+            input_scale,
+            module.weight_scale,
+            bias,
+            output.narrow(0, 0, qinput.shape[0]),
+        )
+
 
     def get_static_input_scale(self, module: Linear) -> Optional[torch.Tensor]:
         if module.input_scale is not None and not module.force_dynamic_quantization:
