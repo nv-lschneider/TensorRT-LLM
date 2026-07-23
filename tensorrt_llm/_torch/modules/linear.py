@@ -52,8 +52,8 @@ def is_nccl_window_tensor_pool_method_enabled(method: Optional[str]) -> bool:
     """Return whether a caller-owned output method is allowed to use the pool.
 
     ``TLLM_NCCL_WINDOW_TENSOR_POOL_METHODS`` is a comma-separated allow-list.
-    It defaults to ``nvfp4`` because the full-model regression case shows a
-    repeatable gain there. FP8 rowwise support remains available for focused
+    It defaults to ``nvfp4,fp8_qdq_cublas`` because both have repeatable
+    full-model gains. FP8 rowwise support remains available for focused
     testing but requires an explicit opt-in. Use ``all`` to enable every
     method with a proven native ``apply_out`` contract, or ``none`` to disable
     every method while leaving the global pool switch unchanged.
@@ -61,7 +61,7 @@ def is_nccl_window_tensor_pool_method_enabled(method: Optional[str]) -> bool:
     if method is None:
         return False
     methods = os.environ.get("TLLM_NCCL_WINDOW_TENSOR_POOL_METHODS",
-                             "nvfp4")
+                             "nvfp4,fp8_qdq_cublas")
     enabled = {value.strip().lower() for value in methods.split(",")}
     return "all" in enabled or method.lower() in enabled
 
@@ -1513,8 +1513,12 @@ class NVFP4LinearMethod(LinearMethodBase):
     def can_apply_out(self, module: Linear) -> bool:
         # Subclasses may change activation preparation or the GEMM itself.
         # They must opt in explicitly after proving their native out contract.
-        return (type(self) is NVFP4LinearMethod
-                and module.nvfp4_allowed_backends == ["cutlass"]
+        output_backends = {
+            "cutlass", "cublaslt", "cutedsl", "cuda_core", "marlin"
+        }
+        configured_backends = set(module.nvfp4_allowed_backends)
+        return (type(self) is NVFP4LinearMethod and configured_backends
+                and configured_backends <= output_backends
                 and module.weight.shape[0] == module.out_features
                 and module.bias is None)
 
@@ -1703,7 +1707,7 @@ class NVFP4LinearMethod(LinearMethodBase):
 
     def apply_out(self, module: Linear, input: torch.Tensor,
                   bias: Optional[torch.Tensor], output: torch.Tensor) -> None:
-        """Write a 2-D CUTLASS NVFP4 result into caller-owned storage."""
+        """Write a 2-D NVFP4 result into caller-owned storage."""
         act_fp4, act_sf, alpha = self._input_prepare(module, input)
         nvfp4_gemm_out(
             act_fp4,
@@ -1712,6 +1716,7 @@ class NVFP4LinearMethod(LinearMethodBase):
             module.weight_scale,
             alpha,
             output,
+            allowed_backends=",".join(module.nvfp4_allowed_backends),
         )
 
     def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,

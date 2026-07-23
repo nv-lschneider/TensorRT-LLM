@@ -13,12 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import torch
 from utils.util import skip_pre_blackwell
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.compilation.backend import Backend
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
 
 def _make_operands(dtype: torch.dtype):
@@ -33,6 +35,35 @@ def _make_operands(dtype: torch.dtype):
         weight, weight_scale, 16, False)
     alpha = torch.reciprocal(activation_scale * weight_scale).reshape(1)
     return activation_fp4, weight_fp4, activation_sf, weight_sf, alpha
+
+
+_BLACKWELL_OUTPUT_BACKENDS = [
+    "cutlass",
+    "cublaslt",
+    "cuda_core",
+    pytest.param(
+        "cutedsl",
+        marks=pytest.mark.skipif(
+            not IS_CUTLASS_DSL_AVAILABLE, reason="CuteDSL is unavailable"),
+    ),
+]
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("backend", _BLACKWELL_OUTPUT_BACKENDS)
+def test_nvfp4_gemm_out_backends(backend):
+    operands = _make_operands(torch.bfloat16)
+    with torch.inference_mode(), autotune():
+        reference = torch.ops.trtllm.nvfp4_gemm(
+            *operands,
+            output_dtype=torch.bfloat16,
+            allowed_backends=backend,
+        )
+        output = reference.new_empty((8, reference.size(1)))
+        torch.ops.trtllm.nvfp4_gemm_out(
+            *operands, output, allowed_backends=backend)
+    torch.testing.assert_close(
+        output[:reference.size(0)], reference, rtol=1e-2, atol=0.15)
 
 
 @skip_pre_blackwell

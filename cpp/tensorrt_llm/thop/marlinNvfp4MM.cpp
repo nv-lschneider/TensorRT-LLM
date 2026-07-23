@@ -45,10 +45,9 @@ namespace torch_ext
 // size_k:             reduction dimension K
 // output_buffer_kind: output allocation kind (0=default, 1=userbuffers, 2=nccl_window)
 // group:              communicator ranks, used when output_buffer_kind selects an NCCL window
-Tensor marlin_nvfp4_gemm(Tensor const& mat_a, Tensor const& mat_b, std::optional<Tensor> const& scale_a,
+Tensor& marlin_nvfp4_gemm_out(Tensor const& mat_a, Tensor const& mat_b, std::optional<Tensor> const& scale_a,
     Tensor const& scale_b, std::optional<Tensor> const& alpha, Tensor const& weight_global_scale,
-    std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype, int64_t size_n, int64_t size_k,
-    int64_t output_buffer_kind = 0, c10::optional<torch::List<int64_t>> group = c10::nullopt)
+    std::optional<at::Tensor> const& bias, int64_t size_n, int64_t size_k, Tensor& out)
 {
     CHECK_TH_CUDA(mat_a);
     TORCH_CHECK(mat_a.scalar_type() == FLOAT4_E2M1X2 || mat_a.scalar_type() == at::ScalarType::BFloat16,
@@ -66,17 +65,17 @@ Tensor marlin_nvfp4_gemm(Tensor const& mat_a, Tensor const& mat_b, std::optional
     TORCH_CHECK(mat_a.dim() == 2, "A must be 2D tensor");
     TORCH_CHECK(!bias.has_value(), "bias is not supported yet");
 
-    auto const out_dtype_ = out_dtype.value_or(at::ScalarType::Half);
-    TORCH_CHECK(
-        out_dtype_ == at::ScalarType::Half || out_dtype_ == at::ScalarType::BFloat16, "Output must be fp16 or bf16");
-
     int32_t m = mat_a.sizes()[0];
     int32_t n = static_cast<int32_t>(size_n);
     int32_t k = static_cast<int32_t>(size_k);
 
-    // Allocate output
-    auto [out, _] = torch_ext::allocate_output(
-        {m, n}, out_dtype_, mat_a.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group);
+    CHECK_TH_CUDA(out);
+    TORCH_CHECK(out.device() == mat_a.device(), "output must reside on the same CUDA device as mat_a");
+    TORCH_CHECK(out.is_contiguous(), "output must be contiguous");
+    TORCH_CHECK(out.dim() == 2 && out.size(0) >= m && out.size(1) == n, "output has shape ", out.sizes(),
+        "; expected at least [", m, ", ", n, "]");
+    TORCH_CHECK(out.scalar_type() == at::ScalarType::Half || out.scalar_type() == at::ScalarType::BFloat16,
+        "Output must be fp16 or bf16");
 
     if (m == 0)
         return out;
@@ -116,6 +115,18 @@ Tensor marlin_nvfp4_gemm(Tensor const& mat_a, Tensor const& mat_b, std::optional
     return out;
 }
 
+Tensor marlin_nvfp4_gemm(Tensor const& mat_a, Tensor const& mat_b, std::optional<Tensor> const& scale_a,
+    Tensor const& scale_b, std::optional<Tensor> const& alpha, Tensor const& weight_global_scale,
+    std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype, int64_t size_n, int64_t size_k,
+    int64_t output_buffer_kind = 0, c10::optional<torch::List<int64_t>> group = c10::nullopt)
+{
+    auto const outputDtype = out_dtype.value_or(at::ScalarType::Half);
+    auto [out, _] = torch_ext::allocate_output({mat_a.sizes()[0], size_n}, outputDtype, mat_a.device(),
+        static_cast<torch_ext::BufferKind>(output_buffer_kind), group);
+    return marlin_nvfp4_gemm_out(
+        mat_a, mat_b, scale_a, scale_b, alpha, weight_global_scale, bias, size_n, size_k, out);
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -126,9 +137,13 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "marlin_nvfp4_gemm(Tensor mat_a, Tensor mat_b, Tensor? scale_a, Tensor scale_b, Tensor? alpha,"
         " Tensor weight_global_scale, Tensor? bias, ScalarType? out_dtype,"
         " int size_n, int size_k, int output_buffer_kind=0, int[]? group=None) -> (Tensor out)");
+    m.def(
+        "marlin_nvfp4_gemm_out(Tensor mat_a, Tensor mat_b, Tensor? scale_a, Tensor scale_b, Tensor? alpha,"
+        " Tensor weight_global_scale, Tensor? bias, int size_n, int size_k, Tensor(a!) out) -> Tensor(a!)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("marlin_nvfp4_gemm", &tensorrt_llm::torch_ext::marlin_nvfp4_gemm);
+    m.impl("marlin_nvfp4_gemm_out", &tensorrt_llm::torch_ext::marlin_nvfp4_gemm_out);
 }

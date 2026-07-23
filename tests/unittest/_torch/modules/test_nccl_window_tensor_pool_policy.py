@@ -8,6 +8,7 @@ from tensorrt_llm._torch.modules.linear import \
     "method, expected",
     [
         ("nvfp4", True),
+        ("fp8_qdq_cublas", True),
         ("fp8_rowwise", False),
         ("cublas_mm", False),
         (None, False),

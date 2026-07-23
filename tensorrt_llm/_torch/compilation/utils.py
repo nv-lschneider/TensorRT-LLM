@@ -184,6 +184,9 @@ def inplace_info():
         },
         torch.ops.trtllm.cublas_scaled_mm_out.default: {
             5: "out"
+        },
+        torch.ops.trtllm.fp8_rowwise_gemm_out.default: {
+            4: "output"
         }
     }
     optional_inplace_infos = {

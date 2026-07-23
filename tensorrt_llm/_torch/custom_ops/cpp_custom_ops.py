@@ -245,6 +245,10 @@ def _register_fake():
     def _(mat_a, mat_b, scale_a, scale_b, bias, out):
         return out
 
+    @torch.library.register_fake("trtllm::cublas_mm_out")
+    def _(mat_a, mat_b, bias, out):
+        return out
+
     @torch.library.register_fake("trtllm::cuda_scaled_mm")
     def _(
         mat_a: torch.Tensor,
@@ -1311,6 +1315,10 @@ def _register_fake():
         n = mat_b.shape[0]
         return mat_a.new_empty((m, n), dtype=out_dtype)
 
+    @torch.library.register_fake("trtllm::cuda_core_nvfp4_gemm_out")
+    def _(mat_a, mat_b, scale_a, scale_b, alpha, bias, out):
+        return out
+
     @torch.library.register_fake("trtllm::marlin_nvfp4_gemm")
     def _(mat_a: torch.Tensor,
           mat_b: torch.Tensor,
@@ -1329,6 +1337,11 @@ def _register_fake():
         # Output: [M, size_n] with dtype=out_dtype
         m = mat_a.shape[0]
         return mat_a.new_empty((m, size_n), dtype=out_dtype)
+
+    @torch.library.register_fake("trtllm::marlin_nvfp4_gemm_out")
+    def _(mat_a, mat_b, scale_a, scale_b, alpha, weight_global_scale, bias,
+          size_n, size_k, out):
+        return out
 
     @torch.library.register_fake("trtllm::marlin_nvfp4_moe_gemm")
     def _(a: torch.Tensor,

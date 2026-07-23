@@ -199,8 +199,6 @@ public:
         c10::optional<torch::Tensor> bias = c10::nullopt) const
     {
         int m = mat1.size(0);
-        int k_compressed = mat1.size(1);
-        int k = k_compressed * 2;
         int n = mat2.size(0);
 
         // Prepare output tensor
@@ -208,50 +206,40 @@ public:
         auto [out, _] = torch_ext::allocate_output(
             output_size, mOutputDtype, mat1.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group);
 
-        // Get algorithm cache
+        runGemmOut(mat1, mat2, mat1_scale, mat2_scale, alpha, out, tactic, bias);
+        return out;
+    }
+
+    void runGemmOut(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1_scale,
+        at::Tensor const& mat2_scale, at::Tensor const& alpha, at::Tensor& out, int64_t tactic,
+        c10::optional<torch::Tensor> bias = c10::nullopt) const
+    {
+        int m = mat1.size(0);
+        int k = mat1.size(1) * 2;
+        int n = mat2.size(0);
+        CHECK_TH_CUDA(out);
+        TORCH_CHECK(out.device() == mat1.device(), "output must reside on the same CUDA device as mat1");
+        TORCH_CHECK(out.is_contiguous(), "output must be contiguous");
+        TORCH_CHECK(out.dim() == 2 && out.size(0) >= m && out.size(1) == n, "output has shape ", out.sizes(),
+            "; expected at least [", m, ", ", n, "]");
+        TORCH_CHECK(out.scalar_type() == mOutputDtype, "output dtype must match runner output dtype");
         auto& cache = getOrCreateAlgoCache(m, k, n, mat1.device(), mat1_scale, mat2_scale);
-
-        // Select algorithm
-        bool has_algo = false;
-        cublasLtMatmulAlgo_t const* algo_ptr = nullptr;
-
         if (tactic >= 0 && tactic < static_cast<int64_t>(cache.heuristics.size()))
         {
-            // Use specified tactic
-            algo_ptr = &cache.heuristics[tactic].algo;
-            has_algo = true;
-            TLLM_LOG_DEBUG(
-                "CublasLtFP4GemmRunner: Using specified tactic %ld (out of %zu) for shape (m=%d, n=%d, k=%d)", tactic,
-                cache.heuristics.size(), m, n, k);
+            cublas_fp4_gemm_caller_with_algo(
+                out, mat1, mat2, mat1_scale, mat2_scale, alpha, cache.heuristics[tactic].algo, mOutputDtype, bias);
         }
         else if (tactic == -1 && !cache.heuristics.empty())
         {
-            // Use best tactic (default is first one)
-            int64_t best_idx
-                = cache.best_tactic < static_cast<int64_t>(cache.heuristics.size()) ? cache.best_tactic : 0;
-            algo_ptr = &cache.heuristics[best_idx].algo;
-            has_algo = true;
-            TLLM_LOG_DEBUG("CublasLtFP4GemmRunner: Using best tactic %ld (out of %zu) for shape (m=%d, n=%d, k=%d)",
-                best_idx, cache.heuristics.size(), m, n, k);
-        }
-
-        // Execute GEMM (beta is always 0 and is managed internally)
-        if (has_algo)
-        {
+            int64_t const best = cache.best_tactic < static_cast<int64_t>(cache.heuristics.size())
+                ? cache.best_tactic : 0;
             cublas_fp4_gemm_caller_with_algo(
-                out, mat1, mat2, mat1_scale, mat2_scale, alpha, *algo_ptr, mOutputDtype, bias);
+                out, mat1, mat2, mat1_scale, mat2_scale, alpha, cache.heuristics[best].algo, mOutputDtype, bias);
         }
         else
         {
-            // Fall back to default (no algorithm specified)
-            TLLM_LOG_DEBUG(
-                "CublasLtFP4GemmRunner: No valid algorithm found (tactic=%ld, available=%zu), falling back to default "
-                "for shape (m=%d, n=%d, k=%d)",
-                tactic, cache.heuristics.size(), m, n, k);
             cublas_fp4_gemm_caller(out, mat1, mat2, mat1_scale, mat2_scale, alpha, bias);
         }
-
-        return out;
     }
 
 private:
@@ -464,5 +452,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.class_<tensorrt_llm::torch_ext::CublasLtFP4GemmRunner>("CublasLtFP4GemmRunner")
         .def(torch::init<at::ScalarType>())
         .def("run_gemm", &tensorrt_llm::torch_ext::CublasLtFP4GemmRunner::runGemm)
+        .def("run_gemm_out", &tensorrt_llm::torch_ext::CublasLtFP4GemmRunner::runGemmOut)
         .def("get_num_heuristic_algos", &tensorrt_llm::torch_ext::CublasLtFP4GemmRunner::getNumHeuristicAlgos);
 }

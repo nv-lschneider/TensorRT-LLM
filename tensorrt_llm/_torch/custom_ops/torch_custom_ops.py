@@ -738,6 +738,17 @@ class CublasLtFP4GemmRunner(TunableRunner):
         )
         return result
 
+    def forward_out(
+        self,
+        inputs: List[torch.Tensor],
+        output: torch.Tensor,
+        tactic: int = -1,
+        bias: Optional[torch.Tensor] = None,
+    ) -> None:
+        mat1, mat2, mat1_scale, mat2_scale, alpha = inputs
+        self.cublaslt_runner.run_gemm_out(
+            mat1, mat2, mat1_scale, mat2_scale, alpha, output, tactic, bias)
+
 
 class CudaCoreNVFP4Runner(TunableRunner):
     """
@@ -813,6 +824,21 @@ class CudaCoreNVFP4Runner(TunableRunner):
             group=self.group,
         )
         return result
+
+    def forward_out(
+        self,
+        inputs: List[torch.Tensor],
+        output: torch.Tensor,
+        tactic: int = -1,
+        bias: Optional[torch.Tensor] = None,
+    ) -> None:
+        act_fp4, weight, act_sf, weight_scale, alpha = inputs
+        m = act_fp4.shape[0]
+        act_sf_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+            act_sf.view((m + 128 - 1) // 128 * 128, -1))
+        torch.ops.trtllm.cuda_core_nvfp4_gemm_out(
+            act_fp4, weight, act_sf_unswizzled, weight_scale, alpha, bias,
+            output)
 
 
 class MarlinNVFP4Runner(TunableRunner):
@@ -922,6 +948,23 @@ class MarlinNVFP4Runner(TunableRunner):
             output_buffer_kind=self.output_buffer_kind,
         )
         return result
+
+    def forward_out(
+        self,
+        inputs: List[torch.Tensor],
+        output: torch.Tensor,
+        tactic: int = -1,
+        **kwargs,
+    ) -> None:
+        act_fp4, weight, act_sf, weight_scale, alpha = inputs
+        (marlin_weight, marlin_scale, marlin_global_scale, size_n,
+         size_k) = self._prepare_marlin_weights(weight, weight_scale)
+        m = act_fp4.shape[0]
+        act_sf_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+            act_sf.view((m + 128 - 1) // 128 * 128, -1)).flatten()
+        torch.ops.trtllm.marlin_nvfp4_gemm_out(
+            act_fp4, marlin_weight, act_sf_unswizzled, marlin_scale, alpha,
+            marlin_global_scale, None, size_n, size_k, output)
 
 
 @torch.library.custom_op("trtllm::nvfp4_gemm_cublaslt", mutates_args=())
@@ -1202,16 +1245,32 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
 
         return tactics
 
+    def _create_backend_runner(self, backend: str) -> TunableRunner:
+        if backend == "cuda_core":
+            return CudaCoreNVFP4Runner(
+                self.output_buffer_kind, self.output_dtype, group=self.group)
+        if backend == "cutlass":
+            return FP4GemmRunner(
+                fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
+                self.output_buffer_kind, self.output_dtype, group=self.group)
+        if backend == "cublaslt":
+            return CublasLtFP4GemmRunner(
+                self.output_buffer_kind, self.output_dtype, group=self.group)
+        if backend == "cutedsl":
+            return CuteDSLNVFP4BlackwellRunner(
+                self.output_dtype, self.output_buffer_kind, self.group)
+        if backend == "marlin":
+            return MarlinNVFP4Runner(self.output_buffer_kind, self.output_dtype)
+        raise ValueError(f"Invalid NVFP4 backend: {backend}")
+
     def forward(
         self,
         inputs: List[torch.Tensor],
-        tactic: Union[
-            Tuple,
-            int] = -1,  # tuple: (backend name, sub_tactic_id), or int: -1 for fallback
+        tactic: Union[Tuple, int] = -1,
         bias: Optional[torch.Tensor] = None,
+        output: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        # Handle fallback tactic on cache miss
         if tactic == -1:
             # Prefer marlin on Ada/Hopper (SM89-99) when explicitly allowed, cutlass
             # otherwise, falling back to whatever backend is available.
@@ -1226,52 +1285,49 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                 tactic = (self.allowed_backends[0], -1)
 
         backend, sub_tactic = tactic
-        if backend == "cuda_core":
-            return CudaCoreNVFP4Runner(self.output_buffer_kind,
-                                       self.output_dtype,
-                                       group=self.group)(inputs,
-                                                         tactic=sub_tactic,
-                                                         bias=bias)
-        elif backend == "cutlass":
-            return FP4GemmRunner(fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
-                                 self.output_buffer_kind,
-                                 self.output_dtype,
-                                 group=self.group)(inputs,
-                                                   tactic=sub_tactic,
-                                                   bias=bias)
-        elif backend == "cublaslt":
-            return CublasLtFP4GemmRunner(self.output_buffer_kind,
-                                         self.output_dtype,
-                                         group=self.group)(inputs,
-                                                           tactic=sub_tactic,
-                                                           bias=bias)
-        elif backend == "cutedsl":
-            return CuteDSLNVFP4BlackwellRunner(self.output_dtype,
-                                               self.output_buffer_kind,
-                                               self.group)(inputs,
-                                                           tactic=sub_tactic,
-                                                           bias=bias)
-        elif backend == "marlin":
-            return MarlinNVFP4Runner(self.output_buffer_kind,
-                                     self.output_dtype)(inputs,
-                                                        tactic=sub_tactic)
-        else:
-            raise ValueError(f"Invalid tactic: {tactic}")
+        runner = self._create_backend_runner(backend)
+        if output is not None:
+            runner.forward_out(
+                inputs, output, tactic=sub_tactic, bias=bias)
+            return output
+        return runner(inputs, tactic=sub_tactic, bias=bias)
+
+    def forward_out(
+        self,
+        inputs: List[torch.Tensor],
+        output: torch.Tensor,
+        tactic: Union[Tuple, int] = -1,
+        bias: Optional[torch.Tensor] = None,
+    ) -> None:
+        self.forward(inputs, tactic=tactic, bias=bias, output=output)
+
+
+_VALID_NVFP4_BACKENDS = frozenset(
+    {"cutlass", "cublaslt", "cutedsl", "cuda_core", "marlin"})
+
+
+def _parse_nvfp4_backends(allowed_backends: str) -> List[str]:
+    backends = [backend.strip() for backend in allowed_backends.split(",")
+                if backend.strip()]
+    invalid_backends = set(backends) - _VALID_NVFP4_BACKENDS
+    if invalid_backends:
+        raise ValueError(
+            f"Invalid backends in allowed_backends: {invalid_backends}. "
+            f"Valid backends are: {sorted(_VALID_NVFP4_BACKENDS)}.")
+    if not backends:
+        raise ValueError(
+            "allowed_backends cannot be empty. "
+            f"Valid backends are: {sorted(_VALID_NVFP4_BACKENDS)}.")
+    return backends
 
 
 @lru_cache(maxsize=None)
-def _get_nvfp4_gemm_out_runners(
+def _get_nvfp4_gemm_out_runner(
     output_dtype: torch.dtype,
-) -> Tuple[NVFP4GemmUnifiedRunner, FP4GemmRunner]:
-    return (
-        NVFP4GemmUnifiedRunner(int(BufferKind.DEFAULT), output_dtype,
-                               ["cutlass"]),
-        FP4GemmRunner(
-            fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
-            int(BufferKind.DEFAULT),
-            output_dtype,
-        ),
-    )
+    allowed_backends: Tuple[str, ...],
+) -> NVFP4GemmUnifiedRunner:
+    return NVFP4GemmUnifiedRunner(
+        int(BufferKind.DEFAULT), output_dtype, list(allowed_backends))
 
 
 @fast_custom_op("trtllm::nvfp4_gemm", mutates_args=())
@@ -1320,25 +1376,7 @@ def nvfp4_gemm(
         ValueError: If backend is invalid/unavailable
     """
 
-    valid_individual_backends = {
-        'cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin'
-    }
-
-    # Parse comma-separated string to list
-    backends_list = [
-        b.strip() for b in allowed_backends.split(',') if b.strip()
-    ]
-
-    # Validate allowed_backends
-    invalid_backends = set(backends_list) - valid_individual_backends
-    if invalid_backends:
-        raise ValueError(
-            f"Invalid backends in allowed_backends: {invalid_backends}. "
-            f"Valid backends are: {sorted(valid_individual_backends)}.")
-    if not backends_list:
-        raise ValueError(
-            f"allowed_backends cannot be empty. "
-            f"Valid backends are: {sorted(valid_individual_backends)}.")
+    backends_list = _parse_nvfp4_backends(allowed_backends)
 
     # Build runner with allowed backends
     runner = NVFP4GemmUnifiedRunner(output_buffer_kind,
@@ -1385,34 +1423,30 @@ def nvfp4_gemm_out(
     weight_scale: torch.Tensor,
     alpha: torch.Tensor,
     output: torch.Tensor,
+    allowed_backends: str = "cutlass,cublaslt,cuda_core",
     bias: Optional[torch.Tensor] = None,
 ) -> None:
-    """Run the tuned CUTLASS NVFP4 GEMM into caller-owned storage."""
-    runner, output_runner = _get_nvfp4_gemm_out_runners(output.dtype)
+    """Run the tuned NVFP4 backend into caller-owned storage."""
+    backends = _parse_nvfp4_backends(allowed_backends)
+    runner = _get_nvfp4_gemm_out_runner(output.dtype, tuple(backends))
     inputs = [act_fp4, weight, act_sf, weight_scale, alpha]
-    tuner = AutoTuner.get()
     try:
-        _, best_tactic = tuner.choose_one(
-            "trtllm::nvfp4_gemm::gemm",
+        _, best_tactic = AutoTuner.get().choose_one(
+            "trtllm::nvfp4_gemm_out::gemm",
             [runner],
             NVFP4GemmUnifiedRunner.tuning_config,
             inputs,
             bias=bias,
+            output=output,
         )
     except IndexError as e:
         raise RuntimeError(
-            "AutoTuner failed to find a CUTLASS tactic for caller-owned "
-            f"NVFP4 output with M={act_fp4.shape[0]}, "
-            f"K={act_fp4.shape[1] * 2}, N={weight.shape[0]}") from e
+            "AutoTuner failed to find an NVFP4 tactic for caller-owned "
+            f"output with M={act_fp4.shape[0]}, K={act_fp4.shape[1] * 2}, "
+            f"N={weight.shape[0]} and backends={backends}") from e
 
-    if best_tactic == -1:
-        best_tactic = ("cutlass", -1)
-    backend, sub_tactic = best_tactic
-    if backend != "cutlass":
-        raise RuntimeError(
-            f"caller-owned NVFP4 output requires CUTLASS, got {backend}")
-    output_runner.forward_out(
-        inputs, output, tactic=sub_tactic, bias=bias)
+    runner.forward_out(
+        inputs, output, tactic=best_tactic, bias=bias)
 
 
 @nvfp4_gemm_out.register_fake
@@ -1423,6 +1457,7 @@ def _(
     weight_scale: torch.Tensor,
     alpha: torch.Tensor,
     output: torch.Tensor,
+    allowed_backends: str = "cutlass,cublaslt,cuda_core",
     bias: Optional[torch.Tensor] = None,
 ) -> None:
     return None

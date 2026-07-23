@@ -157,6 +157,23 @@ class TestNvfp4MarlinGemm(unittest.TestCase):
             size_k=input_dim,
         )
 
+        output_storage = output.new_empty((batch_size + 4, output_dim))
+        output_alias = torch.ops.trtllm.marlin_nvfp4_gemm_out(
+            mat_a,
+            marlin_weight,
+            scale_a=scale_a,
+            scale_b=marlin_scale,
+            alpha=alpha_arg,
+            weight_global_scale=weight_global_scale,
+            bias=None,
+            size_n=output_dim,
+            size_k=input_dim,
+            out=output_storage,
+        )
+        assert output_alias.data_ptr() == output_storage.data_ptr()
+        torch.testing.assert_close(
+            output_storage[:batch_size], output, atol=0.75, rtol=0.02)
+
         output_cpu_float = output.float().cpu()
         assert torch.allclose(output_cpu_float, ref_output_fp32, atol=0.75, rtol=0.02)
 
