@@ -4,6 +4,8 @@ from typing import Any, Callable, Optional
 
 import torch
 
+from ..cuda_graph_utils import get_active_nccl_window_reuse_domain_id
+
 
 class do_multi_stream_local(threading.local):
 
@@ -75,6 +77,15 @@ def maybe_execute_in_parallel(
             result1 = fn1()
             event1.record()
         event1.wait()
+        # event1 is recorded after every auxiliary-stream use above and the
+        # current stream now waits for it. Publish that already-enqueued join
+        # to the registered-window allocator so future same-lane scratch reuse
+        # stays enabled without adding anything to graph replay.
+        domain_id = get_active_nccl_window_reuse_domain_id()
+        record_join = getattr(torch.ops.trtllm,
+                              "_record_nccl_window_stream_join", None)
+        if domain_id is not None and record_join is not None:
+            record_join(domain_id, int(aux_stream.cuda_stream))
     else:
         result0 = fn0()
         result1 = fn1()

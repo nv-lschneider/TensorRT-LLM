@@ -501,10 +501,10 @@ private:
         }
 
         auto& allocator = NCCLWindowAllocator::getInstance();
-        allocator.retainCommForActiveCapture(rawComm);
+        allocator.retainCommForActiveDomain(rawComm);
 
         // Search for existing buffer
-        auto windowBuffer0 = allocator.searchBuffer(comm, input.data_ptr());
+        auto windowBuffer0 = allocator.searchBuffer(comm, input.data_ptr(), input.get_device(), true);
 
         torch::Tensor inputTensor = input;
         void* inputPtr = input.data_ptr();
@@ -1503,6 +1503,7 @@ int64_t ensureNCCLWindowCapacity(
     using tensorrt_llm::common::nccl_util::NCCLWindowLease;
     auto& allocator = NCCLWindowAllocator::getInstance();
     ncclComm_t const comm = *commPtr;
+    allocator.retainCommForActiveDomain(commPtr);
     size_t const bufferSize = static_cast<size_t>(minimumBytes);
     TLLM_LOG_DEBUG("[ensureNCCLWindowCapacity] Ensuring %ld slot(s) of at least %zu bytes for comm %p on device %d",
         slotCount, bufferSize, static_cast<void*>(comm), device);
@@ -1586,8 +1587,12 @@ bool isNCCLWindowBuffer(torch::Tensor const& input, torch::List<int64_t> const& 
     }
 
     using tensorrt_llm::common::nccl_util::NCCLWindowAllocator;
-    auto const buffer
-        = NCCLWindowAllocator::getInstance().searchBuffer(*commPtr, input.data_ptr(), input.get_device());
+    auto& allocator = NCCLWindowAllocator::getInstance();
+    allocator.retainCommForActiveDomain(commPtr);
+    // tunable_allreduce consumes input regardless of the tactic ultimately
+    // selected. Record that stream even when the window predicate is false so
+    // plain NCCL/custom fallbacks cannot outlive an untracked window lease.
+    auto const buffer = allocator.searchBuffer(*commPtr, input.data_ptr(), input.get_device(), true);
     return buffer.isValid();
 #else
     (void) input;

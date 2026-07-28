@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include <chrono>
 #include <limits>
 #include <stdexcept>
 #include <thread>
@@ -215,7 +216,10 @@ bool isNcclWindowSupported(int device)
 
 NcclCommResourceManager& NcclCommResourceManager::getInstance() noexcept
 {
-    static NcclCommResourceManager instance;
+    // Communicator caches are destroyed during process teardown and their
+    // deleters call back into this manager. Keep the callback target alive for
+    // process lifetime so static-destruction order cannot invalidate it.
+    static NcclCommResourceManager& instance = *new NcclCommResourceManager();
     return instance;
 }
 
@@ -398,11 +402,16 @@ size_t NcclCommResourceManager::getResourceCount(ncclComm_t comm) const noexcept
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
 
+thread_local std::shared_ptr<NCCLWindowAllocator::ReuseDomain> NCCLWindowAllocator::mActivePreparationDomain;
 thread_local std::unique_ptr<NCCLWindowAllocator::CaptureState> NCCLWindowAllocator::mActiveCapture;
 
 NCCLWindowAllocator& NCCLWindowAllocator::getInstance()
 {
-    static NCCLWindowAllocator instance;
+    // NCCL communicator deleters can invoke registered cleanup after ordinary
+    // function-local statics have begun destruction. Cleanup callbacks capture
+    // this allocator, so it must remain alive through communicator-cache
+    // teardown.
+    static NCCLWindowAllocator& instance = *new NCCLWindowAllocator();
     return instance;
 }
 
@@ -416,6 +425,11 @@ int NCCLWindowAllocator::resolveDevice(int device)
     int currentDevice = -1;
     TLLM_CUDA_CHECK(cudaGetDevice(&currentDevice));
     return currentDevice;
+}
+
+bool NCCLWindowAllocator::isOrderedOnStream(BufferEntry const& entry, cudaStream_t stream)
+{
+    return entry.useStreams.empty() || (entry.useStreams.size() == 1 && entry.useStreams.contains(stream));
 }
 
 uint64_t NCCLWindowAllocator::createReuseDomain(int device)
@@ -435,9 +449,71 @@ uint64_t NCCLWindowAllocator::createReuseDomain(int device)
     return domain->id;
 }
 
+void NCCLWindowAllocator::beginPreparation(uint64_t domainId)
+{
+    TLLM_CHECK_WITH_INFO(!mActivePreparationDomain,
+        "An NCCL window preparation scope is already active on this thread");
+
+    std::shared_ptr<ReuseDomain> domain;
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto const domainIt = mReuseDomains.find(domainId);
+        TLLM_CHECK_WITH_INFO(domainIt != mReuseDomains.end(), "Unknown NCCL window reuse domain %llu",
+            static_cast<unsigned long long>(domainId));
+        domain = domainIt->second;
+        TLLM_CHECK_WITH_INFO(!domain->closing, "NCCL window reuse domain %llu is closing",
+            static_cast<unsigned long long>(domainId));
+    }
+
+    c10::cuda::CUDAGuard deviceGuard(static_cast<c10::DeviceIndex>(domain->device));
+    cudaStream_t const stream = at::cuda::getCurrentCUDAStream(domain->device).stream();
+    TLLM_CHECK_WITH_INFO(stream == domain->replayStream,
+        "NCCL window reuse domain %llu prepares on replay stream %p, not current stream %p",
+        static_cast<unsigned long long>(domainId), static_cast<void*>(domain->replayStream),
+        static_cast<void*>(stream));
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto const domainIt = mReuseDomains.find(domainId);
+        TLLM_CHECK_WITH_INFO(domainIt != mReuseDomains.end() && domainIt->second == domain && !domain->closing,
+            "NCCL window reuse domain %llu closed while preparation was starting",
+            static_cast<unsigned long long>(domainId));
+        auto const currentThread = std::this_thread::get_id();
+        TLLM_CHECK_WITH_INFO(domain->activeScopes == 0 || domain->activeThread == currentThread,
+            "NCCL window reuse domain %llu already has an active scope on another host thread",
+            static_cast<unsigned long long>(domainId));
+        if (domain->activeScopes == 0)
+        {
+            domain->activeThread = currentThread;
+        }
+        ++domain->activeScopes;
+    }
+    mActivePreparationDomain = std::move(domain);
+}
+
+void NCCLWindowAllocator::endPreparation(uint64_t domainId)
+{
+    TLLM_CHECK_WITH_INFO(mActivePreparationDomain && mActivePreparationDomain->id == domainId,
+        "Mismatched NCCL window preparation scope end for domain %llu", static_cast<unsigned long long>(domainId));
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        TLLM_CHECK(mActivePreparationDomain->activeScopes > 0);
+        TLLM_CHECK(mActivePreparationDomain->activeThread == std::this_thread::get_id());
+        --mActivePreparationDomain->activeScopes;
+        if (mActivePreparationDomain->activeScopes == 0)
+        {
+            mActivePreparationDomain->activeThread = std::thread::id{};
+        }
+        mActivePreparationDomain->scopeCv.notify_all();
+    }
+    mActivePreparationDomain.reset();
+}
+
 uint64_t NCCLWindowAllocator::beginCapture(uint64_t domainId)
 {
     TLLM_CHECK_WITH_INFO(!mActiveCapture, "An NCCL window capture scope is already active on this thread");
+    TLLM_CHECK_WITH_INFO(!mActivePreparationDomain || mActivePreparationDomain->id == domainId,
+        "NCCL window capture domain %llu does not match active preparation domain",
+        static_cast<unsigned long long>(domainId));
 
     std::shared_ptr<ReuseDomain> domain;
     {
@@ -455,15 +531,36 @@ uint64_t NCCLWindowAllocator::beginCapture(uint64_t domainId)
     cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
     unsigned long long captureId = 0;
     cudaGraph_t graph = nullptr;
+#if CUDART_VERSION >= 13000
+    TLLM_CUDA_CHECK(cudaStreamGetCaptureInfo(stream, &status, &captureId, &graph, nullptr, nullptr, nullptr));
+#else
     TLLM_CUDA_CHECK(cudaStreamGetCaptureInfo_v2(stream, &status, &captureId, &graph, nullptr, nullptr));
+#endif
     TLLM_CHECK_WITH_INFO(status == cudaStreamCaptureStatusActive && graph != nullptr,
         "NCCL window capture scope must begin inside an active CUDA graph capture");
 
     auto capture = std::make_unique<CaptureState>();
-    capture->domain = std::move(domain);
+    capture->domain = domain;
     capture->captureId = captureId;
     capture->graph = graph;
     capture->captureStream = stream;
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto const domainIt = mReuseDomains.find(domainId);
+        TLLM_CHECK_WITH_INFO(domainIt != mReuseDomains.end() && domainIt->second == domain && !domain->closing,
+            "NCCL window reuse domain %llu closed while capture was starting",
+            static_cast<unsigned long long>(domainId));
+        auto const currentThread = std::this_thread::get_id();
+        TLLM_CHECK_WITH_INFO(domain->activeScopes == 0 || domain->activeThread == currentThread,
+            "NCCL window reuse domain %llu already has an active scope on another host thread",
+            static_cast<unsigned long long>(domainId));
+        if (domain->activeScopes == 0)
+        {
+            domain->activeThread = currentThread;
+        }
+        ++domain->activeScopes;
+    }
+
     mActiveCapture = std::move(capture);
     return captureId;
 }
@@ -477,6 +574,10 @@ void NCCLWindowAllocator::endCapture(uint64_t captureId)
         std::lock_guard<std::mutex> lock(mMutex);
         for (auto* entry : mActiveCapture->touchedEntries)
         {
+            // Captured work is submitted as one graph launch on the domain's
+            // replay lane. Collapse capture-side stream identities to that
+            // lane only after the captured body has finished recording.
+            entry->useStreams.reset(mActiveCapture->domain->replayStream);
             if (entry->inUse && entry->lastCaptureId == captureId)
             {
                 // A lease that survives the captured body may be a graph
@@ -484,6 +585,14 @@ void NCCLWindowAllocator::endCapture(uint64_t captureId)
                 entry->persistent = true;
             }
         }
+        TLLM_CHECK(mActiveCapture->domain->activeScopes > 0);
+        TLLM_CHECK(mActiveCapture->domain->activeThread == std::this_thread::get_id());
+        --mActiveCapture->domain->activeScopes;
+        if (mActiveCapture->domain->activeScopes == 0)
+        {
+            mActiveCapture->domain->activeThread = std::thread::id{};
+        }
+        mActiveCapture->domain->scopeCv.notify_all();
     }
 
     mActiveCapture.reset();
@@ -492,6 +601,8 @@ void NCCLWindowAllocator::endCapture(uint64_t captureId)
 void NCCLWindowAllocator::graphBindingDestructor(void* userData)
 {
     auto* binding = static_cast<GraphBindingRecord*>(userData);
+    // This release-store must be the callback's final access. The host may
+    // reclaim the stable binding record as soon as it observes retirement.
     binding->retired.store(true, std::memory_order_release);
 }
 
@@ -554,9 +665,18 @@ void NCCLWindowAllocator::ensureGraphBindingLocked(CaptureState& capture)
 void NCCLWindowAllocator::touchEntryLocked(BufferEntry& entry, CaptureState& capture)
 {
     auto& domain = *capture.domain;
+    TLLM_CHECK_WITH_INFO(!domain.closing, "NCCL window reuse domain %llu is closing",
+        static_cast<unsigned long long>(domain.id));
     TLLM_CHECK_WITH_INFO(entry.domainId == 0 || entry.domainId == domain.id,
         "NCCL window buffer %p belongs to reuse domain %llu, not active domain %llu", entry.buffer.ptr,
         static_cast<unsigned long long>(entry.domainId), static_cast<unsigned long long>(domain.id));
+    if (entry.lastCaptureId != capture.captureId && isOrderedOnStream(entry, domain.replayStream))
+    {
+        // The capture wrapper establishes replay-lane -> capture-stream
+        // ordering. Publish that known edge on first touch so later reuse in
+        // this same capture remains the single-stream fast path.
+        entry.useStreams.reset(capture.captureStream);
+    }
     ensureGraphBindingLocked(capture);
     entry.domainId = domain.id;
     entry.lastCaptureId = capture.captureId;
@@ -567,21 +687,100 @@ void NCCLWindowAllocator::touchEntryLocked(BufferEntry& entry, CaptureState& cap
     }
 }
 
-void NCCLWindowAllocator::retainCommForActiveCapture(std::shared_ptr<ncclComm_t> const& comm)
+void NCCLWindowAllocator::retainCommForActiveDomain(std::shared_ptr<ncclComm_t> const& comm)
 {
-    if (!mActiveCapture || !comm || !*comm)
+    if ((!mActiveCapture && !mActivePreparationDomain) || !comm || !*comm)
     {
         return;
     }
     std::lock_guard<std::mutex> lock(mMutex);
-    mActiveCapture->domain->commOwners.try_emplace(*comm, comm);
+    auto& domain = mActiveCapture ? mActiveCapture->domain : mActivePreparationDomain;
+    TLLM_CHECK_WITH_INFO(!domain->closing, "NCCL window reuse domain %llu is closing",
+        static_cast<unsigned long long>(domain->id));
+    domain->commOwners.try_emplace(*comm, comm);
+}
+
+void NCCLWindowAllocator::quiesceReuseDomain(uint64_t domainId)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    auto const domainIt = mReuseDomains.find(domainId);
+    if (domainIt != mReuseDomains.end())
+    {
+        domainIt->second->closing = true;
+    }
+}
+
+void NCCLWindowAllocator::recordStreamJoin(uint64_t domainId, cudaStream_t sourceStream)
+{
+    auto const activeDomain = mActiveCapture ? mActiveCapture->domain : mActivePreparationDomain;
+    TLLM_CHECK_WITH_INFO(activeDomain && activeDomain->id == domainId,
+        "NCCL window stream joins require active domain %llu", static_cast<unsigned long long>(domainId));
+
+    c10::cuda::CUDAGuard deviceGuard(static_cast<c10::DeviceIndex>(activeDomain->device));
+    cudaStream_t const destinationStream = at::cuda::getCurrentCUDAStream(activeDomain->device).stream();
+    if (sourceStream == destinationStream)
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(mMutex);
+    TLLM_CHECK_WITH_INFO(!activeDomain->closing, "NCCL window reuse domain %llu is closing",
+        static_cast<unsigned long long>(domainId));
+    for (auto& [poolKey, entries] : mBufferPool)
+    {
+        if (poolKey.device != activeDomain->device)
+        {
+            continue;
+        }
+        for (auto& entry : entries)
+        {
+            if (entry->domainId == domainId)
+            {
+                entry->useStreams.join(sourceStream, destinationStream);
+            }
+        }
+    }
+}
+
+void NCCLWindowAllocator::recordBufferStreamJoin(
+    ncclComm_t comm, void* ptr, int device, uint64_t generation, cudaStream_t sourceStream)
+{
+    TLLM_CHECK_WITH_INFO(comm != nullptr && ptr != nullptr,
+        "A communicator and buffer pointer are required to record an NCCL window stream join");
+    device = resolveDevice(device);
+    c10::cuda::CUDAGuard deviceGuard(static_cast<c10::DeviceIndex>(device));
+    cudaStream_t const destinationStream = at::cuda::getCurrentCUDAStream(device).stream();
+
+    std::lock_guard<std::mutex> lock(mMutex);
+    PoolKey const poolKey{comm, device};
+    TLLM_CHECK_WITH_INFO(mClosingPools.find(poolKey) == mClosingPools.end(),
+        "NCCL window pool for comm %p on device %d is closing", static_cast<void*>(comm), device);
+    auto const commIt = mBufferPool.find(poolKey);
+    TLLM_CHECK_WITH_INFO(commIt != mBufferPool.end(),
+        "Unknown NCCL window pool for comm %p on device %d", static_cast<void*>(comm), device);
+    auto const entryIt = std::find_if(commIt->second.begin(), commIt->second.end(),
+        [ptr](auto const& entry) { return entry->buffer.ptr == ptr; });
+    TLLM_CHECK_WITH_INFO(entryIt != commIt->second.end(),
+        "Unknown NCCL window buffer %p for comm %p on device %d", ptr, static_cast<void*>(comm), device);
+    auto& entry = **entryIt;
+    TLLM_CHECK_WITH_INFO(entry.inUse && entry.generation == generation,
+        "Stale NCCL window stream join for buffer %p: generation=%llu, active generation=%llu, in_use=%d", ptr,
+        static_cast<unsigned long long>(generation), static_cast<unsigned long long>(entry.generation),
+        entry.inUse ? 1 : 0);
+    entry.useStreams.join(sourceStream, destinationStream);
 }
 
 void NCCLWindowAllocator::closeReuseDomain(uint64_t domainId)
 {
     std::shared_ptr<ReuseDomain> domain;
+    std::unordered_set<cudaStream_t> useStreams;
     {
-        std::lock_guard<std::mutex> lock(mMutex);
+        TLLM_CHECK_WITH_INFO(
+            (!mActiveCapture || mActiveCapture->domain->id != domainId)
+                && (!mActivePreparationDomain || mActivePreparationDomain->id != domainId),
+            "Cannot close NCCL window reuse domain %llu from one of its active scopes",
+            static_cast<unsigned long long>(domainId));
+        std::unique_lock<std::mutex> lock(mMutex);
         auto const domainIt = mReuseDomains.find(domainId);
         if (domainIt == mReuseDomains.end())
         {
@@ -589,22 +788,59 @@ void NCCLWindowAllocator::closeReuseDomain(uint64_t domainId)
         }
         domain = domainIt->second;
         domain->closing = true;
+        domain->scopeCv.wait(lock, [&domain] { return domain->activeScopes == 0; });
+        useStreams.insert(domain->replayStream);
+        for (auto const& [poolKey, entries] : mBufferPool)
+        {
+            if (poolKey.device != domain->device)
+            {
+                continue;
+            }
+            for (auto const& entry : entries)
+            {
+                if (entry->domainId == domainId)
+                {
+                    TLLM_CHECK_WITH_INFO(!entry->inUse,
+                        "NCCL window reuse domain %llu still has a live tensor lease for buffer %p",
+                        static_cast<unsigned long long>(domainId), entry->buffer.ptr);
+                    if (entry->useStreams.hasPrimary)
+                    {
+                        useStreams.insert(entry->useStreams.primary);
+                        useStreams.insert(
+                            entry->useStreams.additionalStreams.begin(), entry->useStreams.additionalStreams.end());
+                    }
+                }
+            }
+        }
     }
 
     c10::cuda::CUDAGuard deviceGuard(static_cast<c10::DeviceIndex>(domain->device));
-    TLLM_CUDA_CHECK(cudaStreamSynchronize(domain->replayStream));
-
-    constexpr size_t maxRetirementYields = 100000;
-    for (size_t attempt = 0; attempt < maxRetirementYields; ++attempt)
+    for (auto stream : useStreams)
     {
+        // nullptr is the real CUDA legacy/default stream and must be drained.
+        TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
+    // CUDA user-object destructors cannot call CUDA APIs. Poll the callback's
+    // final atomic publication from ordinary host code until every graph and
+    // graph exec has dropped its reference.
+    auto const retirementDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    for (;;)
+    {
+        size_t remainingBindings = 0;
         {
             std::lock_guard<std::mutex> lock(mMutex);
             drainRetiredBindingsLocked(*domain);
-            if (domain->liveBindings == 0)
-            {
-                break;
-            }
+            remainingBindings = domain->liveBindings;
         }
+        if (remainingBindings == 0)
+        {
+            break;
+        }
+        TLLM_CHECK_WITH_INFO(std::chrono::steady_clock::now() < retirementDeadline,
+            "Timed out waiting for %zu CUDA graph binding(s) to retire from NCCL window reuse domain %llu; "
+            "the domain remains closed and its registered storage remains pinned",
+            remainingBindings, static_cast<unsigned long long>(domainId));
         std::this_thread::yield();
     }
 
@@ -631,7 +867,9 @@ void NCCLWindowAllocator::closeReuseDomain(uint64_t domainId)
                 entry->domainId = 0;
                 entry->lastCaptureId = 0;
                 entry->persistent = false;
-                entry->homeStream = domain->replayStream;
+                // Every recorded frontier was synchronized above. The arena
+                // is now safe to adopt from any later stream or graph domain.
+                entry->useStreams.clear();
             }
         }
 
@@ -658,21 +896,45 @@ NCCLWindowLease NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size,
 
     std::lock_guard<std::mutex> lock(mMutex);
 
+    PoolKey const poolKey{comm, device};
+    TLLM_CHECK_WITH_INFO(mClosingPools.find(poolKey) == mClosingPools.end(),
+        "NCCL window pool for comm %p on device %d is closing", static_cast<void*>(comm), device);
+
     // Register cleanup callback for this communicator if not already registered
     // This is cheap even if no buffers exist yet - cleanup will just return early
     registerBufferCleanup(comm, device);
 
     // Check if we have an available buffer of at least the requested size for this communicator
     // Use best-fit: find the smallest buffer that's >= requested size
-    PoolKey const poolKey{comm, device};
     auto& commBuffers = mBufferPool[poolKey];
     cudaStream_t const currentStream = at::cuda::getCurrentCUDAStream(device).stream();
     CaptureState* const capture = mActiveCapture.get();
+    ReuseDomain* const preparation = capture ? nullptr : mActivePreparationDomain.get();
+#ifndef NDEBUG
+    if (!capture)
+    {
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        auto const captureErr = cudaStreamIsCapturing(currentStream, &status);
+        TLLM_CHECK_WITH_INFO(captureErr == cudaSuccess && status == cudaStreamCaptureStatusNone,
+            "An untracked CUDA graph capture attempted to acquire an NCCL window. "
+            "Wrap every production capture in NCCLWindowReuseDomain.capture().");
+    }
+#endif
     if (capture)
     {
         TLLM_CHECK_WITH_INFO(capture->domain->device == device,
             "NCCL window reuse domain %llu belongs to device %d, but allocation requested device %d",
             static_cast<unsigned long long>(capture->domain->id), capture->domain->device, device);
+        TLLM_CHECK_WITH_INFO(!capture->domain->closing, "NCCL window reuse domain %llu is closing",
+            static_cast<unsigned long long>(capture->domain->id));
+    }
+    if (preparation)
+    {
+        TLLM_CHECK_WITH_INFO(preparation->device == device,
+            "NCCL window reuse domain %llu belongs to device %d, but preparation requested device %d",
+            static_cast<unsigned long long>(preparation->id), preparation->device, device);
+        TLLM_CHECK_WITH_INFO(!preparation->closing, "NCCL window reuse domain %llu is closing",
+            static_cast<unsigned long long>(preparation->id));
     }
     for (auto& [domainId, domain] : mReuseDomains)
     {
@@ -688,15 +950,27 @@ NCCLWindowLease NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size,
         bool eligible = false;
         if (capture)
         {
-            bool const unbound = entry.domainId == 0;
+            // PyTorch orders entry into capture from the caller's replay lane.
+            // An unbound buffer last used on any other stream has no proven
+            // happens-before edge into this graph and cannot be adopted.
+            bool const unboundOrdered = entry.domainId == 0
+                && isOrderedOnStream(entry, capture->domain->replayStream);
             bool const sameDomainScratch = entry.domainId == capture->domain->id && !entry.persistent;
-            bool const sameCaptureOrdered
-                = entry.lastCaptureId != capture->captureId || entry.homeStream == currentStream;
-            eligible = unbound || (sameDomainScratch && sameCaptureOrdered);
+            bool const sameCaptureOrdered = entry.lastCaptureId == capture->captureId
+                ? isOrderedOnStream(entry, currentStream)
+                : isOrderedOnStream(entry, capture->domain->replayStream);
+            eligible = unboundOrdered || (sameDomainScratch && sameCaptureOrdered);
+        }
+        else if (preparation)
+        {
+            bool const unbound = entry.domainId == 0;
+            bool const sameDomainScratch = entry.domainId == preparation->id && !entry.persistent;
+            bool const streamOrdered = isOrderedOnStream(entry, currentStream);
+            eligible = (unbound || sameDomainScratch) && streamOrdered;
         }
         else
         {
-            bool const streamOrdered = entry.homeStream == nullptr || entry.homeStream == currentStream;
+            bool const streamOrdered = isOrderedOnStream(entry, currentStream);
             eligible = entry.domainId == 0 && streamOrdered;
         }
         if (!entry.inUse && eligible && entry.buffer.size >= size && entry.buffer.size < bestFitSize)
@@ -713,15 +987,19 @@ NCCLWindowLease NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size,
         {
             touchEntryLocked(entry, *capture);
         }
+        else if (preparation)
+        {
+            entry.domainId = preparation->id;
+        }
         entry.inUse = true;
         ++entry.generation;
-        entry.homeStream = currentStream;
+        entry.useStreams.reset(currentStream);
         TLLM_LOG_TRACE(
             "[NCCLUtil] Reusing NCCL window buffer for comm %p on device %d: "
             "handle=%d, ptr=%p, size=%zu, generation=%llu (requested: %zu)",
             static_cast<void*>(comm), device, entry.buffer.handle, entry.buffer.ptr, entry.buffer.size,
             static_cast<unsigned long long>(entry.generation), size);
-        return NCCLWindowLease(entry.buffer, entry.generation, entry.homeStream);
+        return NCCLWindowLease(entry.buffer, entry.generation, currentStream);
     }
 
     // If a previous allocateAndRegisterBuffer call collectively failed for this comm at a size
@@ -763,7 +1041,12 @@ NCCLWindowLease NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size,
     // permanently "in use" empty entry per request because releaseBuffer is a no-op for nullptr.
     if (buffer.isValid())
     {
-        commBuffers.push_back(std::make_unique<BufferEntry>(BufferEntry{buffer, true, 1, currentStream}));
+        BufferEntry entry{buffer, true, 1, StreamUseFrontier(currentStream)};
+        if (preparation)
+        {
+            entry.domainId = preparation->id;
+        }
+        commBuffers.push_back(std::make_unique<BufferEntry>(std::move(entry)));
     }
     else
     {
@@ -800,7 +1083,8 @@ cudaError_t NCCLWindowAllocator::clearCudaErrorIfSymmetricAllocationFailed(
     return cudaSuccess;
 }
 
-NCCLWindowBuffer NCCLWindowAllocator::searchBuffer(ncclComm_t comm, void* ptr, int device)
+NCCLWindowBuffer NCCLWindowAllocator::searchBuffer(
+    ncclComm_t comm, void* ptr, int device, bool recordStreamUse)
 {
     if (!comm || !ptr)
     {
@@ -810,11 +1094,27 @@ NCCLWindowBuffer NCCLWindowAllocator::searchBuffer(ncclComm_t comm, void* ptr, i
     device = resolveDevice(device);
     c10::cuda::CUDAGuard deviceGuard(static_cast<c10::DeviceIndex>(device));
     std::lock_guard<std::mutex> lock(mMutex);
-    auto commIt = mBufferPool.find(PoolKey{comm, device});
+    PoolKey const poolKey{comm, device};
+    if (mClosingPools.find(poolKey) != mClosingPools.end())
+    {
+        return NCCLWindowBuffer();
+    }
+    auto commIt = mBufferPool.find(poolKey);
     if (commIt == mBufferPool.end())
     {
         return NCCLWindowBuffer();
     }
+    cudaStream_t const currentStream = at::cuda::getCurrentCUDAStream(device).stream();
+#ifndef NDEBUG
+    if (!mActiveCapture)
+    {
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        auto const captureErr = cudaStreamIsCapturing(currentStream, &status);
+        TLLM_CHECK_WITH_INFO(captureErr == cudaSuccess && status == cudaStreamCaptureStatusNone,
+            "An untracked CUDA graph capture attempted to use an NCCL window. "
+            "Wrap every production capture in NCCLWindowReuseDomain.capture().");
+    }
+#endif
     for (auto const& entry : commIt->second)
     {
         if (entry->buffer.ptr == ptr)
@@ -825,7 +1125,67 @@ NCCLWindowBuffer NCCLWindowAllocator::searchBuffer(ncclComm_t comm, void* ptr, i
                     "NCCL window reuse domain %llu belongs to device %d, but buffer lookup used device %d",
                     static_cast<unsigned long long>(mActiveCapture->domain->id), mActiveCapture->domain->device,
                     device);
+                TLLM_CHECK_WITH_INFO(
+                    entry->domainId == mActiveCapture->domain->id
+                        || (entry->domainId == 0
+                            && isOrderedOnStream(*entry, mActiveCapture->domain->replayStream)),
+                    "NCCL window buffer %p has no ordered path into capture domain %llu",
+                    entry->buffer.ptr, static_cast<unsigned long long>(mActiveCapture->domain->id));
+                TLLM_CHECK_WITH_INFO(
+                    entry->lastCaptureId == mActiveCapture->captureId
+                        || isOrderedOnStream(*entry, mActiveCapture->domain->replayStream),
+                    "NCCL window buffer %p has outstanding use outside capture domain %llu's replay lane",
+                    entry->buffer.ptr, static_cast<unsigned long long>(mActiveCapture->domain->id));
                 touchEntryLocked(*entry, *mActiveCapture);
+            }
+            else if (mActivePreparationDomain)
+            {
+                TLLM_CHECK_WITH_INFO(mActivePreparationDomain->device == device,
+                    "NCCL window reuse domain %llu belongs to device %d, but buffer lookup used device %d",
+                    static_cast<unsigned long long>(mActivePreparationDomain->id), mActivePreparationDomain->device,
+                    device);
+                TLLM_CHECK_WITH_INFO(!mActivePreparationDomain->closing,
+                    "NCCL window reuse domain %llu is closing",
+                    static_cast<unsigned long long>(mActivePreparationDomain->id));
+                TLLM_CHECK_WITH_INFO(entry->domainId == 0 || entry->domainId == mActivePreparationDomain->id,
+                    "NCCL window buffer %p belongs to reuse domain %llu, not preparation domain %llu",
+                    entry->buffer.ptr, static_cast<unsigned long long>(entry->domainId),
+                    static_cast<unsigned long long>(mActivePreparationDomain->id));
+                TLLM_CHECK_WITH_INFO(isOrderedOnStream(*entry, currentStream),
+                    "NCCL window buffer %p has outstanding use on another stream before preparation domain %llu",
+                    entry->buffer.ptr, static_cast<unsigned long long>(mActivePreparationDomain->id));
+                entry->domainId = mActivePreparationDomain->id;
+            }
+            else if (entry->domainId != 0)
+            {
+                auto const domainIt = mReuseDomains.find(entry->domainId);
+                TLLM_CHECK_WITH_INFO(domainIt != mReuseDomains.end(),
+                    "NCCL window buffer %p refers to unknown reuse domain %llu", entry->buffer.ptr,
+                    static_cast<unsigned long long>(entry->domainId));
+                TLLM_CHECK_WITH_INFO(!domainIt->second->closing,
+                    "NCCL window reuse domain %llu is closing while buffer %p is still being consumed",
+                    static_cast<unsigned long long>(entry->domainId), entry->buffer.ptr);
+                if (domainIt->second->device != device || domainIt->second->replayStream != currentStream
+                    || !isOrderedOnStream(*entry, currentStream))
+                {
+                    // Same-lane eager work is serialized with graph launches
+                    // by stream order. Foreign lanes must use plain NCCL while
+                    // a graph can still replay this registered address.
+                    if (recordStreamUse)
+                    {
+                        // The caller falls back to a non-window operation but
+                        // still reads this address on currentStream. Keep that
+                        // consumer in the teardown/reuse frontier.
+                        entry->useStreams.add(currentStream);
+                    }
+                    return NCCLWindowBuffer();
+                }
+            }
+            if (recordStreamUse)
+            {
+                // Preserve every unordered consumer. An explicit event join
+                // can later collapse a source stream into its destination.
+                entry->useStreams.add(currentStream);
             }
             return entry->buffer;
         }
@@ -874,10 +1234,12 @@ void NCCLWindowAllocator::releaseBuffer(ncclComm_t comm, void* ptr, int device, 
                 return;
             }
             entry.inUse = false;
+            cudaStream_t const stream = entry.useStreams.size() == 1 ? entry.useStreams.primary : nullptr;
             TLLM_LOG_TRACE(
-                "[NCCLUtil] Released NCCL window buffer for comm %p on device %d: ptr=%p, generation=%llu, stream=%p",
+                "[NCCLUtil] Released NCCL window buffer for comm %p on device %d: "
+                "ptr=%p, generation=%llu, frontier_streams=%zu, sole_stream=%p",
                 static_cast<void*>(comm), device, ptr, static_cast<unsigned long long>(entry.generation),
-                static_cast<void*>(entry.homeStream));
+                entry.useStreams.size(), static_cast<void*>(stream));
             return;
         }
     }
@@ -1055,8 +1417,16 @@ void NCCLWindowAllocator::registerBufferCleanup(ncclComm_t comm, int device)
     mRegisteredPools.insert(poolKey);
 
     // Register cleanup with the resource manager
-    NcclCommResourceManager::getInstance().registerResource(
-        comm, [this, comm, device]() { this->cleanupBuffersForComm(comm, device); }, "NCCLWindowAllocator");
+    try
+    {
+        NcclCommResourceManager::getInstance().registerResource(
+            comm, [this, comm, device]() { this->cleanupBuffersForComm(comm, device); }, "NCCLWindowAllocator");
+    }
+    catch (...)
+    {
+        mRegisteredPools.erase(poolKey);
+        throw;
+    }
 }
 
 void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm, int device)
@@ -1071,8 +1441,10 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm, int device)
     std::vector<cudaStream_t> streams;
     {
         std::lock_guard<std::mutex> lock(mMutex);
+        mClosingPools.insert(poolKey);
         if (mRegisteredPools.find(poolKey) == mRegisteredPools.end())
         {
+            mClosingPools.erase(poolKey);
             return;
         }
 
@@ -1081,6 +1453,7 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm, int device)
         {
             mRegisteredPools.erase(poolKey);
             mMinSymmetricFailureSize.erase(poolKey);
+            mClosingPools.erase(poolKey);
             return;
         }
 
@@ -1091,9 +1464,11 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm, int device)
         {
             liveLeaseCount += entry->inUse ? 1 : 0;
             graphOwnedCount += entry->domainId != 0 ? 1 : 0;
-            if (entry->homeStream != nullptr)
+            if (entry->useStreams.hasPrimary)
             {
-                uniqueStreams.insert(entry->homeStream);
+                uniqueStreams.insert(entry->useStreams.primary);
+                uniqueStreams.insert(
+                    entry->useStreams.additionalStreams.begin(), entry->useStreams.additionalStreams.end());
             }
         }
         if (liveLeaseCount != 0 || graphOwnedCount != 0)
@@ -1118,9 +1493,13 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm, int device)
         cudaError_t const cudaErr = cudaStreamSynchronize(stream);
         if (cudaErr != cudaSuccess)
         {
-            TLLM_LOG_WARNING(
-                "[NCCLUtil] cudaStreamSynchronize failed with error %d before cleanup for comm %p, stream %p",
+            // Fail closed. Deregistering after a failed completion proof could
+            // expose device work to freed or repurposed storage.
+            TLLM_LOG_ERROR(
+                "[NCCLUtil] Refusing NCCL window cleanup after cudaStreamSynchronize failed with "
+                "error %d for comm %p, stream %p",
                 cudaErr, static_cast<void*>(comm), static_cast<void*>(stream));
+            return;
         }
     }
 
@@ -1128,6 +1507,23 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm, int device)
     auto commIt = mBufferPool.find(poolKey);
     if (commIt == mBufferPool.end())
     {
+        mClosingPools.erase(poolKey);
+        return;
+    }
+
+    size_t liveLeaseCount = 0;
+    size_t graphOwnedCount = 0;
+    for (auto const& entry : commIt->second)
+    {
+        liveLeaseCount += entry->inUse ? 1 : 0;
+        graphOwnedCount += entry->domainId != 0 ? 1 : 0;
+    }
+    if (liveLeaseCount != 0 || graphOwnedCount != 0)
+    {
+        TLLM_LOG_ERROR(
+            "[NCCLUtil] Refusing to free comm %p window storage after teardown synchronization with %zu live "
+            "lease(s) and %zu graph-owned buffer(s)",
+            static_cast<void*>(comm), liveLeaseCount, graphOwnedCount);
         return;
     }
 
@@ -1182,6 +1578,7 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm, int device)
     mBufferPool.erase(commIt);
     mRegisteredPools.erase(poolKey);
     mMinSymmetricFailureSize.erase(poolKey);
+    mClosingPools.erase(poolKey);
 }
 
 #endif // NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)

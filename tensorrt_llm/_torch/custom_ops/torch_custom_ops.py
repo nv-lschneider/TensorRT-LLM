@@ -35,6 +35,9 @@ from tensorrt_llm.quantization.utils import fp8_quantize
 from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
                          TuningConfig)
+from ..cuda_graph_utils import (
+    get_active_nccl_window_reuse_domain_id,
+    register_nccl_window_reuse_domain_retire_callback)
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
@@ -2138,6 +2141,17 @@ class AllReduceRunner(TunableRunner):
         )
 
     @classmethod
+    def discard_preallocation_domain(cls, domain_id: int) -> None:
+        """Forget host capacity records after the native arena is retired."""
+        with cls._prealloc_lock:
+            stale_keys = [
+                key for key in cls._prealloc_capacity
+                if len(key) >= 3 and key[2] == domain_id
+            ]
+            for key in stale_keys:
+                del cls._prealloc_capacity[key]
+
+    @classmethod
     def _maybe_preallocate_buffers(cls,
                                    input_tensor: torch.Tensor,
                                    group: List[int],
@@ -2166,7 +2180,12 @@ class AllReduceRunner(TunableRunner):
         slot_count = 2
         group_key = tuple(group)
         device_key = (input_tensor.device.type, input_tensor.device.index)
-        cache_key = (device_key, group_key)
+        # Graph-bound arenas are unavailable to foreign replay domains even
+        # when device/group/capacity match. Preparation exposes the owner
+        # domain before warmup so a second runner cannot incorrectly skip its
+        # own capacity reservation.
+        domain_id = get_active_nccl_window_reuse_domain_id()
+        cache_key = (device_key, group_key, domain_id)
         with cls._prealloc_lock:
             prepared_capacities = cls._prealloc_capacity.setdefault(
                 cache_key, [])
@@ -2274,6 +2293,10 @@ class AllReduceRunner(TunableRunner):
             self.eps,
             self.trigger_completion_at_end,
         )
+
+
+register_nccl_window_reuse_domain_retire_callback(
+    AllReduceRunner.discard_preallocation_domain)
 
 
 @torch.library.register_fake("trtllm::preallocate_nccl_window_buffer")
@@ -2398,6 +2421,7 @@ def _(
     op: int,
     eps: float,
     trigger_completion_at_end: bool,
+    minimum_window_bytes: int,
 ) -> List[torch.Tensor]:
     if op == int(AllReduceFusionOp.NONE):
         return [torch.empty_like(input)]

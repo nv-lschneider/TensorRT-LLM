@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -39,6 +40,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -248,11 +250,14 @@ public:
     // If an unused buffer of at least the requested size exists for this communicator, it will be reused.
     // Uses best-fit strategy: selects the smallest available buffer that meets the size requirement.
     // Otherwise, a new buffer is allocated and registered.
+    // CUDA graph callers must enter beginCapture/endCapture so graph lifetime
+    // can be bound without a capture-status query on the release fast path.
     NCCLWindowLease requestBuffer(ncclComm_t comm, size_t size, int device = -1);
 
     // Search for a buffer by pointer. Returns an invalid buffer if not found.
     // This matches the UBManager.search_buffer() interface.
-    NCCLWindowBuffer searchBuffer(ncclComm_t comm, void* ptr, int device = -1);
+    NCCLWindowBuffer searchBuffer(
+        ncclComm_t comm, void* ptr, int device = -1, bool recordStreamUse = false);
 
     // Release a buffer back to the pool for potential reuse
     // Release is conditional on the exact logical lease generation.
@@ -285,16 +290,29 @@ public:
     // Begin/end a graph capture scope for an existing serial domain. begin
     // must run after CUDA capture has started so the active cudaGraph_t can be
     // obtained and retained.
+    void beginPreparation(uint64_t domainId);
+    void endPreparation(uint64_t domainId);
     uint64_t beginCapture(uint64_t domainId);
     void endCapture(uint64_t captureId);
 
+    // Stop new preparation, capture, and allocation work before the owner
+    // starts resetting graphs in this domain.
+    void quiesceReuseDomain(uint64_t domainId);
+
     // Close a domain after its graph execs have been reset. This synchronizes
-    // the teardown-only replay lane and returns its arena to the eager pool.
+    // every recorded use frontier and returns its arena to the eager pool.
     void closeReuseDomain(uint64_t domainId);
 
-    // Keep a communicator alive while the active graph domain owns window
-    // addresses from it. This is a no-op outside a window capture scope.
-    void retainCommForActiveCapture(std::shared_ptr<ncclComm_t> const& comm);
+    // A trusted caller invokes these after it has enqueued an explicit CUDA
+    // event dependency from sourceStream into the current stream. They only
+    // publish that existing ordering proof; they do not enqueue CUDA work.
+    void recordStreamJoin(uint64_t domainId, cudaStream_t sourceStream);
+    void recordBufferStreamJoin(
+        ncclComm_t comm, void* ptr, int device, uint64_t generation, cudaStream_t sourceStream);
+
+    // Keep a communicator alive while the active preparation/capture domain
+    // owns window addresses from it. This is a no-op outside a domain scope.
+    void retainCommForActiveDomain(std::shared_ptr<ncclComm_t> const& comm);
 
     // Check if a communicator is valid (non-null)
     // Note: We don't track cleaned-up comms because NCCL can reuse memory addresses.
@@ -333,12 +351,112 @@ private:
     // Cleanup all buffers for a specific communicator
     void cleanupBuffersForComm(ncclComm_t comm, int device);
 
+    // Inline the normal one-stream case. additionalStreams allocates only
+    // after a genuinely unordered cross-stream consumer is observed.
+    struct StreamUseFrontier
+    {
+        bool hasPrimary{false};
+        cudaStream_t primary{nullptr};
+        std::vector<cudaStream_t> additionalStreams;
+
+        StreamUseFrontier() = default;
+
+        explicit StreamUseFrontier(cudaStream_t stream)
+            : hasPrimary(true)
+            , primary(stream)
+        {
+        }
+
+        [[nodiscard]] bool empty() const noexcept
+        {
+            return !hasPrimary;
+        }
+
+        [[nodiscard]] size_t size() const noexcept
+        {
+            return (hasPrimary ? 1 : 0) + additionalStreams.size();
+        }
+
+        [[nodiscard]] bool contains(cudaStream_t stream) const
+        {
+            return hasPrimary && (primary == stream
+                || std::find(additionalStreams.begin(), additionalStreams.end(), stream)
+                    != additionalStreams.end());
+        }
+
+        void reset(cudaStream_t stream)
+        {
+            hasPrimary = true;
+            primary = stream;
+            additionalStreams.clear();
+        }
+
+        void clear()
+        {
+            hasPrimary = false;
+            primary = nullptr;
+            additionalStreams.clear();
+        }
+
+        void add(cudaStream_t stream)
+        {
+            if (!hasPrimary)
+            {
+                reset(stream);
+            }
+            else if (!contains(stream))
+            {
+                additionalStreams.push_back(stream);
+            }
+        }
+
+        bool join(cudaStream_t source, cudaStream_t destination)
+        {
+            if (!hasPrimary || source == destination)
+            {
+                return false;
+            }
+
+            bool removed = false;
+            if (primary == source)
+            {
+                removed = true;
+                if (additionalStreams.empty())
+                {
+                    hasPrimary = false;
+                }
+                else
+                {
+                    primary = additionalStreams.back();
+                    additionalStreams.pop_back();
+                }
+            }
+            else
+            {
+                auto const it = std::find(additionalStreams.begin(), additionalStreams.end(), source);
+                if (it != additionalStreams.end())
+                {
+                    *it = additionalStreams.back();
+                    additionalStreams.pop_back();
+                    removed = true;
+                }
+            }
+            if (removed)
+            {
+                add(destination);
+            }
+            return removed;
+        }
+    };
+
     struct BufferEntry
     {
         NCCLWindowBuffer buffer;
         bool inUse;
         uint64_t generation;
-        cudaStream_t homeStream;
+        // Empty means no device use has been observed. A nullptr element is
+        // the real CUDA legacy/default stream, not an uninitialized sentinel.
+        StreamUseFrontier useStreams;
         uint64_t domainId{0};
         uint64_t lastCaptureId{0};
         bool persistent{false};
@@ -357,9 +475,12 @@ private:
         int device{-1};
         cudaStream_t replayStream{nullptr};
         bool closing{false};
+        size_t activeScopes{0};
+        std::thread::id activeThread;
         size_t liveBindings{0};
         std::vector<std::unique_ptr<GraphBindingRecord>> bindings;
         std::unordered_map<ncclComm_t, std::shared_ptr<ncclComm_t>> commOwners;
+        std::condition_variable scopeCv;
     };
 
     struct CaptureState
@@ -393,6 +514,7 @@ private:
     };
 
     static int resolveDevice(int device);
+    static bool isOrderedOnStream(BufferEntry const& entry, cudaStream_t stream);
     static void graphBindingDestructor(void* userData);
     void ensureGraphBindingLocked(CaptureState& capture);
     void touchEntryLocked(BufferEntry& entry, CaptureState& capture);
@@ -401,12 +523,17 @@ private:
     mutable std::mutex mMutex;
     std::unordered_map<PoolKey, std::vector<std::unique_ptr<BufferEntry>>, PoolKeyHash> mBufferPool;
     std::unordered_set<PoolKey, PoolKeyHash> mRegisteredPools;
+    // A communicator cleanup callback has started for these exact pools.
+    // Acquisitions and use registration are rejected while teardown drains
+    // their recorded streams and deregisters storage.
+    std::unordered_set<PoolKey, PoolKeyHash> mClosingPools;
     // Smallest request size that is known to fail collectively for each communicator.
     // Requests below the recorded size may still succeed and already-pooled buffers are always
     // reused before consulting this cache.
     std::unordered_map<PoolKey, size_t, PoolKeyHash> mMinSymmetricFailureSize;
     std::unordered_map<uint64_t, std::shared_ptr<ReuseDomain>> mReuseDomains;
     std::atomic<uint64_t> mNextDomainId{1};
+    static thread_local std::shared_ptr<ReuseDomain> mActivePreparationDomain;
     static thread_local std::unique_ptr<CaptureState> mActiveCapture;
 };
 
@@ -503,7 +630,7 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
 
     try
     {
-        allocator.retainCommForActiveCapture(comm);
+        allocator.retainCommForActiveDomain(comm);
         lease = allocator.requestBuffer(*comm, buffer_size, device.index());
     }
     catch (std::exception const& e)
@@ -539,10 +666,20 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
         }
     };
 
-    // Create tensor from the buffer
-    auto tensor = torch::from_blob(lease.ptr, shape, strides_vec, deleter, torch::dtype(dtype).device(device));
-
-    return std::make_pair(tensor, static_cast<NCCLWindowBuffer const&>(lease));
+    try
+    {
+        // Once construction succeeds, tensor storage owns the exact
+        // generation through deleter.
+        auto tensor = torch::from_blob(lease.ptr, shape, strides_vec, deleter, torch::dtype(dtype).device(device));
+        return std::make_pair(tensor, static_cast<NCCLWindowBuffer const&>(lease));
+    }
+    catch (...)
+    {
+        // from_blob has not installed deleter, so return the transient lease
+        // explicitly instead of leaving this entry permanently in use.
+        allocator.releaseBuffer(*comm, lease);
+        throw;
+    }
 }
 
 inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(

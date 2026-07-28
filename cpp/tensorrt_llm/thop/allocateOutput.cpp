@@ -30,6 +30,7 @@
 
 #include <torch/extension.h>
 
+#include <cstdint>
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -72,12 +73,51 @@ int64_t beginNcclWindowCapture(int64_t domainId)
 #endif
 }
 
+void beginNcclWindowPreparation(int64_t domainId)
+{
+#if ENABLE_MULTI_DEVICE && NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+    common::nccl_util::NCCLWindowAllocator::getInstance().beginPreparation(static_cast<uint64_t>(domainId));
+#else
+    (void) domainId;
+#endif
+}
+
+void endNcclWindowPreparation(int64_t domainId)
+{
+#if ENABLE_MULTI_DEVICE && NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+    common::nccl_util::NCCLWindowAllocator::getInstance().endPreparation(static_cast<uint64_t>(domainId));
+#else
+    (void) domainId;
+#endif
+}
+
 void endNcclWindowCapture(int64_t captureId)
 {
 #if ENABLE_MULTI_DEVICE && NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
     common::nccl_util::NCCLWindowAllocator::getInstance().endCapture(static_cast<uint64_t>(captureId));
 #else
     (void) captureId;
+#endif
+}
+
+void quiesceNcclWindowReuseDomain(int64_t domainId)
+{
+#if ENABLE_MULTI_DEVICE && NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+    common::nccl_util::NCCLWindowAllocator::getInstance().quiesceReuseDomain(static_cast<uint64_t>(domainId));
+#else
+    (void) domainId;
+#endif
+}
+
+void recordNcclWindowStreamJoin(int64_t domainId, int64_t sourceStream)
+{
+#if ENABLE_MULTI_DEVICE && NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+    auto stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(sourceStream));
+    common::nccl_util::NCCLWindowAllocator::getInstance().recordStreamJoin(
+        static_cast<uint64_t>(domainId), stream);
+#else
+    (void) domainId;
+    (void) sourceStream;
 #endif
 }
 
@@ -100,8 +140,12 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "allocate_output(Tensor like, int output_buffer_kind, int[]? group, "
         "int[]? shape=None, ScalarType? out_dtype=None) -> (Tensor, int)");
     m.def("_create_nccl_window_reuse_domain(int device) -> int");
+    m.def("_begin_nccl_window_preparation(int domain_id) -> ()");
+    m.def("_end_nccl_window_preparation(int domain_id) -> ()");
     m.def("_begin_nccl_window_capture(int domain_id) -> int");
     m.def("_end_nccl_window_capture(int capture_id) -> ()");
+    m.def("_quiesce_nccl_window_reuse_domain(int domain_id) -> ()");
+    m.def("_record_nccl_window_stream_join(int domain_id, int source_stream) -> ()");
     m.def("_close_nccl_window_reuse_domain(int domain_id) -> ()");
 }
 
@@ -113,7 +157,11 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
 {
     m.impl("_create_nccl_window_reuse_domain", &tensorrt_llm::torch_ext::createNcclWindowReuseDomain);
+    m.impl("_begin_nccl_window_preparation", &tensorrt_llm::torch_ext::beginNcclWindowPreparation);
+    m.impl("_end_nccl_window_preparation", &tensorrt_llm::torch_ext::endNcclWindowPreparation);
     m.impl("_begin_nccl_window_capture", &tensorrt_llm::torch_ext::beginNcclWindowCapture);
     m.impl("_end_nccl_window_capture", &tensorrt_llm::torch_ext::endNcclWindowCapture);
+    m.impl("_quiesce_nccl_window_reuse_domain", &tensorrt_llm::torch_ext::quiesceNcclWindowReuseDomain);
+    m.impl("_record_nccl_window_stream_join", &tensorrt_llm::torch_ext::recordNcclWindowStreamJoin);
     m.impl("_close_nccl_window_reuse_domain", &tensorrt_llm::torch_ext::closeNcclWindowReuseDomain);
 }
