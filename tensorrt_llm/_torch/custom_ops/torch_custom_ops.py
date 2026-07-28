@@ -2087,7 +2087,7 @@ def _(
 
 class AllReduceRunner(TunableRunner):
     _prealloc_lock: ClassVar[threading.Lock] = threading.Lock()
-    _prealloc_done: ClassVar[set] = set()
+    _prealloc_capacity: ClassVar[dict] = {}
     # Set from AllReduce.__init__ via extra_attrs when the model is built.
     _prealloc_max_num_tokens: ClassVar[Optional[int]] = None
     _prealloc_hidden_size: ClassVar[Optional[int]] = None
@@ -2104,23 +2104,39 @@ class AllReduceRunner(TunableRunner):
         self,
         tp_size: int,
         group: List[int],
+        strategy: int,
         op: int,
         eps: float,
         trigger_completion_at_end: bool,
+        input_dtype: torch.dtype,
+        input_device: torch.device,
         input_uses_nccl_window: bool = False,
     ):
         self.tp_size = tp_size
+        self.group = list(group)
+        self.strategy = int(strategy)
         self.op = op
-        self.group = group
         self.eps = eps
         self.trigger_completion_at_end = trigger_completion_at_end
+        self.input_dtype = input_dtype
+        self.input_device_type = input_device.type
+        self.input_device_index = input_device.index
         self.input_uses_nccl_window = input_uses_nccl_window
 
     def unique_id(self):
+        # Dynamic shapes and byte counts deliberately do not belong here. The
+        # autotuner adds its (possibly bucketed) input-shape profile alongside
+        # this stable runner identity when constructing the cache key.
         return (
-            self.tp_size,
-            self.op,
-            self.input_uses_nccl_window,
+            ("communicator_group", tuple(self.group)),
+            ("tp_size", self.tp_size),
+            ("allreduce_mode", self.strategy),
+            ("fusion_op", self.op),
+            ("eps", self.eps),
+            ("trigger_completion_at_end", self.trigger_completion_at_end),
+            ("window_mode", self.input_uses_nccl_window),
+            ("dtype", str(self.input_dtype)),
+            ("device", (self.input_device_type, self.input_device_index)),
         )
 
     @classmethod
@@ -2133,7 +2149,7 @@ class AllReduceRunner(TunableRunner):
                                    dtype: Optional[torch.dtype] = None) -> None:
         if not do_preparation:
             return
-        if not hasattr(torch.ops.trtllm, "preallocate_nccl_window_buffer"):
+        if not hasattr(torch.ops.trtllm, "ensure_nccl_window_capacity"):
             return
         if input_tensor.numel() == 0 or input_tensor.size(0) == 0:
             return
@@ -2145,36 +2161,59 @@ class AllReduceRunner(TunableRunner):
                 # If capture status can't be queried, avoid prealloc to be safe.
                 return
 
-        # If max_num_tokens and hidden_size are provided, pre-allocate at 2x
-        # the model-configured size to give the NCCL window allocator extra
-        # headroom beyond the nominal max shape.  dtype comes from the model
-        # spec; fall back to the actual input tensor's properties when any
-        # value is missing.
-        # The dummy tensor is created here, after the stream-capture guard,
-        # so it is never allocated inside a CUDA graph context.
+        target_dtype = dtype if dtype is not None else input_tensor.dtype
         if max_num_tokens is not None and hidden_size is not None:
-            prealloc_input = torch.empty(
-                [2 * max_num_tokens, hidden_size],
-                dtype=dtype if dtype is not None else input_tensor.dtype,
-                device=input_tensor.device)
+            element_size = torch.empty((), dtype=target_dtype).element_size()
+            minimum_bytes = (2 * int(max_num_tokens) * int(hidden_size) *
+                             int(element_size))
         else:
-            prealloc_input = input_tensor
-
-        num_tokens = int(prealloc_input.size(0))
-        if num_tokens <= 0:
+            minimum_bytes = (int(input_tensor.numel()) *
+                             int(input_tensor.element_size()))
+        if minimum_bytes <= 0:
             return
-        group_key = tuple(group)
-        cache_key = (group_key, num_tokens)
-        with cls._prealloc_lock:
-            if cache_key in cls._prealloc_done:
-                return
-            cls._prealloc_done.add(cache_key)
 
+        slot_count = 2
+        group_key = tuple(group)
+        device_key = (input_tensor.device.type, input_tensor.device.index)
+        cache_key = (device_key, group_key)
+        with cls._prealloc_lock:
+            prepared_capacities = cls._prealloc_capacity.setdefault(
+                cache_key, [])
+            if any(prepared_bytes >= minimum_bytes
+                   and prepared_slots >= slot_count
+                   for prepared_bytes, prepared_slots in prepared_capacities):
+                return
+
+        # Do not hold the process-local cache lock across communicator setup or
+        # allocation. Different rank-local thread schedules must not serialize
+        # collective setup in a different order. Concurrent duplicate ensures
+        # are harmless: the allocator will reuse the same released capacity.
         logger.debug(
-            "[tunable_allreduce] Pre-allocating NCCL window buffers: "
-            "tokens=%d group=%s", num_tokens, list(group))
-        torch.ops.trtllm.preallocate_nccl_window_buffer(prealloc_input, group,
-                                                        2)
+            "[tunable_allreduce] Ensuring NCCL window capacity: "
+            "bytes=%d slots=%d device=%s group=%s", minimum_bytes, slot_count,
+            input_tensor.device, list(group))
+        prepared = int(
+            torch.ops.trtllm.ensure_nccl_window_capacity(
+                input_tensor, group, minimum_bytes, slot_count))
+        if prepared < slot_count:
+            logger.debug(
+                "[tunable_allreduce] NCCL window capacity request "
+                "prepared only %d/%d slots", prepared, slot_count)
+            return
+
+        with cls._prealloc_lock:
+            prepared_capacities = cls._prealloc_capacity.setdefault(
+                cache_key, [])
+            # Keep only non-dominated capacity records. A record is reusable
+            # when both its per-slot bytes and simultaneous slot count cover a
+            # later request.
+            prepared_capacities[:] = [
+                (prepared_bytes, prepared_slots)
+                for prepared_bytes, prepared_slots in prepared_capacities
+                if prepared_bytes > minimum_bytes
+                or prepared_slots > slot_count
+            ]
+            prepared_capacities.append((minimum_bytes, slot_count))
 
     def get_valid_tactics(
         self,
@@ -2257,6 +2296,16 @@ def _(
     return None
 
 
+@torch.library.register_fake("trtllm::ensure_nccl_window_capacity")
+def _(
+    like: torch.Tensor,
+    group: List[int],
+    minimum_bytes: int,
+    slot_count: int,
+) -> int:
+    return 0
+
+
 # Host-side predicate for custom-op implementations only. Do not call this
 # directly from model forward code or compiled graphs; it returns a Python bool
 # and is intended only to let another custom op gate its setup logic.
@@ -2297,9 +2346,12 @@ def tunable_allreduce(
     allreduce_runner = AllReduceRunner(
         len(group),
         group,
+        strategy,
         op,
         eps,
         trigger_completion_at_end,
+        input.dtype,
+        input.device,
         input_uses_nccl_window,
     )
 

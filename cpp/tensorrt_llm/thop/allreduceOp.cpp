@@ -1474,17 +1474,17 @@ private:
 
 #endif // ENABLE_MULTI_DEVICE
 
-void preallocateNCCLWindowBuffer(
-    torch::Tensor const& input, torch::List<int64_t> const& group, int64_t const buffersPerSize)
+int64_t ensureNCCLWindowCapacity(
+    torch::Tensor const& like, torch::List<int64_t> const& group, int64_t const minimumBytes, int64_t const slotCount)
 {
 #if ENABLE_MULTI_DEVICE
-    if (buffersPerSize <= 0 || group.size() == 0 || input.numel() == 0 || input.size(0) == 0)
+    if (slotCount <= 0 || minimumBytes <= 0 || group.size() == 0 || !like.is_cuda())
     {
-        return;
+        return 0;
     }
 
-    c10::cuda::CUDAGuard deviceGuard(input.device());
-    int const device = input.get_device();
+    c10::cuda::CUDAGuard deviceGuard(like.device());
+    int const device = like.get_device();
 
     std::set<int> groupSet;
     for (auto const& rank : group)
@@ -1495,33 +1495,25 @@ void preallocateNCCLWindowBuffer(
     auto const commPtr = getComm(groupSet);
     if (!commPtr || *commPtr == nullptr)
     {
-        TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffers] NCCL comm is null; skipping preallocation");
-        return;
+        TLLM_LOG_DEBUG("[ensureNCCLWindowCapacity] NCCL comm is null; skipping preallocation");
+        return 0;
     }
 
     using tensorrt_llm::common::nccl_util::NCCLWindowAllocator;
+    using tensorrt_llm::common::nccl_util::NCCLWindowLease;
     auto& allocator = NCCLWindowAllocator::getInstance();
     ncclComm_t const comm = *commPtr;
-
-    int64_t const numTokens = input.size(0);
-    int64_t const elementsPerToken = input.numel() / numTokens;
-    if (elementsPerToken <= 0)
-    {
-        return;
-    }
-    size_t const bufferSize = static_cast<size_t>(numTokens) * static_cast<size_t>(elementsPerToken)
-        * static_cast<size_t>(input.element_size());
-    if (bufferSize == 0)
-    {
-        return;
-    }
-    TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffer] Pre-allocating %ld buffer(s) for tokens=%ld (%zu bytes) comm %p",
-        buffersPerSize, numTokens, bufferSize, static_cast<void*>(comm));
-    std::vector<tensorrt_llm::common::nccl_util::NCCLWindowLease> allocatedBuffers;
-    allocatedBuffers.reserve(buffersPerSize);
+    size_t const bufferSize = static_cast<size_t>(minimumBytes);
+    TLLM_LOG_DEBUG("[ensureNCCLWindowCapacity] Ensuring %ld slot(s) of at least %zu bytes for comm %p on device %d",
+        slotCount, bufferSize, static_cast<void*>(comm), device);
+    std::vector<NCCLWindowLease> allocatedBuffers;
+    allocatedBuffers.reserve(slotCount);
     try
     {
-        for (int64_t i = 0; i < buffersPerSize; ++i)
+        // Hold every lease until the full request has been attempted. This
+        // ensures one pooled address cannot satisfy multiple simultaneous
+        // slots in the same capacity request.
+        for (int64_t i = 0; i < slotCount; ++i)
         {
             auto buffer = allocator.requestBuffer(comm, bufferSize, device);
             if (!buffer.isValid())
@@ -1533,17 +1525,32 @@ void preallocateNCCLWindowBuffer(
     }
     catch (std::exception const& e)
     {
-        TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffer] requestBuffer failed for %zu bytes: %s", bufferSize, e.what());
+        TLLM_LOG_DEBUG("[ensureNCCLWindowCapacity] requestBuffer failed for %zu bytes: %s", bufferSize, e.what());
     }
 
     for (auto const& buffer : allocatedBuffers)
     {
-        allocator.releaseBuffer(comm, buffer.ptr, device, buffer.generation);
+        allocator.releaseBuffer(comm, buffer);
     }
+    return static_cast<int64_t>(allocatedBuffers.size());
 #else
+    (void) like;
     (void) group;
-    (void) buffersPerSize;
+    (void) minimumBytes;
+    (void) slotCount;
+    return 0;
 #endif
+}
+
+void preallocateNCCLWindowBuffer(
+    torch::Tensor const& input, torch::List<int64_t> const& group, int64_t const buffersPerSize)
+{
+    if (input.numel() == 0)
+    {
+        return;
+    }
+    int64_t const minimumBytes = input.numel() * input.element_size();
+    (void) ensureNCCLWindowCapacity(input, group, minimumBytes, buffersPerSize);
 }
 
 bool isNCCLWindowBuffer(torch::Tensor const& input, torch::List<int64_t> const& group)
@@ -2162,6 +2169,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int nranks,"
         "float eps) -> Tensor[]");
     m.def("preallocate_nccl_window_buffer(Tensor input, int[] group, int count) -> ()");
+    m.def("ensure_nccl_window_capacity(Tensor like, int[] group, int minimum_bytes, int slot_count) -> int");
     m.def("is_nccl_window_buffer(Tensor input, int[] group) -> bool");
     m.def(
         "minimax_allreduce_rms("
@@ -2193,6 +2201,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("moe_allreduce", &tensorrt_llm::torch_ext::moe_allreduce);
     m.impl("moe_finalize_allreduce", &tensorrt_llm::torch_ext::moe_finalize_allreduce);
     m.impl("preallocate_nccl_window_buffer", &tensorrt_llm::torch_ext::preallocateNCCLWindowBuffer);
+    m.impl("ensure_nccl_window_capacity", &tensorrt_llm::torch_ext::ensureNCCLWindowCapacity);
     m.impl("is_nccl_window_buffer", &tensorrt_llm::torch_ext::isNCCLWindowBuffer);
     m.impl("minimax_allreduce_rms", &tensorrt_llm::torch_ext::minimax_allreduce_rms);
     m.impl("minimax_allreduce_rms_qk", &tensorrt_llm::torch_ext::minimax_allreduce_rms_qk);
@@ -2208,5 +2217,7 @@ TORCH_LIBRARY_IMPL(trtllm, CPU, m)
             return std::vector<at::Tensor>{};
         });
     m.impl("preallocate_nccl_window_buffer", [](at::Tensor const&, torch::List<int64_t> const&, int64_t) { return; });
+    m.impl("ensure_nccl_window_capacity",
+        [](at::Tensor const&, torch::List<int64_t> const&, int64_t, int64_t) -> int64_t { return 0; });
     m.impl("is_nccl_window_buffer", [](at::Tensor const&, torch::List<int64_t> const&) { return false; });
 }
