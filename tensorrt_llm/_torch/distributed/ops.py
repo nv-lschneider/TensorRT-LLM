@@ -717,23 +717,22 @@ class AllReduce(nn.Module):
 
         self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
 
-        # Propagate model-level prealloc config to AllReduceRunner once per
-        # process.  extra_attrs is only active during model __init__, so we
-        # read it here and stash the values as class-level attributes that
-        # AllReduceRunner.forward can use during the autotuner warm-up phase.
+        # Snapshot this module's capacity requirement. Keeping it on the module
+        # avoids process-global sizing state being overwritten when multiple
+        # models with different hidden sizes or dtypes coexist.
+        self._minimum_window_bytes = 0
         extra_attrs = get_model_extra_attrs()
         if extra_attrs:
-            from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
-                AllReduceRunner
             max_num_tokens = extra_attrs.get('allreduce_max_num_tokens')
             hidden_size = extra_attrs.get('allreduce_hidden_size')
-            if max_num_tokens is not None:
-                AllReduceRunner._prealloc_max_num_tokens = max_num_tokens
-            if hidden_size is not None:
-                AllReduceRunner._prealloc_hidden_size = hidden_size
-            prealloc_dtype = extra_attrs.get('allreduce_dtype')
-            if prealloc_dtype is not None:
-                AllReduceRunner._prealloc_dtype = prealloc_dtype
+            if max_num_tokens is not None and hidden_size is not None:
+                prealloc_dtype = (extra_attrs.get('allreduce_dtype') or dtype
+                                  or torch.bfloat16)
+                element_size = torch.empty(
+                    (), dtype=prealloc_dtype).element_size()
+                self._minimum_window_bytes = (
+                    2 * int(max_num_tokens) * int(hidden_size) *
+                    int(element_size))
 
         if self.mapping.tp_size > 1 and not self.mapping.enable_attention_dp:
             # Initialize Symmetric Memory AllReduce if needed (before workspace allocation)
@@ -918,6 +917,7 @@ class AllReduce(nn.Module):
                 eps=all_reduce_params.eps,
                 trigger_completion_at_end=all_reduce_params.
                 trigger_completion_at_end,
+                minimum_window_bytes=self._minimum_window_bytes,
             )
         else:
             output = self.all_reduce_op(

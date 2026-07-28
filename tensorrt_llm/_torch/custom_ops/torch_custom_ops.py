@@ -2088,10 +2088,6 @@ def _(
 class AllReduceRunner(TunableRunner):
     _prealloc_lock: ClassVar[threading.Lock] = threading.Lock()
     _prealloc_capacity: ClassVar[dict] = {}
-    # Set from AllReduce.__init__ via extra_attrs when the model is built.
-    _prealloc_max_num_tokens: ClassVar[Optional[int]] = None
-    _prealloc_hidden_size: ClassVar[Optional[int]] = None
-    _prealloc_dtype: ClassVar[Optional[torch.dtype]] = None
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, get_last_power_of_2_num_tokens_buckets(8192),
@@ -2110,6 +2106,7 @@ class AllReduceRunner(TunableRunner):
         trigger_completion_at_end: bool,
         input_dtype: torch.dtype,
         input_device: torch.device,
+        minimum_window_bytes: int = 0,
         input_uses_nccl_window: bool = False,
     ):
         self.tp_size = tp_size
@@ -2121,6 +2118,7 @@ class AllReduceRunner(TunableRunner):
         self.input_dtype = input_dtype
         self.input_device_type = input_device.type
         self.input_device_index = input_device.index
+        self.minimum_window_bytes = int(minimum_window_bytes)
         self.input_uses_nccl_window = input_uses_nccl_window
 
     def unique_id(self):
@@ -2144,9 +2142,7 @@ class AllReduceRunner(TunableRunner):
                                    input_tensor: torch.Tensor,
                                    group: List[int],
                                    do_preparation: bool = False,
-                                   max_num_tokens: Optional[int] = None,
-                                   hidden_size: Optional[int] = None,
-                                   dtype: Optional[torch.dtype] = None) -> None:
+                                   minimum_window_bytes: int = 0) -> None:
         if not do_preparation:
             return
         if not hasattr(torch.ops.trtllm, "ensure_nccl_window_capacity"):
@@ -2161,14 +2157,9 @@ class AllReduceRunner(TunableRunner):
                 # If capture status can't be queried, avoid prealloc to be safe.
                 return
 
-        target_dtype = dtype if dtype is not None else input_tensor.dtype
-        if max_num_tokens is not None and hidden_size is not None:
-            element_size = torch.empty((), dtype=target_dtype).element_size()
-            minimum_bytes = (2 * int(max_num_tokens) * int(hidden_size) *
-                             int(element_size))
-        else:
-            minimum_bytes = (int(input_tensor.numel()) *
-                             int(input_tensor.element_size()))
+        input_bytes = (int(input_tensor.numel()) *
+                       int(input_tensor.element_size()))
+        minimum_bytes = max(int(minimum_window_bytes), input_bytes)
         if minimum_bytes <= 0:
             return
 
@@ -2260,9 +2251,7 @@ class AllReduceRunner(TunableRunner):
                     input,
                     self.group,
                     do_preparation=True,
-                    max_num_tokens=AllReduceRunner._prealloc_max_num_tokens,
-                    hidden_size=AllReduceRunner._prealloc_hidden_size,
-                    dtype=AllReduceRunner._prealloc_dtype,
+                    minimum_window_bytes=self.minimum_window_bytes,
                 )
             return input
         if tactic == -1:
@@ -2329,6 +2318,7 @@ def tunable_allreduce(
     op: int,
     eps: float,
     trigger_completion_at_end: bool,
+    minimum_window_bytes: int,
 ) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
@@ -2352,6 +2342,7 @@ def tunable_allreduce(
         trigger_completion_at_end,
         input.dtype,
         input.device,
+        minimum_window_bytes,
         input_uses_nccl_window,
     )
 

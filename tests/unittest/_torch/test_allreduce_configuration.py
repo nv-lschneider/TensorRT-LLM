@@ -87,6 +87,26 @@ def test_allreduce_inherits_global_strategy_but_explicit_auto_wins():
     assert explicit.strategy == AllReduceStrategy.AUTO
 
 
+def test_allreduce_capacity_is_scoped_to_each_module():
+    mapping = Mapping()
+    with model_extra_attrs({
+            "allreduce_max_num_tokens": 128,
+            "allreduce_hidden_size": 64,
+            "allreduce_dtype": torch.float16,
+    }):
+        small = AllReduce(mapping=mapping)
+    with model_extra_attrs({
+            "allreduce_max_num_tokens": 256,
+            "allreduce_hidden_size": 128,
+            "allreduce_dtype": torch.float32,
+    }):
+        large = AllReduce(mapping=mapping)
+
+    assert small._minimum_window_bytes == 2 * 128 * 64 * 2
+    assert large._minimum_window_bytes == 2 * 256 * 128 * 4
+    assert small._minimum_window_bytes == 32768
+
+
 @pytest.mark.parametrize(
     "module_factory",
     [
