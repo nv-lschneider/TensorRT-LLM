@@ -84,7 +84,7 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
     c10::cuda::CUDAGuard deviceGuard(static_cast<c10::DeviceIndex>(device));
     TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, rank);
     using CommKey = std::pair<std::set<int>, int>;
-    static std::map<CommKey, std::shared_ptr<ncclComm_t>> commMap;
+    static std::map<CommKey, std::weak_ptr<ncclComm_t>> commMap;
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     std::ostringstream oss;
@@ -103,10 +103,13 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
     auto it = commMap.find(commKey);
     if (it != commMap.end())
     {
-        auto ncclComm = it->second;
-        TLLM_LOG_TRACE(
-            "NCCL comm for group(%s) on device %d is cached for rank %d", groupStr.c_str(), device, rank);
-        return ncclComm;
+        if (auto ncclComm = it->second.lock())
+        {
+            TLLM_LOG_TRACE(
+                "NCCL comm for group(%s) on device %d is cached for rank %d", groupStr.c_str(), device, rank);
+            return ncclComm;
+        }
+        commMap.erase(it);
     }
 
     TLLM_LOG_TRACE("Init NCCL comm for group(%s) on device %d for rank %d", groupStr.c_str(), device, rank);

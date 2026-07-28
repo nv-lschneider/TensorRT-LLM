@@ -2563,10 +2563,10 @@ class PyTorchModelEngine(ModelEngine):
 
         Tears down, in order:
 
-        1. The optional ``ModelLoader`` (which in turn releases any
+        1. CUDA Graph captures (via :meth:`_release_cuda_graphs`).
+        2. The optional ``ModelLoader`` (which in turn releases any
            GMS client; see :meth:`ModelLoader.cleanup`).
-        2. The model module reference.
-        3. CUDA Graph captures (via :meth:`_release_cuda_graphs`).
+        3. The model module reference.
         4. Input processors.
         5. Userbuffers (``ub.ub_deallocate`` per buffer); on per-buffer
            failure the unfreed buffers are kept attached so a deterministic
@@ -2596,14 +2596,17 @@ class PyTorchModelEngine(ModelEngine):
         # rolled back.  Keep each handle live until its own release succeeds,
         # so a failed cleanup can be retried without double-freeing resources
         # that were already released.
+        # Captured graphs embed raw addresses owned by model modules and NCCL
+        # communicators. Retire their graph/domain leases before dropping any
+        # object that may be the final communicator owner.
+        self._release_cuda_graphs()
+
         model_loader = getattr(self, "model_loader", None)
         if model_loader is not None:
             model_loader.cleanup()
             self.model_loader = None
 
         self.model = None
-
-        self._release_cuda_graphs()
         self.input_processor = None
         self.input_processor_with_hash = None
 

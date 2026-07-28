@@ -755,7 +755,6 @@ class CUDAGraphRunner:
         self._window_reuse_domain = None
         del self.memory_pool
         self.memory_pool = None
-        torch.cuda.empty_cache()
 
 
 EncoderKeyType: TypeAlias = Tuple[int, int, int]
@@ -1210,4 +1209,3 @@ class EncoderCUDAGraphRunner:
         self._window_reuse_domain = None
         del self.memory_pool
         self.memory_pool = None
-        torch.cuda.empty_cache()

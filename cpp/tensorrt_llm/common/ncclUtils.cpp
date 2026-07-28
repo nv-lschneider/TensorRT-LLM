@@ -1067,57 +1067,77 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm, int device)
     }
 
     c10::cuda::CUDAGuard deviceGuard(static_cast<c10::DeviceIndex>(device));
-
-    // Synchronize CUDA to ensure all operations using these buffers are complete
-    // before we deregister windows and free memory
-    cudaError_t cudaErr = cudaDeviceSynchronize();
-    if (cudaErr != cudaSuccess)
+    PoolKey const poolKey{comm, device};
+    std::vector<cudaStream_t> streams;
     {
-        TLLM_LOG_WARNING("[NCCLUtil] cudaDeviceSynchronize failed with error: %d before cleanup for comm %p", cudaErr,
-            static_cast<void*>(comm));
-        // Continue anyway - the sync failure might be from a previous error
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (mRegisteredPools.find(poolKey) == mRegisteredPools.end())
+        {
+            return;
+        }
+
+        auto const commIt = mBufferPool.find(poolKey);
+        if (commIt == mBufferPool.end())
+        {
+            mRegisteredPools.erase(poolKey);
+            mMinSymmetricFailureSize.erase(poolKey);
+            return;
+        }
+
+        size_t liveLeaseCount = 0;
+        size_t graphOwnedCount = 0;
+        std::unordered_set<cudaStream_t> uniqueStreams;
+        for (auto const& entry : commIt->second)
+        {
+            liveLeaseCount += entry->inUse ? 1 : 0;
+            graphOwnedCount += entry->domainId != 0 ? 1 : 0;
+            if (entry->homeStream != nullptr)
+            {
+                uniqueStreams.insert(entry->homeStream);
+            }
+        }
+        if (liveLeaseCount != 0 || graphOwnedCount != 0)
+        {
+            // Fail closed: freeing here would turn a lifetime-ordering bug
+            // into an address UAF. Correct teardown closes graph domains and
+            // releases tensor leases before the final communicator owner.
+            TLLM_LOG_ERROR(
+                "[NCCLUtil] Refusing to free comm %p window storage with %zu live lease(s) and %zu "
+                "graph-owned buffer(s). Graph runners must close before communicator teardown.",
+                static_cast<void*>(comm), liveLeaseCount, graphOwnedCount);
+            return;
+        }
+        streams.assign(uniqueStreams.begin(), uniqueStreams.end());
+    }
+
+    // Synchronize only streams that carried a window lease. Same-stream reuse
+    // is ordered without events; this teardown-only synchronization establishes
+    // completion before deregistration without stalling unrelated devices/work.
+    for (auto stream : streams)
+    {
+        cudaError_t const cudaErr = cudaStreamSynchronize(stream);
+        if (cudaErr != cudaSuccess)
+        {
+            TLLM_LOG_WARNING(
+                "[NCCLUtil] cudaStreamSynchronize failed with error %d before cleanup for comm %p, stream %p",
+                cudaErr, static_cast<void*>(comm), static_cast<void*>(stream));
+        }
     }
 
     std::lock_guard<std::mutex> lock(mMutex);
-
-    // Check if we've already cleaned up this communicator
-    PoolKey const poolKey{comm, device};
-    if (mRegisteredPools.find(poolKey) == mRegisteredPools.end())
-    {
-        // Already cleaned up or never registered
-        return;
-    }
-
     auto commIt = mBufferPool.find(poolKey);
     if (commIt == mBufferPool.end())
     {
-        // No buffers to clean up, but mark as cleaned
-        mRegisteredPools.erase(poolKey);
-        mMinSymmetricFailureSize.erase(poolKey);
         return;
     }
 
     TLLM_LOG_TRACE(
         "[NCCLUtil] Cleaning up %zu NCCL window buffers for comm %p", commIt->second.size(), static_cast<void*>(comm));
 
-    // Check for buffers still in use - this shouldn't happen if cleanup is called properly,
-    // but we log a warning if it does
-    size_t inUseCount = 0;
     size_t totalBytes = 0;
     for (auto const& entry : commIt->second)
     {
         totalBytes += entry->buffer.size;
-        if (entry->inUse)
-        {
-            ++inUseCount;
-        }
-    }
-    if (inUseCount > 0)
-    {
-        TLLM_LOG_WARNING(
-            "[NCCLUtil] Cleaning up %zu buffers still marked as in-use for comm %p. "
-            "This may indicate buffers weren't properly released before cleanup.",
-            inUseCount, static_cast<void*>(comm));
     }
     TLLM_LOG_DEBUG("[NCCLUtil] NCCL window allocator teardown for comm %p: %zu buffers, %zu bytes total",
         static_cast<void*>(comm), commIt->second.size(), totalBytes);
@@ -1127,26 +1147,17 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm, int device)
         auto& entry = *entryPtr;
         if (entry.buffer.isValid())
         {
-            // Deregister the window - the communicator is still valid at this point
-            // (cleanup happens before ncclCommDestroy), but we need to be careful
-            // if buffers are still in use by active operations
             if (entry.buffer.window && comm)
             {
-                // Note: Even if buffer is marked inUse, we must deregister since
-                // the communicator is being destroyed. The communicator is valid,
-                // but we should handle potential errors gracefully.
                 ncclResult_t result = ncclCommWindowDeregister(comm, entry.buffer.window);
                 if (result != ncclSuccess)
                 {
                     TLLM_LOG_WARNING(
-                        "[NCCLUtil] ncclCommWindowDeregister failed with error: %d for comm %p, "
-                        "window %p (buffer inUse: %d)",
-                        result, static_cast<void*>(comm), static_cast<void*>(entry.buffer.window), entry.inUse);
+                        "[NCCLUtil] ncclCommWindowDeregister failed with error: %d for comm %p, window %p", result,
+                        static_cast<void*>(comm), static_cast<void*>(entry.buffer.window));
                 }
             }
 
-            // Free device memory using ncclMemFree
-            // This should be safe even if deregister failed
             if (entry.buffer.ptr)
             {
                 try
