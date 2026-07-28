@@ -79,8 +79,12 @@ ncclUniqueId getUniqueId(std::set<int> const& group)
 std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
 {
     auto const rank = COMM_SESSION.getRank();
+    int device = -1;
+    TLLM_CUDA_CHECK(cudaGetDevice(&device));
+    c10::cuda::CUDAGuard deviceGuard(static_cast<c10::DeviceIndex>(device));
     TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, rank);
-    static std::map<std::set<int>, std::shared_ptr<ncclComm_t>> commMap;
+    using CommKey = std::pair<std::set<int>, int>;
+    static std::map<CommKey, std::shared_ptr<ncclComm_t>> commMap;
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     std::ostringstream oss;
@@ -95,15 +99,17 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
         index++;
     }
     auto groupStr = oss.str();
-    auto it = commMap.find(group);
+    CommKey const commKey{group, device};
+    auto it = commMap.find(commKey);
     if (it != commMap.end())
     {
         auto ncclComm = it->second;
-        TLLM_LOG_TRACE("NCCL comm for group(%s) is cached for rank %d", groupStr.c_str(), rank);
+        TLLM_LOG_TRACE(
+            "NCCL comm for group(%s) on device %d is cached for rank %d", groupStr.c_str(), device, rank);
         return ncclComm;
     }
 
-    TLLM_LOG_TRACE("Init NCCL comm for group(%s) for rank %d", groupStr.c_str(), rank);
+    TLLM_LOG_TRACE("Init NCCL comm for group(%s) on device %d for rank %d", groupStr.c_str(), device, rank);
     ncclUniqueId id = getUniqueId(group);
     int groupRank = 0;
     for (auto const& currentRank : group)
@@ -114,12 +120,14 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
     }
     TLLM_CHECK(static_cast<size_t>(groupRank) < group.size());
     std::shared_ptr<ncclComm_t> ncclComm(new ncclComm_t,
-        [](ncclComm_t* comm)
+        [device](ncclComm_t* comm)
         {
             if (!comm)
             {
                 return;
             }
+
+            c10::cuda::CUDAGuard deviceGuard(static_cast<c10::DeviceIndex>(device));
 
             // STEP 1: Clean up resources and destroy NCCL communicator if it's valid
             if (*comm)
@@ -177,7 +185,7 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
 #else
     NCCLCHECK_THROW(ncclCommInitRank(ncclComm.get(), group.size(), id, groupRank));
 #endif // NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
-    commMap[group] = ncclComm;
+    commMap[commKey] = ncclComm;
     TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, rank);
     return ncclComm;
 }

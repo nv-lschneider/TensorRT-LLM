@@ -56,6 +56,11 @@ inline std::pair<at::Tensor, BufferKind> allocate_output(std::vector<int64_t> co
 #if ENABLE_MULTI_DEVICE
         if (group.has_value() && group->size() > 0)
         {
+            TLLM_CHECK_WITH_INFO(device.is_cuda(), "NCCL window output requires a CUDA device");
+            auto const windowDevice = device.has_index()
+                ? device
+                : c10::Device(c10::DeviceType::CUDA, c10::cuda::current_device());
+            c10::cuda::CUDAGuard deviceGuard(windowDevice);
             std::set<int> groupSet;
             for (auto const& rank : *group)
             {
@@ -73,7 +78,7 @@ inline std::pair<at::Tensor, BufferKind> allocate_output(std::vector<int64_t> co
             if (commPtr && *commPtr != nullptr)
             {
                 auto [tensor, buffer]
-                    = tensorrt_llm::common::nccl_util::createNCCLWindowTensor(commPtr, output_size, dtype);
+                    = tensorrt_llm::common::nccl_util::createNCCLWindowTensor(commPtr, output_size, dtype, windowDevice);
                 if (tensor.defined() && buffer.isValid())
                 {
                     result = tensor;

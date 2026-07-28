@@ -104,9 +104,11 @@ bool isGb10Platform(int realSmVersion, bool isIntegrated)
 }
 #endif
 
-bool queryNcclWindowSupported()
+bool queryNcclWindowSupported(int device)
 {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+    c10::cuda::CUDAGuard deviceGuard(static_cast<c10::DeviceIndex>(device));
+
     int version = 0;
     if (ncclGetVersion(&version) != ncclSuccess)
     {
@@ -126,17 +128,6 @@ bool queryNcclWindowSupported()
     if (version >= kNcclGb10WindowFixedVersion)
     {
         return true;
-    }
-
-    int device = -1;
-    cudaError_t const deviceErr = cudaGetDevice(&device);
-    if (deviceErr != cudaSuccess)
-    {
-        TLLM_LOG_WARNING(
-            "[NCCLUtil] Failed to query the current CUDA device while checking NCCL window support: %s; "
-            "falling back to regular tensors.",
-            cudaGetErrorString(deviceErr));
-        return false;
     }
 
     int isIntegrated = 0;
@@ -174,6 +165,7 @@ bool queryNcclWindowSupported()
     }
     return supported;
 #else
+    (void) device;
     return false;
 #endif
 }
@@ -199,10 +191,21 @@ bool isNcclWindowSupportedForPlatform(int realSmVersion, bool isIntegrated, int 
 
 bool isNcclWindowSupported()
 {
-    static std::once_flag supportCheckFlag;
-    static bool windowBuffersSupported = false;
-    std::call_once(supportCheckFlag, []() { windowBuffersSupported = queryNcclWindowSupported(); });
-    return windowBuffersSupported;
+    return isNcclWindowSupported(c10::cuda::current_device());
+}
+
+bool isNcclWindowSupported(int device)
+{
+    static std::mutex supportCheckMutex;
+    static std::unordered_map<int, bool> windowSupportByDevice;
+
+    std::lock_guard<std::mutex> lock(supportCheckMutex);
+    auto const [it, inserted] = windowSupportByDevice.try_emplace(device, false);
+    if (inserted)
+    {
+        it->second = queryNcclWindowSupported(device);
+    }
+    return it->second;
 }
 
 //==============================================================================
@@ -400,9 +403,24 @@ NCCLWindowAllocator& NCCLWindowAllocator::getInstance()
     return instance;
 }
 
-NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size)
+int NCCLWindowAllocator::resolveDevice(int device)
 {
-    if (!isNcclWindowSupported())
+    if (device >= 0)
+    {
+        return device;
+    }
+
+    int currentDevice = -1;
+    TLLM_CUDA_CHECK(cudaGetDevice(&currentDevice));
+    return currentDevice;
+}
+
+NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size, int device)
+{
+    device = resolveDevice(device);
+    c10::cuda::CUDAGuard deviceGuard(static_cast<c10::DeviceIndex>(device));
+
+    if (!isNcclWindowSupported(device))
     {
         return NCCLWindowBuffer();
     }
@@ -414,40 +432,46 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
 
     // Register cleanup callback for this communicator if not already registered
     // This is cheap even if no buffers exist yet - cleanup will just return early
-    registerBufferCleanup(comm);
+    registerBufferCleanup(comm, device);
 
     // Check if we have an available buffer of at least the requested size for this communicator
     // Use best-fit: find the smallest buffer that's >= requested size
-    auto& commBuffers = mBufferPool[comm];
+    PoolKey const poolKey{comm, device};
+    auto& commBuffers = mBufferPool[poolKey];
     auto bestFit = commBuffers.end();
     size_t bestFitSize = std::numeric_limits<size_t>::max();
 
     for (auto it = commBuffers.begin(); it != commBuffers.end(); ++it)
     {
-        if (!it->inUse && it->buffer.size >= size && it->buffer.size < bestFitSize)
+        auto const& entry = **it;
+        if (!entry.inUse && entry.buffer.size >= size && entry.buffer.size < bestFitSize)
         {
             bestFit = it;
-            bestFitSize = it->buffer.size;
+            bestFitSize = entry.buffer.size;
         }
     }
 
     if (bestFit != commBuffers.end())
     {
-        bestFit->inUse = true;
+        auto& entry = **bestFit;
+        entry.inUse = true;
         TLLM_LOG_TRACE(
-            "[NCCLUtil] Reusing NCCL window buffer for comm %p: handle=%d, ptr=%p, size=%zu (requested: %zu)",
-            static_cast<void*>(comm), bestFit->buffer.handle, bestFit->buffer.ptr, bestFit->buffer.size, size);
-        return bestFit->buffer;
+            "[NCCLUtil] Reusing NCCL window buffer for comm %p on device %d: "
+            "handle=%d, ptr=%p, size=%zu (requested: %zu)",
+            static_cast<void*>(comm), device, entry.buffer.handle, entry.buffer.ptr, entry.buffer.size, size);
+        return entry.buffer;
     }
 
     // If a previous allocateAndRegisterBuffer call collectively failed for this comm at a size
     // no larger than this request, do not retry the known-failing new allocation path. Smaller
     // requests and already-pooled buffers can still use NCCL windows.
-    auto const failureIt = mMinSymmetricFailureSize.find(comm);
+    auto const failureIt = mMinSymmetricFailureSize.find(poolKey);
     if (failureIt != mMinSymmetricFailureSize.end() && size >= failureIt->second)
     {
-        TLLM_LOG_DEBUG("[NCCLUtil] Skipping NCCL window allocation for comm %p, size=%zu; known failure threshold=%zu",
-            static_cast<void*>(comm), size, failureIt->second);
+        TLLM_LOG_DEBUG(
+            "[NCCLUtil] Skipping NCCL window allocation for comm %p on device %d, "
+            "size=%zu; known failure threshold=%zu",
+            static_cast<void*>(comm), device, size, failureIt->second);
         return NCCLWindowBuffer();
     }
 
@@ -468,33 +492,35 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
 
     // No available buffer found, allocate a new one
     TLLM_LOG_TRACE(
-        "[NCCLUtil] Allocating new NCCL window buffer for comm %p, size=%zu", static_cast<void*>(comm), size);
+        "[NCCLUtil] Allocating new NCCL window buffer for comm %p on device %d, size=%zu",
+        static_cast<void*>(comm), device, size);
     int handle = static_cast<int>(commBuffers.size());
-    NCCLWindowBuffer buffer = allocateAndRegisterBuffer(comm, size, handle);
+    NCCLWindowBuffer buffer = allocateAndRegisterBuffer(comm, size, handle, device);
     // Only cache valid buffers. allocateAndRegisterBuffer returns an empty buffer when any rank
     // failed ncclMemAlloc (collective fallback to plain allreduce); caching it would leak a
     // permanently "in use" empty entry per request because releaseBuffer is a no-op for nullptr.
     if (buffer.isValid())
     {
-        commBuffers.push_back({buffer, true});
+        commBuffers.push_back(std::make_unique<BufferEntry>(BufferEntry{buffer, true}));
     }
     else
     {
         // The collective allreduce inside allocateAndRegisterBuffer agreed that this request
         // cannot use symmetric memory on at least one rank. Remember the smallest failing
         // request size so repeated too-large autotuner probes do not keep stressing this path.
-        recordSymmetricFailureLocked(comm, size);
+        recordSymmetricFailureLocked(comm, device, size);
     }
 
     return buffer;
 }
 
-void NCCLWindowAllocator::recordSymmetricFailureLocked(ncclComm_t comm, size_t size)
+void NCCLWindowAllocator::recordSymmetricFailureLocked(ncclComm_t comm, int device, size_t size)
 {
-    auto failureIt = mMinSymmetricFailureSize.find(comm);
+    PoolKey const poolKey{comm, device};
+    auto failureIt = mMinSymmetricFailureSize.find(poolKey);
     if (failureIt == mMinSymmetricFailureSize.end())
     {
-        mMinSymmetricFailureSize.emplace(comm, size);
+        mMinSymmetricFailureSize.emplace(poolKey, size);
     }
     else if (size < failureIt->second)
     {
@@ -512,77 +538,93 @@ cudaError_t NCCLWindowAllocator::clearCudaErrorIfSymmetricAllocationFailed(
     return cudaSuccess;
 }
 
-NCCLWindowBuffer NCCLWindowAllocator::searchBuffer(ncclComm_t comm, void* ptr) const
+NCCLWindowBuffer NCCLWindowAllocator::searchBuffer(ncclComm_t comm, void* ptr, int device) const
 {
     if (!comm || !ptr)
     {
         return NCCLWindowBuffer();
     }
 
+    device = resolveDevice(device);
+    c10::cuda::CUDAGuard deviceGuard(static_cast<c10::DeviceIndex>(device));
     std::lock_guard<std::mutex> lock(mMutex);
-    return searchBufferLocked(comm, ptr);
+    return searchBufferLocked(comm, ptr, device);
 }
 
-void NCCLWindowAllocator::releaseBuffer(ncclComm_t comm, void* ptr)
+void NCCLWindowAllocator::releaseBuffer(ncclComm_t comm, void* ptr, int device)
 {
     if (!comm || !ptr)
     {
         return;
     }
 
+    device = resolveDevice(device);
+    c10::cuda::CUDAGuard deviceGuard(static_cast<c10::DeviceIndex>(device));
     std::lock_guard<std::mutex> lock(mMutex);
-    auto commIt = mBufferPool.find(comm);
+    PoolKey const poolKey{comm, device};
+    auto commIt = mBufferPool.find(poolKey);
     if (commIt == mBufferPool.end())
     {
-        TLLM_LOG_WARNING(
-            "[NCCLUtil] Attempted to release buffer %p for unknown comm %p", ptr, static_cast<void*>(comm));
+        TLLM_LOG_WARNING("[NCCLUtil] Attempted to release buffer %p for unknown comm %p on device %d", ptr,
+            static_cast<void*>(comm), device);
         return;
     }
 
-    for (auto& entry : commIt->second)
+    for (auto const& entryPtr : commIt->second)
     {
+        auto& entry = *entryPtr;
         if (entry.buffer.ptr == ptr)
         {
             entry.inUse = false;
-            TLLM_LOG_TRACE("[NCCLUtil] Released NCCL window buffer for comm %p: ptr=%p", static_cast<void*>(comm), ptr);
+            TLLM_LOG_TRACE("[NCCLUtil] Released NCCL window buffer for comm %p on device %d: ptr=%p",
+                static_cast<void*>(comm), device, ptr);
             return;
         }
     }
 
-    TLLM_LOG_WARNING("[NCCLUtil] Attempted to release unknown buffer %p for comm %p", ptr, static_cast<void*>(comm));
+    TLLM_LOG_WARNING("[NCCLUtil] Attempted to release unknown buffer %p for comm %p on device %d", ptr,
+        static_cast<void*>(comm), device);
 }
 
-ncclWindow_t NCCLWindowAllocator::getWindow(ncclComm_t comm, void* ptr) const
+ncclWindow_t NCCLWindowAllocator::getWindow(ncclComm_t comm, void* ptr, int device) const
 {
+    device = resolveDevice(device);
+    c10::cuda::CUDAGuard deviceGuard(static_cast<c10::DeviceIndex>(device));
     std::lock_guard<std::mutex> lock(mMutex);
-    NCCLWindowBuffer buffer = searchBufferLocked(comm, ptr);
+    NCCLWindowBuffer buffer = searchBufferLocked(comm, ptr, device);
     return buffer.isValid() ? buffer.window : nullptr;
 }
 
-size_t NCCLWindowAllocator::getSize(ncclComm_t comm, void* ptr) const
+size_t NCCLWindowAllocator::getSize(ncclComm_t comm, void* ptr, int device) const
 {
+    device = resolveDevice(device);
+    c10::cuda::CUDAGuard deviceGuard(static_cast<c10::DeviceIndex>(device));
     std::lock_guard<std::mutex> lock(mMutex);
-    NCCLWindowBuffer buffer = searchBufferLocked(comm, ptr);
+    NCCLWindowBuffer buffer = searchBufferLocked(comm, ptr, device);
     return buffer.isValid() ? buffer.size : 0;
 }
 
-NCCLWindowBuffer NCCLWindowAllocator::getBufferInfo(ncclComm_t comm, void* ptr) const
+NCCLWindowBuffer NCCLWindowAllocator::getBufferInfo(ncclComm_t comm, void* ptr, int device) const
 {
+    device = resolveDevice(device);
+    c10::cuda::CUDAGuard deviceGuard(static_cast<c10::DeviceIndex>(device));
     std::lock_guard<std::mutex> lock(mMutex);
-    return searchBufferLocked(comm, ptr);
+    return searchBufferLocked(comm, ptr, device);
 }
 
-size_t NCCLWindowAllocator::getBufferCount(ncclComm_t comm) const
+size_t NCCLWindowAllocator::getBufferCount(ncclComm_t comm, int device) const
 {
+    device = resolveDevice(device);
     std::lock_guard<std::mutex> lock(mMutex);
-    auto commIt = mBufferPool.find(comm);
+    auto commIt = mBufferPool.find(PoolKey{comm, device});
     return commIt != mBufferPool.end() ? commIt->second.size() : 0;
 }
 
-size_t NCCLWindowAllocator::getBufferInUseCount(ncclComm_t comm) const
+size_t NCCLWindowAllocator::getBufferInUseCount(ncclComm_t comm, int device) const
 {
+    device = resolveDevice(device);
     std::lock_guard<std::mutex> lock(mMutex);
-    auto commIt = mBufferPool.find(comm);
+    auto commIt = mBufferPool.find(PoolKey{comm, device});
     if (commIt == mBufferPool.end())
     {
         return 0;
@@ -591,7 +633,7 @@ size_t NCCLWindowAllocator::getBufferInUseCount(ncclComm_t comm) const
     size_t count = 0;
     for (auto const& entry : commIt->second)
     {
-        if (entry.inUse)
+        if (entry->inUse)
         {
             ++count;
         }
@@ -607,8 +649,10 @@ bool NCCLWindowAllocator::isCommValid(ncclComm_t comm) const noexcept
     return comm != nullptr;
 }
 
-NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle)
+NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle, int device)
 {
+    c10::cuda::CUDAGuard deviceGuard(static_cast<c10::DeviceIndex>(device));
+
     // Step 1: Pre-allocate the rank-sync flag before ncclMemAlloc. ncclMemAlloc can fail
     // asymmetrically with ncclUnhandledCudaError on configurations where the symmetric/VMM path
     // is unavailable; that failure may leave a sticky CUDA last-error on the device. If we
@@ -672,15 +716,17 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
 
     // Step 5: Success. Transfer ownership to the returned buffer.
     ncclGuard.release();
-    NCCLWindowBuffer buffer{ncclPtr, handle, size, window};
-    TLLM_LOG_TRACE("[NCCLUtil] Allocated and registered NCCL window buffer: handle=%d, ptr=%p, size=%zu, window=%p",
-        handle, buffer.ptr, buffer.size, static_cast<void*>(buffer.window));
+    NCCLWindowBuffer buffer{ncclPtr, handle, size, window, device};
+    TLLM_LOG_TRACE(
+        "[NCCLUtil] Allocated and registered NCCL window buffer: "
+        "handle=%d, ptr=%p, size=%zu, window=%p, device=%d",
+        handle, buffer.ptr, buffer.size, static_cast<void*>(buffer.window), device);
     return buffer;
 }
 
-NCCLWindowBuffer NCCLWindowAllocator::searchBufferLocked(ncclComm_t comm, void* ptr) const
+NCCLWindowBuffer NCCLWindowAllocator::searchBufferLocked(ncclComm_t comm, void* ptr, int device) const
 {
-    auto commIt = mBufferPool.find(comm);
+    auto commIt = mBufferPool.find(PoolKey{comm, device});
     if (commIt == mBufferPool.end())
     {
         return NCCLWindowBuffer();
@@ -688,36 +734,39 @@ NCCLWindowBuffer NCCLWindowAllocator::searchBufferLocked(ncclComm_t comm, void* 
 
     for (auto const& entry : commIt->second)
     {
-        if (entry.buffer.ptr == ptr)
+        if (entry->buffer.ptr == ptr)
         {
-            return entry.buffer;
+            return entry->buffer;
         }
     }
 
     return NCCLWindowBuffer();
 }
 
-void NCCLWindowAllocator::registerBufferCleanup(ncclComm_t comm)
+void NCCLWindowAllocator::registerBufferCleanup(ncclComm_t comm, int device)
 {
+    PoolKey const poolKey{comm, device};
     // Don't register if already registered
-    if (mRegisteredComms.find(comm) != mRegisteredComms.end())
+    if (mRegisteredPools.find(poolKey) != mRegisteredPools.end())
     {
         return;
     }
 
-    mRegisteredComms.insert(comm);
+    mRegisteredPools.insert(poolKey);
 
     // Register cleanup with the resource manager
     NcclCommResourceManager::getInstance().registerResource(
-        comm, [this, comm]() { this->cleanupBuffersForComm(comm); }, "NCCLWindowAllocator");
+        comm, [this, comm, device]() { this->cleanupBuffersForComm(comm, device); }, "NCCLWindowAllocator");
 }
 
-void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
+void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm, int device)
 {
     if (!comm)
     {
         return;
     }
+
+    c10::cuda::CUDAGuard deviceGuard(static_cast<c10::DeviceIndex>(device));
 
     // Synchronize CUDA to ensure all operations using these buffers are complete
     // before we deregister windows and free memory
@@ -732,18 +781,19 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
     std::lock_guard<std::mutex> lock(mMutex);
 
     // Check if we've already cleaned up this communicator
-    if (mRegisteredComms.find(comm) == mRegisteredComms.end())
+    PoolKey const poolKey{comm, device};
+    if (mRegisteredPools.find(poolKey) == mRegisteredPools.end())
     {
         // Already cleaned up or never registered
         return;
     }
 
-    auto commIt = mBufferPool.find(comm);
+    auto commIt = mBufferPool.find(poolKey);
     if (commIt == mBufferPool.end())
     {
         // No buffers to clean up, but mark as cleaned
-        mRegisteredComms.erase(comm);
-        mMinSymmetricFailureSize.erase(comm);
+        mRegisteredPools.erase(poolKey);
+        mMinSymmetricFailureSize.erase(poolKey);
         return;
     }
 
@@ -756,8 +806,8 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
     size_t totalBytes = 0;
     for (auto const& entry : commIt->second)
     {
-        totalBytes += entry.buffer.size;
-        if (entry.inUse)
+        totalBytes += entry->buffer.size;
+        if (entry->inUse)
         {
             ++inUseCount;
         }
@@ -772,8 +822,9 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
     TLLM_LOG_DEBUG("[NCCLUtil] NCCL window allocator teardown for comm %p: %zu buffers, %zu bytes total",
         static_cast<void*>(comm), commIt->second.size(), totalBytes);
 
-    for (auto& entry : commIt->second)
+    for (auto const& entryPtr : commIt->second)
     {
+        auto& entry = *entryPtr;
         if (entry.buffer.isValid())
         {
             // Deregister the window - the communicator is still valid at this point
@@ -818,8 +869,8 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
     }
 
     mBufferPool.erase(commIt);
-    mRegisteredComms.erase(comm);
-    mMinSymmetricFailureSize.erase(comm);
+    mRegisteredPools.erase(poolKey);
+    mMinSymmetricFailureSize.erase(poolKey);
 }
 
 #endif // NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)

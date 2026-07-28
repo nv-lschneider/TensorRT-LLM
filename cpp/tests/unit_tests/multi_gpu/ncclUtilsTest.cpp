@@ -47,7 +47,9 @@ public:
     static void recordSymmetricFailure(NCCLWindowAllocator& allocator, ncclComm_t comm, size_t size)
     {
         std::lock_guard<std::mutex> lock(allocator.mMutex);
-        allocator.recordSymmetricFailureLocked(comm, size);
+        int device = -1;
+        TLLM_CUDA_CHECK(cudaGetDevice(&device));
+        allocator.recordSymmetricFailureLocked(comm, device, size);
     }
 
     static cudaError_t clearCudaErrorIfSymmetricAllocationFailed(
@@ -309,6 +311,9 @@ TEST_F(NCCLWindowAllocatorTest, BasicAllocation)
     EXPECT_NE(buffer.window, nullptr);
     EXPECT_EQ(buffer.size, bufferSize);
     EXPECT_GE(buffer.handle, 0);
+    int currentDevice = -1;
+    TLLM_CUDA_CHECK(cudaGetDevice(&currentDevice));
+    EXPECT_EQ(buffer.device, currentDevice);
 
     // Verify we can search for it
     auto found = allocator.searchBuffer(*mComm, buffer.ptr);
@@ -711,11 +716,14 @@ TEST_F(CreateNCCLWindowTensorTest, BasicTensorCreation)
     // Create a tensor with shape [4, 8] and float32 dtype
     std::vector<int64_t> shape = {4, 8};
     auto [tensor, buffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
+    int currentDevice = -1;
+    TLLM_CUDA_CHECK(cudaGetDevice(&currentDevice));
 
     // Verify tensor properties
     EXPECT_TRUE(tensor.defined());
     EXPECT_EQ(tensor.dtype(), torch::kFloat32);
     EXPECT_EQ(tensor.device().type(), torch::kCUDA);
+    EXPECT_EQ(tensor.get_device(), currentDevice);
     EXPECT_EQ(tensor.dim(), 2);
     EXPECT_EQ(tensor.size(0), 4);
     EXPECT_EQ(tensor.size(1), 8);
@@ -727,6 +735,7 @@ TEST_F(CreateNCCLWindowTensorTest, BasicTensorCreation)
     // ncclMemAlloc may allocate more than requested, so check at least the requested size
     EXPECT_GE(buffer.size, 4 * 8 * sizeof(float));
     EXPECT_NE(buffer.window, nullptr);
+    EXPECT_EQ(buffer.device, currentDevice);
 
     // Verify tensor data pointer matches buffer pointer
     EXPECT_EQ(tensor.data_ptr(), buffer.ptr);
@@ -829,6 +838,38 @@ TEST_F(CreateNCCLWindowTensorTest, TensorDeleterReleasesBuffer)
 
     // Buffer should still exist in the pool (for reuse)
     EXPECT_GE(allocator.getBufferCount(*mComm), 1);
+}
+
+TEST_F(CreateNCCLWindowTensorTest, TensorDeleterUsesOwningDevice)
+{
+    using nccl_util::createNCCLWindowTensor;
+
+    int deviceCount = 0;
+    TLLM_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
+    if (deviceCount < 2)
+    {
+        GTEST_SKIP() << "Requires at least two CUDA devices";
+    }
+
+    int ownerDevice = -1;
+    TLLM_CUDA_CHECK(cudaGetDevice(&ownerDevice));
+    int const otherDevice = (ownerDevice + 1) % deviceCount;
+
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    auto [tensor, buffer] = createNCCLWindowTensor(mComm, {16, 16}, torch::kFloat32);
+    ASSERT_TRUE(tensor.defined());
+    ASSERT_TRUE(buffer.isValid());
+    EXPECT_EQ(buffer.device, ownerDevice);
+
+    TLLM_CUDA_CHECK(cudaSetDevice(otherDevice));
+    tensor = torch::Tensor();
+
+    EXPECT_EQ(allocator.getBufferInUseCount(*mComm, ownerDevice), 0);
+    int currentDevice = -1;
+    TLLM_CUDA_CHECK(cudaGetDevice(&currentDevice));
+    EXPECT_EQ(currentDevice, otherDevice);
+
+    TLLM_CUDA_CHECK(cudaSetDevice(ownerDevice));
 }
 
 TEST_F(CreateNCCLWindowTensorTest, MultipleTensors)

@@ -524,7 +524,7 @@ private:
             {
                 // Large buffer: create window buffer and copy input (can swap inputTensor reference)
                 auto [symmetricInput, symmetricBuffer0]
-                    = createNCCLWindowTensor(rawComm, input.sizes(), input.scalar_type());
+                    = createNCCLWindowTensor(rawComm, input.sizes(), input.scalar_type(), input.device());
                 if (!symmetricBuffer0.isValid())
                 {
                     TLLM_LOG_DEBUG(
@@ -555,7 +555,8 @@ private:
         }
 
         // Use window-backed output buffer
-        auto [normOut, windowBuffer1] = createNCCLWindowTensor(rawComm, input.sizes(), input.scalar_type());
+        auto [normOut, windowBuffer1]
+            = createNCCLWindowTensor(rawComm, input.sizes(), input.scalar_type(), input.device());
         torch::Tensor outputTensor = windowBuffer1.isValid() ? normOut : torch::empty_like(inputTensor);
         void* outputPtr = windowBuffer1.isValid() ? windowBuffer1.ptr : outputTensor.data_ptr();
         if (!windowBuffer1.isValid())
@@ -1481,6 +1482,9 @@ void preallocateNCCLWindowBuffer(
         return;
     }
 
+    c10::cuda::CUDAGuard deviceGuard(input.device());
+    int const device = input.get_device();
+
     std::set<int> groupSet;
     for (auto const& rank : group)
     {
@@ -1518,7 +1522,7 @@ void preallocateNCCLWindowBuffer(
     {
         for (int64_t i = 0; i < buffersPerSize; ++i)
         {
-            auto buffer = allocator.requestBuffer(comm, bufferSize);
+            auto buffer = allocator.requestBuffer(comm, bufferSize, device);
             if (!buffer.isValid())
             {
                 break;
@@ -1533,7 +1537,7 @@ void preallocateNCCLWindowBuffer(
 
     for (auto ptr : allocatedPtrs)
     {
-        allocator.releaseBuffer(comm, ptr);
+        allocator.releaseBuffer(comm, ptr, device);
     }
 #else
     (void) group;
@@ -1549,6 +1553,7 @@ bool isNCCLWindowBuffer(torch::Tensor const& input, torch::List<int64_t> const& 
         return false;
     }
 
+    c10::cuda::CUDAGuard deviceGuard(input.device());
     std::set<int> groupSet;
     for (auto const& rank : group)
     {
@@ -1573,7 +1578,8 @@ bool isNCCLWindowBuffer(torch::Tensor const& input, torch::List<int64_t> const& 
     }
 
     using tensorrt_llm::common::nccl_util::NCCLWindowAllocator;
-    auto const buffer = NCCLWindowAllocator::getInstance().searchBuffer(*commPtr, input.data_ptr());
+    auto const buffer
+        = NCCLWindowAllocator::getInstance().searchBuffer(*commPtr, input.data_ptr(), input.get_device());
     return buffer.isValid();
 #else
     (void) input;
@@ -1589,6 +1595,7 @@ std::vector<torch::Tensor> allreduce_raw(torch::Tensor const& input, torch::opti
     bool const trigger_completion_at_end_)
 {
 #if ENABLE_MULTI_DEVICE
+    c10::cuda::CUDAGuard deviceGuard(input.device());
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
     auto const strategy = static_cast<AllReduceStrategyType>(int8_t(strategy_));
     auto const fusion_op = static_cast<AllReduceFusionOp>(int8_t(fusion_op_));
@@ -1613,6 +1620,7 @@ std::vector<torch::Tensor> allreduce_pg(torch::Tensor const& input, torch::optio
     int64_t const strategy_, int64_t const fusion_op_, double const eps_, bool const trigger_completion_at_end_)
 {
 #if ENABLE_MULTI_DEVICE
+    c10::cuda::CUDAGuard deviceGuard(input.device());
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
     auto const strategy = static_cast<AllReduceStrategyType>(int8_t(strategy_));
     auto const fusion_op = static_cast<AllReduceFusionOp>(int8_t(fusion_op_));
