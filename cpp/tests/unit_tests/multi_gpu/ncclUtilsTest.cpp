@@ -361,6 +361,12 @@ TEST_F(NCCLWindowAllocatorTest, StaleGenerationCannotReleaseReusedBuffer)
     ASSERT_EQ(second.ptr, first.ptr);
     ASSERT_GT(second.generation, first.generation);
 
+    auto const currentStream = c10::cuda::getCurrentCUDAStream(second.device).stream();
+    EXPECT_THROW(
+        allocator.recordBufferStreamJoin(
+            *mComm, first.ptr, first.device, first.generation, currentStream),
+        tensorrt_llm::common::TllmException);
+
     allocator.releaseBuffer(*mComm, first.ptr, first.device, first.generation);
     EXPECT_EQ(allocator.getBufferInUseCount(*mComm, second.device), 1);
 
@@ -371,6 +377,7 @@ TEST_F(NCCLWindowAllocatorTest, StaleGenerationCannotReleaseReusedBuffer)
 TEST_F(NCCLWindowAllocatorTest, EagerDifferentStreamsDoNotAlias)
 {
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    auto testComm = createSplitComm(*mComm, 0, mRank);
     int device = -1;
     TLLM_CUDA_CHECK(cudaGetDevice(&device));
 
@@ -381,65 +388,260 @@ TEST_F(NCCLWindowAllocatorTest, EagerDifferentStreamsDoNotAlias)
     nccl_util::NCCLWindowLease first;
     {
         c10::cuda::CUDAStreamGuard streamGuard(stream1);
-        first = allocator.requestBuffer(*mComm, 256 * 1024, device);
+        first = allocator.requestBuffer(*testComm, 256 * 1024, device);
         ASSERT_TRUE(first.isValid());
-        allocator.releaseBuffer(*mComm, first);
+        allocator.releaseBuffer(*testComm, first);
     }
 
     nccl_util::NCCLWindowLease second;
     {
         c10::cuda::CUDAStreamGuard streamGuard(stream2);
-        second = allocator.requestBuffer(*mComm, 256 * 1024, device);
+        second = allocator.requestBuffer(*testComm, 256 * 1024, device);
         ASSERT_TRUE(second.isValid());
         EXPECT_NE(second.ptr, first.ptr);
-        allocator.releaseBuffer(*mComm, second);
+        allocator.releaseBuffer(*testComm, second);
     }
+    TLLM_CUDA_CHECK(cudaStreamSynchronize(stream1.stream()));
+    TLLM_CUDA_CHECK(cudaStreamSynchronize(stream2.stream()));
+    testComm.reset();
+}
+
+TEST_F(NCCLWindowAllocatorTest, DefaultStreamIsARealReuseFrontier)
+{
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    auto testComm = createSplitComm(*mComm, 0, mRank);
+    int device = -1;
+    TLLM_CUDA_CHECK(cudaGetDevice(&device));
+
+    auto defaultStream = c10::cuda::getDefaultCUDAStream(device);
+    auto otherStream = c10::cuda::getStreamFromPool(false, device);
+
+    nccl_util::NCCLWindowLease original;
+    {
+        c10::cuda::CUDAStreamGuard streamGuard(defaultStream);
+        original = allocator.requestBuffer(*testComm, 256 * 1024, device);
+        ASSERT_TRUE(original.isValid());
+        allocator.releaseBuffer(*testComm, original);
+
+        auto sameLane = allocator.requestBuffer(*testComm, 256 * 1024, device);
+        ASSERT_TRUE(sameLane.isValid());
+        EXPECT_EQ(sameLane.ptr, original.ptr);
+        allocator.releaseBuffer(*testComm, sameLane);
+    }
+
+    {
+        c10::cuda::CUDAStreamGuard streamGuard(otherStream);
+        auto foreignLane = allocator.requestBuffer(*testComm, 256 * 1024, device);
+        ASSERT_TRUE(foreignLane.isValid());
+        EXPECT_NE(foreignLane.ptr, original.ptr);
+        allocator.releaseBuffer(*testComm, foreignLane);
+    }
+
+    TLLM_CUDA_CHECK(cudaStreamSynchronize(defaultStream.stream()));
+    TLLM_CUDA_CHECK(cudaStreamSynchronize(otherStream.stream()));
+    testComm.reset();
+}
+
+TEST_F(NCCLWindowAllocatorTest, ObservedConsumerStreamBecomesReuseFrontier)
+{
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    auto testComm = createSplitComm(*mComm, 0, mRank);
+    int device = -1;
+    TLLM_CUDA_CHECK(cudaGetDevice(&device));
+
+    auto producerStream = c10::cuda::getStreamFromPool(false, device);
+    auto consumerStream = c10::cuda::getStreamFromPool(false, device);
+    ASSERT_NE(producerStream.stream(), consumerStream.stream());
+
+    nccl_util::NCCLWindowLease original;
+    cudaEvent_t produced = nullptr;
+    TLLM_CUDA_CHECK(cudaEventCreateWithFlags(&produced, cudaEventDisableTiming));
+    {
+        c10::cuda::CUDAStreamGuard streamGuard(producerStream);
+        original = allocator.requestBuffer(*testComm, 256 * 1024, device);
+        ASSERT_TRUE(original.isValid());
+        TLLM_CUDA_CHECK(cudaMemsetAsync(original.ptr, 0x11, original.size, producerStream.stream()));
+        TLLM_CUDA_CHECK(cudaEventRecord(produced, producerStream.stream()));
+    }
+
+    {
+        c10::cuda::CUDAStreamGuard streamGuard(consumerStream);
+        TLLM_CUDA_CHECK(cudaStreamWaitEvent(consumerStream.stream(), produced));
+        auto observed = allocator.searchBuffer(*testComm, original.ptr, device, true);
+        ASSERT_TRUE(observed.isValid());
+        TLLM_CUDA_CHECK(cudaMemsetAsync(observed.ptr, 0x22, observed.size, consumerStream.stream()));
+        allocator.recordBufferStreamJoin(
+            *testComm, original.ptr, device, original.generation, producerStream.stream());
+        allocator.releaseBuffer(*testComm, original);
+    }
+
+    nccl_util::NCCLWindowLease producerBorrow;
+    {
+        c10::cuda::CUDAStreamGuard streamGuard(producerStream);
+        producerBorrow = allocator.requestBuffer(*testComm, 256 * 1024, device);
+        ASSERT_TRUE(producerBorrow.isValid());
+        EXPECT_NE(producerBorrow.ptr, original.ptr);
+        allocator.releaseBuffer(*testComm, producerBorrow);
+    }
+
+    {
+        c10::cuda::CUDAStreamGuard streamGuard(consumerStream);
+        auto consumerBorrow = allocator.requestBuffer(*testComm, 256 * 1024, device);
+        ASSERT_TRUE(consumerBorrow.isValid());
+        EXPECT_EQ(consumerBorrow.ptr, original.ptr);
+        allocator.releaseBuffer(*testComm, consumerBorrow);
+        TLLM_CUDA_CHECK(cudaStreamSynchronize(consumerStream.stream()));
+    }
+
+    TLLM_CUDA_CHECK(cudaStreamSynchronize(producerStream.stream()));
+    TLLM_CUDA_CHECK(cudaEventDestroy(produced));
+    testComm.reset();
 }
 
 TEST_F(NCCLWindowAllocatorTest, GraphDomainRetainsAndReusesRegisteredBuffer)
 {
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    auto testComm = createSplitComm(*mComm, 0, mRank);
     int device = -1;
     TLLM_CUDA_CHECK(cudaGetDevice(&device));
-    auto stream = c10::cuda::getStreamFromPool(false, device);
-    c10::cuda::CUDAStreamGuard streamGuard(stream);
+    auto replayStream = c10::cuda::getStreamFromPool(false, device);
+    auto captureStream0 = c10::cuda::getStreamFromPool(false, device);
+    auto captureStream1 = c10::cuda::getStreamFromPool(false, device);
 
-    auto prepared = allocator.requestBuffer(*mComm, 256 * 1024, device);
-    ASSERT_TRUE(prepared.isValid());
-    void* const expectedPtr = prepared.ptr;
-    allocator.releaseBuffer(*mComm, prepared);
-
-    uint64_t const domainId = allocator.createReuseDomain(device);
-    cudaGraph_t graph = nullptr;
-    cudaGraphExec_t graphExec = nullptr;
-    TLLM_CUDA_CHECK(cudaStreamBeginCapture(stream.stream(), cudaStreamCaptureModeThreadLocal));
-    uint64_t const captureId = allocator.beginCapture(domainId);
-
-    auto captured = allocator.requestBuffer(*mComm, 256 * 1024, device);
-    EXPECT_TRUE(captured.isValid());
-    if (captured.isValid())
+    uint64_t domainId = 0;
+    uint64_t foreignDomainId = 0;
+    void* expectedPtr = nullptr;
     {
-        EXPECT_EQ(captured.ptr, expectedPtr);
-        TLLM_CUDA_CHECK(cudaMemsetAsync(captured.ptr, 0x5a, captured.size, stream.stream()));
-        allocator.releaseBuffer(*mComm, captured);
+        c10::cuda::CUDAStreamGuard replayGuard(replayStream);
+        domainId = allocator.createReuseDomain(device);
+        allocator.beginPreparation(domainId);
+        allocator.retainCommForActiveDomain(testComm);
+        auto prepared = allocator.requestBuffer(*testComm, 256 * 1024, device);
+        ASSERT_TRUE(prepared.isValid());
+        expectedPtr = prepared.ptr;
+        allocator.releaseBuffer(*testComm, prepared);
+        allocator.endPreparation(domainId);
+
+        // A second serial domain on the same lane must reserve another
+        // address even though neither domain has captured a graph yet.
+        foreignDomainId = allocator.createReuseDomain(device);
+        allocator.beginPreparation(foreignDomainId);
+        allocator.retainCommForActiveDomain(testComm);
+        auto foreignPrepared = allocator.requestBuffer(*testComm, 256 * 1024, device);
+        ASSERT_TRUE(foreignPrepared.isValid());
+        EXPECT_NE(foreignPrepared.ptr, expectedPtr);
+        allocator.releaseBuffer(*testComm, foreignPrepared);
+        allocator.endPreparation(foreignDomainId);
     }
-    allocator.endCapture(captureId);
 
-    TLLM_CUDA_CHECK(cudaStreamEndCapture(stream.stream(), &graph));
-    ASSERT_NE(graph, nullptr);
-    TLLM_CUDA_CHECK(cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0));
-    ASSERT_NE(graphExec, nullptr);
-    TLLM_CUDA_CHECK(cudaGraphLaunch(graphExec, stream.stream()));
-    TLLM_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
-    TLLM_CUDA_CHECK(cudaGraphExecDestroy(graphExec));
-    TLLM_CUDA_CHECK(cudaGraphDestroy(graph));
+    cudaGraph_t graph0 = nullptr;
+    cudaGraphExec_t graphExec0 = nullptr;
+    {
+        c10::cuda::CUDAStreamGuard captureGuard(captureStream0);
+        TLLM_CUDA_CHECK(cudaStreamBeginCapture(captureStream0.stream(), cudaStreamCaptureModeThreadLocal));
+        uint64_t const captureId = allocator.beginCapture(domainId);
+        allocator.retainCommForActiveDomain(testComm);
 
+        auto firstCapturedLease = allocator.requestBuffer(*testComm, 256 * 1024, device);
+        ASSERT_TRUE(firstCapturedLease.isValid());
+        EXPECT_EQ(firstCapturedLease.ptr, expectedPtr);
+        TLLM_CUDA_CHECK(cudaMemsetAsync(
+            firstCapturedLease.ptr, 0x5a, firstCapturedLease.size, captureStream0.stream()));
+        allocator.releaseBuffer(*testComm, firstCapturedLease);
+
+        // A later overwrite on the exact same captured stream is ordered and
+        // may reuse the transient slot without an event or replay overhead.
+        auto secondCapturedLease = allocator.requestBuffer(*testComm, 256 * 1024, device);
+        ASSERT_TRUE(secondCapturedLease.isValid());
+        EXPECT_EQ(secondCapturedLease.ptr, expectedPtr);
+        EXPECT_GT(secondCapturedLease.generation, firstCapturedLease.generation);
+        TLLM_CUDA_CHECK(cudaMemsetAsync(
+            secondCapturedLease.ptr, 0x3c, secondCapturedLease.size, captureStream0.stream()));
+        allocator.releaseBuffer(*testComm, secondCapturedLease);
+
+        allocator.endCapture(captureId);
+        TLLM_CUDA_CHECK(cudaStreamEndCapture(captureStream0.stream(), &graph0));
+    }
+    ASSERT_NE(graph0, nullptr);
+    TLLM_CUDA_CHECK(cudaGraphInstantiate(&graphExec0, graph0, nullptr, nullptr, 0));
+    ASSERT_NE(graphExec0, nullptr);
+
+    // A second graph variant captured on another side stream shares the same
+    // arena because both execs are launched serially on replayStream.
+    cudaGraph_t graph1 = nullptr;
+    cudaGraphExec_t graphExec1 = nullptr;
+    {
+        c10::cuda::CUDAStreamGuard captureGuard(captureStream1);
+        TLLM_CUDA_CHECK(cudaStreamBeginCapture(captureStream1.stream(), cudaStreamCaptureModeThreadLocal));
+        uint64_t const captureId = allocator.beginCapture(domainId);
+        allocator.retainCommForActiveDomain(testComm);
+        auto variantLease = allocator.requestBuffer(*testComm, 256 * 1024, device);
+        ASSERT_TRUE(variantLease.isValid());
+        EXPECT_EQ(variantLease.ptr, expectedPtr);
+        TLLM_CUDA_CHECK(
+            cudaMemsetAsync(variantLease.ptr, 0x7b, variantLease.size, captureStream1.stream()));
+        allocator.releaseBuffer(*testComm, variantLease);
+        allocator.endCapture(captureId);
+        TLLM_CUDA_CHECK(cudaStreamEndCapture(captureStream1.stream(), &graph1));
+    }
+    ASSERT_NE(graph1, nullptr);
+    TLLM_CUDA_CHECK(cudaGraphInstantiate(&graphExec1, graph1, nullptr, nullptr, 0));
+    ASSERT_NE(graphExec1, nullptr);
+
+    allocator.quiesceReuseDomain(foreignDomainId);
+    allocator.closeReuseDomain(foreignDomainId);
+
+    {
+        c10::cuda::CUDAStreamGuard replayGuard(replayStream);
+        auto sameLane = allocator.searchBuffer(*testComm, expectedPtr, device, true);
+        EXPECT_TRUE(sameLane.isValid());
+    }
+    {
+        c10::cuda::CUDAStreamGuard foreignGuard(captureStream0);
+        auto foreignLane = allocator.searchBuffer(*testComm, expectedPtr, device, true);
+        EXPECT_FALSE(foreignLane.isValid());
+    }
+
+    // The graph owns expectedPtr even though both transient leases ended.
+    // Foreign eager work must receive another slot until graph teardown.
+    {
+        c10::cuda::CUDAStreamGuard replayGuard(replayStream);
+        auto foreignLease = allocator.requestBuffer(*testComm, 256 * 1024, device);
+        ASSERT_TRUE(foreignLease.isValid());
+        EXPECT_NE(foreignLease.ptr, expectedPtr);
+        allocator.releaseBuffer(*testComm, foreignLease);
+
+        for (int iteration = 0; iteration < 1000; ++iteration)
+        {
+            TLLM_CUDA_CHECK(cudaGraphLaunch(graphExec0, replayStream.stream()));
+            TLLM_CUDA_CHECK(cudaGraphLaunch(graphExec1, replayStream.stream()));
+        }
+    }
+
+    // Quiesce before graph reset. closeReuseDomain synchronizes the in-flight
+    // replay lane and waits for both CUDA user-object references to retire.
+    allocator.quiesceReuseDomain(domainId);
+    TLLM_CUDA_CHECK(cudaGraphExecDestroy(graphExec0));
+    TLLM_CUDA_CHECK(cudaGraphExecDestroy(graphExec1));
+    TLLM_CUDA_CHECK(cudaGraphDestroy(graph0));
+    TLLM_CUDA_CHECK(cudaGraphDestroy(graph1));
     allocator.closeReuseDomain(domainId);
 
-    auto reused = allocator.requestBuffer(*mComm, 256 * 1024, device);
-    ASSERT_TRUE(reused.isValid());
-    EXPECT_EQ(reused.ptr, expectedPtr);
-    allocator.releaseBuffer(*mComm, reused);
+    unsigned char finalValue = 0;
+    TLLM_CUDA_CHECK(cudaMemcpy(&finalValue, expectedPtr, sizeof(finalValue), cudaMemcpyDeviceToHost));
+    EXPECT_EQ(finalValue, 0x7b);
+
+    {
+        // Teardown synchronized the old replay lane, so the retired arena is
+        // safe to adopt on a different stream without an event.
+        c10::cuda::CUDAStreamGuard postCloseGuard(captureStream0);
+        auto reused = allocator.requestBuffer(*testComm, 256 * 1024, device);
+        ASSERT_TRUE(reused.isValid());
+        EXPECT_EQ(reused.ptr, expectedPtr);
+        allocator.releaseBuffer(*testComm, reused);
+        TLLM_CUDA_CHECK(cudaStreamSynchronize(captureStream0.stream()));
+    }
+    testComm.reset();
 }
 
 TEST_F(NCCLWindowAllocatorTest, BestFitReuse)

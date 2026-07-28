@@ -1149,6 +1149,10 @@ class TestADPiecewiseRunnerCapture:
         monkeypatch.setattr(piecewise_runner_mod, "make_weak_ref", fake_make_weak_ref)
 
         runner = ADPiecewiseRunner(nn.Identity())
+        # This test intentionally replaces real CUDA capture with a no-op
+        # context. Keep the registered-window lifetime wrapper consistent with
+        # that fake instead of entering the native capture protocol.
+        monkeypatch.setattr(runner._window_reuse_domain, "capture", fake_cuda_graph)
         runner.set_dynamic_out_info(
             7,
             OutputInfo(
