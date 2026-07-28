@@ -1516,8 +1516,8 @@ void preallocateNCCLWindowBuffer(
     }
     TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffer] Pre-allocating %ld buffer(s) for tokens=%ld (%zu bytes) comm %p",
         buffersPerSize, numTokens, bufferSize, static_cast<void*>(comm));
-    std::vector<void*> allocatedPtrs;
-    allocatedPtrs.reserve(buffersPerSize);
+    std::vector<tensorrt_llm::common::nccl_util::NCCLWindowLease> allocatedBuffers;
+    allocatedBuffers.reserve(buffersPerSize);
     try
     {
         for (int64_t i = 0; i < buffersPerSize; ++i)
@@ -1527,7 +1527,7 @@ void preallocateNCCLWindowBuffer(
             {
                 break;
             }
-            allocatedPtrs.push_back(buffer.ptr);
+            allocatedBuffers.push_back(buffer);
         }
     }
     catch (std::exception const& e)
@@ -1535,9 +1535,9 @@ void preallocateNCCLWindowBuffer(
         TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffer] requestBuffer failed for %zu bytes: %s", bufferSize, e.what());
     }
 
-    for (auto ptr : allocatedPtrs)
+    for (auto const& buffer : allocatedBuffers)
     {
-        allocator.releaseBuffer(comm, ptr, device);
+        allocator.releaseBuffer(comm, buffer.ptr, device, buffer.generation);
     }
 #else
     (void) group;

@@ -22,6 +22,7 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include <gtest/gtest.h>
+#include <c10/cuda/CUDAStream.h>
 #include <mutex>
 #include <nccl.h>
 #include <thread>
@@ -321,7 +322,7 @@ TEST_F(NCCLWindowAllocatorTest, BasicAllocation)
     EXPECT_EQ(found.ptr, buffer.ptr);
 
     // Release the buffer
-    allocator.releaseBuffer(*mComm, buffer.ptr);
+    allocator.releaseBuffer(*mComm, buffer);
 }
 
 TEST_F(NCCLWindowAllocatorTest, BufferReuse)
@@ -336,14 +337,63 @@ TEST_F(NCCLWindowAllocatorTest, BufferReuse)
     void* ptr1 = buffer1.ptr;
 
     // Release it
-    allocator.releaseBuffer(*mComm, ptr1);
+    allocator.releaseBuffer(*mComm, buffer1);
 
     // Request another buffer of the same size - should reuse
     auto buffer2 = allocator.requestBuffer(*mComm, bufferSize);
     EXPECT_TRUE(buffer2.isValid());
     EXPECT_EQ(buffer2.ptr, ptr1); // Should be the same buffer
 
-    allocator.releaseBuffer(*mComm, buffer2.ptr);
+    allocator.releaseBuffer(*mComm, buffer2);
+}
+
+TEST_F(NCCLWindowAllocatorTest, StaleGenerationCannotReleaseReusedBuffer)
+{
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+
+    auto first = allocator.requestBuffer(*mComm, 512 * 1024);
+    ASSERT_TRUE(first.isValid());
+    ASSERT_GT(first.generation, 0);
+    allocator.releaseBuffer(*mComm, first.ptr, first.device, first.generation);
+
+    auto second = allocator.requestBuffer(*mComm, 512 * 1024);
+    ASSERT_TRUE(second.isValid());
+    ASSERT_EQ(second.ptr, first.ptr);
+    ASSERT_GT(second.generation, first.generation);
+
+    allocator.releaseBuffer(*mComm, first.ptr, first.device, first.generation);
+    EXPECT_EQ(allocator.getBufferInUseCount(*mComm, second.device), 1);
+
+    allocator.releaseBuffer(*mComm, second.ptr, second.device, second.generation);
+    EXPECT_EQ(allocator.getBufferInUseCount(*mComm, second.device), 0);
+}
+
+TEST_F(NCCLWindowAllocatorTest, EagerDifferentStreamsDoNotAlias)
+{
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    int device = -1;
+    TLLM_CUDA_CHECK(cudaGetDevice(&device));
+
+    auto stream1 = c10::cuda::getStreamFromPool(false, device);
+    auto stream2 = c10::cuda::getStreamFromPool(false, device);
+    ASSERT_NE(stream1.stream(), stream2.stream());
+
+    nccl_util::NCCLWindowLease first;
+    {
+        c10::cuda::CUDAStreamGuard streamGuard(stream1);
+        first = allocator.requestBuffer(*mComm, 256 * 1024, device);
+        ASSERT_TRUE(first.isValid());
+        allocator.releaseBuffer(*mComm, first);
+    }
+
+    nccl_util::NCCLWindowLease second;
+    {
+        c10::cuda::CUDAStreamGuard streamGuard(stream2);
+        second = allocator.requestBuffer(*mComm, 256 * 1024, device);
+        ASSERT_TRUE(second.isValid());
+        EXPECT_NE(second.ptr, first.ptr);
+        allocator.releaseBuffer(*mComm, second);
+    }
 }
 
 TEST_F(NCCLWindowAllocatorTest, BestFitReuse)
@@ -360,9 +410,9 @@ TEST_F(NCCLWindowAllocatorTest, BestFitReuse)
     void* ptr512KB = buffer512KB.ptr;
 
     // Release all
-    allocator.releaseBuffer(*mComm, ptr1MB);
-    allocator.releaseBuffer(*mComm, ptr2MB);
-    allocator.releaseBuffer(*mComm, ptr512KB);
+    allocator.releaseBuffer(*mComm, buffer1MB);
+    allocator.releaseBuffer(*mComm, buffer2MB);
+    allocator.releaseBuffer(*mComm, buffer512KB);
 
     // Request 768KB - should reuse 1MB (best fit, smallest that fits)
     auto buffer768KB = allocator.requestBuffer(*mComm, 768 * 1024);
@@ -370,7 +420,7 @@ TEST_F(NCCLWindowAllocatorTest, BestFitReuse)
     EXPECT_EQ(buffer768KB.ptr, ptr1MB);       // Should reuse 1MB buffer
     EXPECT_EQ(buffer768KB.size, 1024 * 1024); // Original size
 
-    allocator.releaseBuffer(*mComm, buffer768KB.ptr);
+    allocator.releaseBuffer(*mComm, buffer768KB);
 }
 
 TEST_F(NCCLWindowAllocatorTest, FailureCacheIsSizeAwareForNewAllocations)
@@ -389,7 +439,7 @@ TEST_F(NCCLWindowAllocatorTest, FailureCacheIsSizeAwareForNewAllocations)
     EXPECT_FALSE(failedBuffer.isValid());
     EXPECT_EQ(allocator.getBufferCount(*testComm), 1);
 
-    allocator.releaseBuffer(*testComm, smallBuffer.ptr);
+    allocator.releaseBuffer(*testComm, smallBuffer);
     testComm.reset();
 }
 
@@ -401,7 +451,7 @@ TEST_F(NCCLWindowAllocatorTest, FailureCacheDoesNotDisableReusableBuffers)
     auto buffer1MB = allocator.requestBuffer(*testComm, 1024 * 1024);
     ASSERT_TRUE(buffer1MB.isValid());
     void* ptr1MB = buffer1MB.ptr;
-    allocator.releaseBuffer(*testComm, ptr1MB);
+    allocator.releaseBuffer(*testComm, buffer1MB);
 
     nccl_util::NCCLWindowAllocatorTestAccess::recordSymmetricFailure(allocator, *testComm, 512 * 1024);
 
@@ -409,7 +459,7 @@ TEST_F(NCCLWindowAllocatorTest, FailureCacheDoesNotDisableReusableBuffers)
     ASSERT_TRUE(reusedBuffer.isValid());
     EXPECT_EQ(reusedBuffer.ptr, ptr1MB);
     EXPECT_EQ(allocator.getBufferCount(*testComm), 1);
-    allocator.releaseBuffer(*testComm, reusedBuffer.ptr);
+    allocator.releaseBuffer(*testComm, reusedBuffer);
 
     auto failedBuffer = allocator.requestBuffer(*testComm, 2 * 1024 * 1024);
     EXPECT_FALSE(failedBuffer.isValid());
@@ -434,7 +484,7 @@ TEST_F(NCCLWindowAllocatorTest, FailureCacheKeepsSmallestFailureSize)
     EXPECT_FALSE(failedBuffer.isValid());
     EXPECT_EQ(allocator.getBufferCount(*testComm), 1);
 
-    allocator.releaseBuffer(*testComm, smallBuffer.ptr);
+    allocator.releaseBuffer(*testComm, smallBuffer);
     testComm.reset();
 }
 
@@ -459,23 +509,23 @@ TEST_F(NCCLWindowAllocatorTest, MultipleBuffers)
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
 
     const size_t bufferSize = 256 * 1024;
-    std::vector<void*> ptrs;
+    std::vector<nccl_util::NCCLWindowLease> leases;
 
     // Allocate multiple buffers
     for (int i = 0; i < 5; ++i)
     {
         auto buffer = allocator.requestBuffer(*mComm, bufferSize);
         EXPECT_TRUE(buffer.isValid());
-        ptrs.push_back(buffer.ptr);
+        leases.push_back(buffer);
     }
 
     EXPECT_EQ(allocator.getBufferCount(*mComm), 5);
     EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 5);
 
     // Release all
-    for (auto* ptr : ptrs)
+    for (auto const& lease : leases)
     {
-        allocator.releaseBuffer(*mComm, ptr);
+        allocator.releaseBuffer(*mComm, lease);
     }
 
     EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 0);
@@ -502,7 +552,7 @@ TEST_F(NCCLWindowAllocatorTest, SearchBuffer)
     auto notFound = allocator.searchBuffer(*mComm, fakePtr);
     EXPECT_FALSE(notFound.isValid());
 
-    allocator.releaseBuffer(*mComm, buffer.ptr);
+    allocator.releaseBuffer(*mComm, buffer);
 }
 
 TEST_F(NCCLWindowAllocatorTest, GetWindowAndSize)
@@ -527,7 +577,7 @@ TEST_F(NCCLWindowAllocatorTest, GetWindowAndSize)
     EXPECT_EQ(allocator.getWindow(*mComm, fakePtr), nullptr);
     EXPECT_EQ(allocator.getSize(*mComm, fakePtr), 0);
 
-    allocator.releaseBuffer(*mComm, buffer.ptr);
+    allocator.releaseBuffer(*mComm, buffer);
 }
 
 TEST_F(NCCLWindowAllocatorTest, GetBufferInfo)
@@ -544,7 +594,7 @@ TEST_F(NCCLWindowAllocatorTest, GetBufferInfo)
     EXPECT_EQ(info.handle, buffer.handle);
     EXPECT_EQ(info.window, buffer.window);
 
-    allocator.releaseBuffer(*mComm, buffer.ptr);
+    allocator.releaseBuffer(*mComm, buffer);
 }
 
 TEST_F(NCCLWindowAllocatorTest, ScopedBuffer)
@@ -593,8 +643,8 @@ TEST_F(NCCLWindowAllocatorTest, CleanupOnCommDestroy)
     EXPECT_TRUE(buffer2.isValid());
 
     // Manually release buffers before cleanup to avoid warnings
-    allocator.releaseBuffer(*testComm, buffer1.ptr);
-    allocator.releaseBuffer(*testComm, buffer2.ptr);
+    allocator.releaseBuffer(*testComm, buffer1);
+    allocator.releaseBuffer(*testComm, buffer2);
 
     // Verify buffers are released but still exist in pool
     EXPECT_EQ(allocator.getBufferInUseCount(*testComm), 0);
@@ -649,8 +699,8 @@ TEST_F(NCCLWindowAllocatorTest, MultipleComms)
     EXPECT_EQ(allocator.getBufferCount(*comm2), 1);
     EXPECT_NE(buffer1.ptr, buffer2.ptr); // Different buffers from different comms
 
-    allocator.releaseBuffer(*comm1, buffer1.ptr);
-    allocator.releaseBuffer(*comm2, buffer2.ptr);
+    allocator.releaseBuffer(*comm1, buffer1);
+    allocator.releaseBuffer(*comm2, buffer2);
 
     // Clean up comms
     comm1.reset();

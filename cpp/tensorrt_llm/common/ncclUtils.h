@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -219,6 +220,23 @@ struct NCCLWindowBuffer
     }
 };
 
+// A logical acquisition of a registered window. Registration metadata remains
+// immutable and searchable; only requestBuffer can mint a releasable lease.
+struct NCCLWindowLease : public NCCLWindowBuffer
+{
+    uint64_t generation{0};
+    cudaStream_t homeStream{nullptr};
+
+    NCCLWindowLease() = default;
+
+    NCCLWindowLease(NCCLWindowBuffer const& buffer, uint64_t generation_, cudaStream_t homeStream_)
+        : NCCLWindowBuffer(buffer)
+        , generation(generation_)
+        , homeStream(homeStream_)
+    {
+    }
+};
+
 // Manages NCCL window-registered buffers with pooling and automatic cleanup.
 // Buffers are tied to the lifetime of their associated NCCL communicator.
 class NCCLWindowAllocator
@@ -230,14 +248,20 @@ public:
     // If an unused buffer of at least the requested size exists for this communicator, it will be reused.
     // Uses best-fit strategy: selects the smallest available buffer that meets the size requirement.
     // Otherwise, a new buffer is allocated and registered.
-    NCCLWindowBuffer requestBuffer(ncclComm_t comm, size_t size, int device = -1);
+    NCCLWindowLease requestBuffer(ncclComm_t comm, size_t size, int device = -1);
 
     // Search for a buffer by pointer. Returns an invalid buffer if not found.
     // This matches the UBManager.search_buffer() interface.
     NCCLWindowBuffer searchBuffer(ncclComm_t comm, void* ptr, int device = -1) const;
 
     // Release a buffer back to the pool for potential reuse
-    void releaseBuffer(ncclComm_t comm, void* ptr, int device = -1);
+    // Release is conditional on the exact logical lease generation.
+    void releaseBuffer(ncclComm_t comm, void* ptr, int device, uint64_t generation);
+
+    void releaseBuffer(ncclComm_t comm, NCCLWindowLease const& lease)
+    {
+        releaseBuffer(comm, lease.ptr, lease.device, lease.generation);
+    }
 
     // Get the window handle for a specific buffer pointer
     ncclWindow_t getWindow(ncclComm_t comm, void* ptr, int device = -1) const;
@@ -295,6 +319,8 @@ private:
     {
         NCCLWindowBuffer buffer;
         bool inUse;
+        uint64_t generation;
+        cudaStream_t homeStream;
     };
 
     struct PoolKey
@@ -346,7 +372,8 @@ public:
     {
         if (mBuffer.isValid())
         {
-            NCCLWindowAllocator::getInstance().releaseBuffer(*mComm, mBuffer.ptr, mBuffer.device);
+            NCCLWindowAllocator::getInstance().releaseBuffer(
+                *mComm, mBuffer.ptr, mBuffer.device, mBuffer.generation);
         }
     }
 
@@ -377,7 +404,7 @@ public:
 
 private:
     std::shared_ptr<ncclComm_t> mComm;
-    NCCLWindowBuffer mBuffer;
+    NCCLWindowLease mBuffer;
 };
 
 // Creates a PyTorch tensor backed by an NCCL window buffer.
@@ -410,7 +437,7 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
 
     // Request buffer from allocator
     auto& allocator = NCCLWindowAllocator::getInstance();
-    NCCLWindowBuffer buffer;
+    NCCLWindowLease lease;
 
     if (!comm || !*comm)
     {
@@ -420,7 +447,7 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
 
     try
     {
-        buffer = allocator.requestBuffer(*comm, buffer_size, device.index());
+        lease = allocator.requestBuffer(*comm, buffer_size, device.index());
     }
     catch (std::exception const& e)
     {
@@ -429,18 +456,19 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
     }
 
     // Defensive validation: ensure buffer is valid before proceeding
-    if (!buffer.isValid())
+    if (!lease.isValid())
     {
         TLLM_LOG_DEBUG("[createNCCLWindowTensor] invalid buffer returned from requestBuffer; returning invalid buffer");
         return std::make_pair(torch::Tensor(), NCCLWindowBuffer());
     }
 
     // Create custom deleter that releases the buffer
-    auto deleter = [comm, ptr = buffer.ptr, deviceIndex = buffer.device](void*) noexcept
+    auto deleter
+        = [comm, ptr = lease.ptr, deviceIndex = lease.device, generation = lease.generation](void*) noexcept
     {
         try
         {
-            NCCLWindowAllocator::getInstance().releaseBuffer(*comm, ptr, deviceIndex);
+            NCCLWindowAllocator::getInstance().releaseBuffer(*comm, ptr, deviceIndex, generation);
         }
         catch (std::exception const& e)
         {
@@ -455,9 +483,9 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
     };
 
     // Create tensor from the buffer
-    auto tensor = torch::from_blob(buffer.ptr, shape, strides_vec, deleter, torch::dtype(dtype).device(device));
+    auto tensor = torch::from_blob(lease.ptr, shape, strides_vec, deleter, torch::dtype(dtype).device(device));
 
-    return std::make_pair(tensor, buffer);
+    return std::make_pair(tensor, static_cast<NCCLWindowBuffer const&>(lease));
 }
 
 inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(

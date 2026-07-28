@@ -415,14 +415,14 @@ int NCCLWindowAllocator::resolveDevice(int device)
     return currentDevice;
 }
 
-NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size, int device)
+NCCLWindowLease NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size, int device)
 {
     device = resolveDevice(device);
     c10::cuda::CUDAGuard deviceGuard(static_cast<c10::DeviceIndex>(device));
 
     if (!isNcclWindowSupported(device))
     {
-        return NCCLWindowBuffer();
+        return NCCLWindowLease();
     }
 
     TLLM_CHECK_WITH_INFO(comm != nullptr, "NCCL communicator cannot be null");
@@ -438,13 +438,15 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     // Use best-fit: find the smallest buffer that's >= requested size
     PoolKey const poolKey{comm, device};
     auto& commBuffers = mBufferPool[poolKey];
+    cudaStream_t const currentStream = at::cuda::getCurrentCUDAStream(device).stream();
     auto bestFit = commBuffers.end();
     size_t bestFitSize = std::numeric_limits<size_t>::max();
 
     for (auto it = commBuffers.begin(); it != commBuffers.end(); ++it)
     {
         auto const& entry = **it;
-        if (!entry.inUse && entry.buffer.size >= size && entry.buffer.size < bestFitSize)
+        bool const streamOrdered = entry.homeStream == nullptr || entry.homeStream == currentStream;
+        if (!entry.inUse && streamOrdered && entry.buffer.size >= size && entry.buffer.size < bestFitSize)
         {
             bestFit = it;
             bestFitSize = entry.buffer.size;
@@ -455,11 +457,14 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     {
         auto& entry = **bestFit;
         entry.inUse = true;
+        ++entry.generation;
+        entry.homeStream = currentStream;
         TLLM_LOG_TRACE(
             "[NCCLUtil] Reusing NCCL window buffer for comm %p on device %d: "
-            "handle=%d, ptr=%p, size=%zu (requested: %zu)",
-            static_cast<void*>(comm), device, entry.buffer.handle, entry.buffer.ptr, entry.buffer.size, size);
-        return entry.buffer;
+            "handle=%d, ptr=%p, size=%zu, generation=%llu (requested: %zu)",
+            static_cast<void*>(comm), device, entry.buffer.handle, entry.buffer.ptr, entry.buffer.size,
+            static_cast<unsigned long long>(entry.generation), size);
+        return NCCLWindowLease(entry.buffer, entry.generation, entry.homeStream);
     }
 
     // If a previous allocateAndRegisterBuffer call collectively failed for this comm at a size
@@ -472,22 +477,22 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
             "[NCCLUtil] Skipping NCCL window allocation for comm %p on device %d, "
             "size=%zu; known failure threshold=%zu",
             static_cast<void*>(comm), device, size, failureIt->second);
-        return NCCLWindowBuffer();
+        return NCCLWindowLease();
     }
 
     // No available buffer found, avoid registration during CUDA graph capture
-    auto stream = at::cuda::getCurrentCUDAStream();
-    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-    auto capture_err = cudaStreamIsCapturing(stream, &capture_status);
-    if (capture_err != cudaSuccess)
+    cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+    auto const captureErr = cudaStreamIsCapturing(currentStream, &captureStatus);
+    if (captureErr != cudaSuccess)
     {
-        TLLM_LOG_DEBUG("[NCCLUtil] cudaStreamIsCapturing failed: %s", cudaGetErrorString(capture_err));
+        TLLM_LOG_DEBUG("[NCCLUtil] cudaStreamIsCapturing failed: %s", cudaGetErrorString(captureErr));
     }
-    if (capture_err == cudaSuccess && capture_status != cudaStreamCaptureStatusNone)
+    bool const isCapturing = captureErr == cudaSuccess && captureStatus != cudaStreamCaptureStatusNone;
+    if (isCapturing)
     {
         TLLM_LOG_DEBUG("[NCCLUtil] Skipping NCCL window allocation during capture for comm %p (requested: %zu)",
             static_cast<void*>(comm), size);
-        return NCCLWindowBuffer();
+        return NCCLWindowLease();
     }
 
     // No available buffer found, allocate a new one
@@ -501,7 +506,7 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     // permanently "in use" empty entry per request because releaseBuffer is a no-op for nullptr.
     if (buffer.isValid())
     {
-        commBuffers.push_back(std::make_unique<BufferEntry>(BufferEntry{buffer, true}));
+        commBuffers.push_back(std::make_unique<BufferEntry>(BufferEntry{buffer, true, 1, currentStream}));
     }
     else
     {
@@ -511,7 +516,7 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
         recordSymmetricFailureLocked(comm, device, size);
     }
 
-    return buffer;
+    return buffer.isValid() ? NCCLWindowLease(buffer, 1, currentStream) : NCCLWindowLease();
 }
 
 void NCCLWindowAllocator::recordSymmetricFailureLocked(ncclComm_t comm, int device, size_t size)
@@ -551,7 +556,7 @@ NCCLWindowBuffer NCCLWindowAllocator::searchBuffer(ncclComm_t comm, void* ptr, i
     return searchBufferLocked(comm, ptr, device);
 }
 
-void NCCLWindowAllocator::releaseBuffer(ncclComm_t comm, void* ptr, int device)
+void NCCLWindowAllocator::releaseBuffer(ncclComm_t comm, void* ptr, int device, uint64_t generation)
 {
     if (!comm || !ptr)
     {
@@ -575,9 +580,27 @@ void NCCLWindowAllocator::releaseBuffer(ncclComm_t comm, void* ptr, int device)
         auto& entry = *entryPtr;
         if (entry.buffer.ptr == ptr)
         {
+            if (generation == 0 || generation != entry.generation)
+            {
+                TLLM_LOG_WARNING(
+                    "[NCCLUtil] Ignoring stale release for comm %p on device %d: "
+                    "ptr=%p, generation=%llu, active generation=%llu",
+                    static_cast<void*>(comm), device, ptr, static_cast<unsigned long long>(generation),
+                    static_cast<unsigned long long>(entry.generation));
+                return;
+            }
+            if (!entry.inUse)
+            {
+                TLLM_LOG_WARNING(
+                    "[NCCLUtil] Ignoring duplicate release for comm %p on device %d: ptr=%p, generation=%llu",
+                    static_cast<void*>(comm), device, ptr, static_cast<unsigned long long>(entry.generation));
+                return;
+            }
             entry.inUse = false;
-            TLLM_LOG_TRACE("[NCCLUtil] Released NCCL window buffer for comm %p on device %d: ptr=%p",
-                static_cast<void*>(comm), device, ptr);
+            TLLM_LOG_TRACE(
+                "[NCCLUtil] Released NCCL window buffer for comm %p on device %d: ptr=%p, generation=%llu, stream=%p",
+                static_cast<void*>(comm), device, ptr, static_cast<unsigned long long>(entry.generation),
+                static_cast<void*>(entry.homeStream));
             return;
         }
     }
