@@ -30,6 +30,7 @@ import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm.mapping import Mapping
 
+from ..cuda_graph_utils import NCCLWindowReuseDomain
 from .multi_stream.auto_multi_stream import multi_stream_schedule
 from .patterns import MATCHER_SUBSYSTEM
 from .patterns.ar_residual_norm import register_ar_fusions
@@ -73,6 +74,7 @@ class Backend:
         self.capture_num_tokens = sorted(capture_num_tokens or [])
         self.piecewise_cuda_graph = enable_piecewise_cuda_graph
         self._piecewise_runners: WeakSet[PiecewiseRunner] = WeakSet()
+        self._piecewise_window_domains: set[NCCLWindowReuseDomain] = set()
         self.no_optimization = False
         self.num_streams = max_num_streams
         self.events = Backend.Events()
@@ -126,8 +128,26 @@ class Backend:
 
     def clear_piecewise_cuda_graphs(self) -> None:
         runners = list(self._piecewise_runners)
+        # Quiesce every shared serial domain before any sibling graph exec is
+        # reset, closing the reset-to-retirement race.
+        for domain in self._piecewise_window_domains:
+            domain.quiesce()
         for runner in runners:
             runner.clear_cuda_graphs()
+
+        # A domain is shared by the piecewise segments produced by one
+        # optimizer invocation because those graph execs replay serially. All
+        # sibling graphs must be gone before closing and rotating that domain.
+        replacement_domains = {
+            domain: NCCLWindowReuseDomain()
+            for domain in self._piecewise_window_domains
+        }
+        for domain in self._piecewise_window_domains:
+            domain.close()
+        for runner in runners:
+            runner.window_reuse_domain = replacement_domains[
+                runner.window_reuse_domain]
+        self._piecewise_window_domains = set(replacement_domains.values())
 
         # CUDACachingAllocator does not allow a private pool handle to be
         # reused after its last graph is reset. Preserve the sharing between
@@ -183,6 +203,9 @@ class Backend:
                 self.num_streams,
             )
             self._piecewise_runners.update(runners)
+            if runners:
+                self._piecewise_window_domains.add(
+                    runners[0].window_reuse_domain)
             self.generate_events(num_events)
             return gm
         elif self.enable_inductor:

@@ -486,14 +486,16 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
         static_kwargs = {k: self._clone_value(v) for k, v in kwargs.items()}
 
         graph = torch.cuda.CUDAGraph()
-        for _ in range(self.WARMUP_STEPS):
-            fn(*static_args, **static_kwargs)
-            torch.cuda.synchronize()
-            gc.collect()
-            torch.cuda.empty_cache()
+        window_reuse_domain = self._get_window_reuse_domain()
+        with window_reuse_domain.prepare():
+            for _ in range(self.WARMUP_STEPS):
+                fn(*static_args, **static_kwargs)
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
 
-        with torch.cuda.graph(graph, pool=self._get_pool()):
-            output = fn(*static_args, **static_kwargs)
+            with window_reuse_domain.capture(graph, pool=self._get_pool()):
+                output = fn(*static_args, **static_kwargs)
 
         self.graphs[key] = graph
         self.static_inputs[key] = (static_args, static_kwargs)

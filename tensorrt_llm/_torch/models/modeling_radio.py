@@ -811,6 +811,13 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
         graph_runner.capture_all(device)
         self._blocks_graph_runner = graph_runner
 
+    def clear_blocks_cuda_graph(self) -> None:
+        """Release block-stack captures before model/communicator teardown."""
+        if self._blocks_graph_runner is None:
+            return
+        self._blocks_graph_runner.clear()
+        self._blocks_graph_runner = None
+
     def prepare_attn_metadata(
             self, batch_size: int, seq_lengths: List[int],
             attn_metadata: AttentionMetadata) -> AttentionMetadata:

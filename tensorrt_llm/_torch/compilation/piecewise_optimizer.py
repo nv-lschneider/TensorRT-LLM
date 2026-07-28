@@ -11,6 +11,7 @@ from torch.fx.passes.split_module import split_module
 
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 
+from ..cuda_graph_utils import NCCLWindowReuseDomain
 from ..utils import (get_model_extra_attrs,
                      get_per_request_piecewise_cuda_graph_flag,
                      get_piecewise_cuda_graph_flag, make_weak_ref,
@@ -45,6 +46,7 @@ class PiecewiseInterpreter(Interpreter):
         exclude_modules_id: list[int],
         piecewise_runner_num: int,
         graph_pool_handle: tuple[int, int],
+        window_reuse_domain: NCCLWindowReuseDomain,
         garbage_collect_values: bool = True,
         graph=None,
         max_num_streams: int = 1,
@@ -59,6 +61,7 @@ class PiecewiseInterpreter(Interpreter):
         self.piecewise_runner_idx = 0
         self.exclude_modules = [f"submod_{i}" for i in exclude_modules_id]
         self.graph_pool_handle = graph_pool_handle
+        self.window_reuse_domain = window_reuse_domain
         self.enable_inductor = enable_inductor
         self.num_events = 0
         self.max_num_streams = max_num_streams
@@ -112,6 +115,7 @@ class PiecewiseInterpreter(Interpreter):
                 runtime_num_tokens_idx,
                 self.capture_num_tokens,
                 self.graph_pool_handle,
+                self.window_reuse_domain,
                 compile_fx_inner(submod, args)
                 if self.enable_inductor else submod,
                 self.enable_inductor,
@@ -151,6 +155,7 @@ class PiecewiseRunner(object):
         runtime_num_tokens_idx: tuple[int],
         capture_num_tokens: List[int],
         graph_pool_handle,
+        window_reuse_domain: NCCLWindowReuseDomain,
         default_callable: Callable,
         enable_inductor: bool,
         is_first_runner: bool,
@@ -166,6 +171,7 @@ class PiecewiseRunner(object):
         self.runtime_num_tokens_idx = runtime_num_tokens_idx
         self.call_count = 0
         self.graph_pool_handle = graph_pool_handle
+        self.window_reuse_domain = window_reuse_domain
         self.enable_inductor = enable_inductor
 
         self.entries: dict[int, Entry] = {}
@@ -180,7 +186,11 @@ class PiecewiseRunner(object):
             )
 
     def clear_cuda_graphs(self):
-        """Release captures while retaining buckets for a later warmup."""
+        """Release captures while retaining buckets for a later warmup.
+
+        ``Backend`` owns the shared window domain and closes it only after all
+        sibling runners in this serial replay group have reset their graphs.
+        """
         for entry in self.entries.values():
             if entry.cuda_graph is not None:
                 entry.cuda_graph.reset()
@@ -224,7 +234,8 @@ class PiecewiseRunner(object):
 
             if entry.warmup_count < 3:
                 entry.warmup_count += 1
-                return entry.callable(*args)
+                with self.window_reuse_domain.prepare():
+                    return entry.callable(*args)
 
             entry.input_addresses = [
                 i.data_ptr() for i in args if isinstance(i, torch.Tensor)
@@ -239,7 +250,8 @@ class PiecewiseRunner(object):
                 # it's ready rather than capture it ourselves
                 # Graph Capture would override the stream. We need to setup the stream correctly.
                 extra_attrs = get_model_extra_attrs()
-                with torch.cuda.graph(graph, pool=self.graph_pool_handle):
+                with self.window_reuse_domain.capture(
+                        graph, pool=self.graph_pool_handle):
                     extra_attrs["global_stream"] = torch.cuda.current_stream()
                     output = entry.callable(*args)
                 extra_attrs["global_stream"] = torch.cuda.current_stream()
@@ -279,6 +291,7 @@ def piecewise_optimizer(
     max_num_streams: int = 1,
 ) -> tuple[GraphModule, int, List[PiecewiseRunner]]:
     graph_pool_handle = torch.cuda.graph_pool_handle()
+    window_reuse_domain = NCCLWindowReuseDomain()
     graph = gm.graph
 
     stop_partition = False
@@ -320,6 +333,7 @@ def piecewise_optimizer(
         exclude_modules_id,
         len(set(node_to_graph_id.values())) - len(exclude_modules_id),
         graph_pool_handle,
+        window_reuse_domain,
         max_num_streams=max_num_streams,
     )
 

@@ -552,14 +552,30 @@ class ADEngine(ModelEngine):
                 graph.reset()
 
         model = getattr(self, "model", None)
+        window_reuse_domains = {}
         if model is not None:
-            for module in model.modules():
+            modules = list(model.modules())
+            for module in modules:
+                domain = getattr(module, "_window_reuse_domain", None)
+                if domain is not None:
+                    window_reuse_domains[id(domain)] = domain
+
+            # Reject new capture/allocation work before destroying any graph
+            # that may carry a native user-object binding to these arenas.
+            for domain in window_reuse_domains.values():
+                domain.quiesce()
+
+            for module in modules:
                 if module.__class__.__name__ == "CapturedGraph":
                     cudagraphs = getattr(module, "cudagraphs", None)
                     if isinstance(cudagraphs, dict):
                         for graph in list(cudagraphs.values()):
                             _reset_cuda_graph(graph)
                         cudagraphs.clear()
+                    output_extents = getattr(
+                        module, "_cudagraph_output_extents", None)
+                    if isinstance(output_extents, dict):
+                        output_extents.clear()
                     module._cuda_graph_mem_pool = None
                     module._input_buffers = []
                     module._out_buffer_flat = None
@@ -576,6 +592,11 @@ class ADEngine(ModelEngine):
                             _reset_cuda_graph(getattr(entry, "cuda_graph", None))
                         entries.clear()
                     module._graph_pool = None
+
+        # Piecewise segments share one domain, so retire each unique arena only
+        # after every owning graph and graph-backed tensor reference is gone.
+        for domain in window_reuse_domains.values():
+            domain.close()
 
         torch.cuda.empty_cache()
 

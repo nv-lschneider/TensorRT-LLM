@@ -52,6 +52,34 @@ except (ImportError, ModuleNotFoundError):
     TRTLLM_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
+# NCCLWindowReuseDomain  (CUDA graph backends also run standalone)
+# ---------------------------------------------------------------------------
+if TRTLLM_AVAILABLE:
+    from tensorrt_llm._torch.cuda_graph_utils import NCCLWindowReuseDomain
+else:
+
+    class NCCLWindowReuseDomain:
+        """Standalone CUDA-graph wrapper when TRT-LLM window ops are absent."""
+
+        def __init__(self, *, borrow_active: bool = False) -> None:
+            del borrow_active
+
+        @contextmanager
+        def prepare(self):
+            yield None
+
+        @contextmanager
+        def capture(self, graph: torch.cuda.CUDAGraph, *, pool: Any = None):
+            with torch.cuda.graph(graph, pool=pool):
+                yield
+
+        def quiesce(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+# ---------------------------------------------------------------------------
 # ModelOpt quant config helpers  (used by standalone model factories)
 # ---------------------------------------------------------------------------
 if TRTLLM_AVAILABLE:

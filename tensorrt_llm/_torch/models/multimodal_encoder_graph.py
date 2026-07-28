@@ -39,6 +39,7 @@ from typing import (
 import torch
 
 from ...logger import logger
+from ..cuda_graph_utils import NCCLWindowReuseDomain
 from ..utils import make_weak_ref
 
 if TYPE_CHECKING:
@@ -181,6 +182,7 @@ class MultimodalEncoderGraphRunner:
         self._config = config
         # Adopted from the first captured graph so subsequent bucket captures share the pool.
         self._memory_pool = None
+        self._window_reuse_domain = NCCLWindowReuseDomain()
 
         if not config.buckets:
             raise ValueError(
@@ -212,12 +214,25 @@ class MultimodalEncoderGraphRunner:
         `enable_padding=True` captures the with-dummy-context variant for each bucket;
         `enable_padding=False` captures the exact-fit variant.
         """
-        for bucket in self._buckets:
-            key = self._padded_key_for_bucket(bucket)
-            if key in self._captured:
-                continue
-            padded_seq_lengths = self._dummy_padded_seq_lengths(bucket, key)
-            self._capture_key(key, padded_seq_lengths, device)
+        try:
+            for bucket in self._buckets:
+                key = self._padded_key_for_bucket(bucket)
+                if key in self._captured:
+                    continue
+                padded_seq_lengths = self._dummy_padded_seq_lengths(bucket, key)
+                self._capture_key(key, padded_seq_lengths, device)
+        except Exception:
+            self.clear()
+            raise
+
+    def clear(self) -> None:
+        """Reset every bucket before retiring its registered-window arena."""
+        self._window_reuse_domain.quiesce()
+        for captured in self._captured.values():
+            captured.graph.reset()
+        self._captured.clear()
+        self._window_reuse_domain.close()
+        self._memory_pool = None
 
     def maybe_run(
         self,
@@ -383,12 +398,12 @@ class MultimodalEncoderGraphRunner:
             capture_kwargs["pool"] = self._memory_pool
 
         graph = torch.cuda.CUDAGraph()
-        with torch.inference_mode():
+        with torch.inference_mode(), self._window_reuse_domain.prepare():
             for _ in range(self._config.warmup_steps):
                 self._encoder_fn(static_inputs, metadata)
             torch.cuda.synchronize()
 
-            with torch.cuda.graph(graph, **capture_kwargs):
+            with self._window_reuse_domain.capture(graph, **capture_kwargs):
                 outputs = self._encoder_fn(static_inputs, metadata)
 
         captured_outputs = {name: make_weak_ref(tensor) for name, tensor in outputs.items()}

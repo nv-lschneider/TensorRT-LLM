@@ -1,5 +1,6 @@
 import functools
 import gc
+import weakref
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Hashable, List, Optional, Protocol, Tuple, TypeAlias
 
@@ -7,6 +8,7 @@ import torch
 
 from tensorrt_llm.logger import logger
 
+from ..cuda_graph_utils import NCCLWindowReuseDomain
 from ..utils import make_weak_ref
 
 # One named graph-key component, e.g. ("hidden_states", (1, 4096, 3072)).
@@ -46,6 +48,30 @@ class SharedGraphPool:
 
     def __init__(self):
         self.handle = None
+        self._window_reuse_domain = NCCLWindowReuseDomain()
+        self._window_domain_users: weakref.WeakSet[object] = weakref.WeakSet()
+
+    def acquire_window_reuse_domain(
+            self, owner: object) -> NCCLWindowReuseDomain:
+        self._window_domain_users.add(owner)
+        return self._window_reuse_domain
+
+    def quiesce_window_reuse_domain_if_last(self, owner: object) -> None:
+        if owner in self._window_domain_users and len(
+                self._window_domain_users) == 1:
+            self._window_reuse_domain.quiesce()
+
+    def release_window_reuse_domain(self, owner: object) -> None:
+        if owner in self._window_domain_users and len(
+                self._window_domain_users) == 1:
+            self._window_reuse_domain.close()
+            self._window_domain_users.discard(owner)
+            # CUDA private pool handles cannot be reused after their final
+            # graph is reset. Rotate both resources as one generation.
+            self.handle = None
+            self._window_reuse_domain = NCCLWindowReuseDomain()
+        else:
+            self._window_domain_users.discard(owner)
 
 
 class CUDAGraphRunner:
@@ -79,6 +105,9 @@ class CUDAGraphRunner:
         self.graph_outputs: Dict[KeyType, Any] = {}  # weak refs
         self.static_inputs: Dict[KeyType, Tuple[List[Any], Dict[str, Any]]] = {}
         self.memory_pool = config.cuda_graph_mem_pool
+        self._owns_shared_window_domain = False
+        self._window_reuse_domain = (
+            None if shared_pool is not None else NCCLWindowReuseDomain())
 
     def register_extra_key_fn(self, name: str, fn: ExtraKeyFn) -> None:
         """Register a graph-key extension computed from forward args/kwargs.
@@ -124,6 +153,17 @@ class CUDAGraphRunner:
             return self._shared_pool.handle
         return self.memory_pool
 
+    def _get_window_reuse_domain(self) -> NCCLWindowReuseDomain:
+        if self._shared_pool is None:
+            assert self._window_reuse_domain is not None
+            return self._window_reuse_domain
+        if not self._owns_shared_window_domain:
+            self._window_reuse_domain = (
+                self._shared_pool.acquire_window_reuse_domain(self))
+            self._owns_shared_window_domain = True
+        assert self._window_reuse_domain is not None
+        return self._window_reuse_domain
+
     def capture(
         self, key: KeyType, fn: Callable, args: Tuple[Any, ...], kwargs: Dict[str, Any]
     ) -> None:
@@ -136,14 +176,16 @@ class CUDAGraphRunner:
         }
 
         graph = torch.cuda.CUDAGraph()
-        for _ in range(self.WARMUP_STEPS):
-            fn(*static_args, **static_kwargs)
-            torch.cuda.synchronize()
-            gc.collect()
-            torch.cuda.empty_cache()
+        window_reuse_domain = self._get_window_reuse_domain()
+        with window_reuse_domain.prepare():
+            for _ in range(self.WARMUP_STEPS):
+                fn(*static_args, **static_kwargs)
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
 
-        with torch.cuda.graph(graph, pool=self._get_pool()):
-            output = fn(*static_args, **static_kwargs)
+            with window_reuse_domain.capture(graph, pool=self._get_pool()):
+                output = fn(*static_args, **static_kwargs)
 
         self.graphs[key] = graph
         self.static_inputs[key] = (static_args, static_kwargs)
@@ -203,11 +245,23 @@ class CUDAGraphRunner:
 
     def clear(self):
         """Releases all captured graphs and the associated memory pool."""
-        if not self.graphs:
-            return
+        if self._shared_pool is not None:
+            if self._owns_shared_window_domain:
+                self._shared_pool.quiesce_window_reuse_domain_if_last(self)
+        else:
+            assert self._window_reuse_domain is not None
+            self._window_reuse_domain.quiesce()
         for graph in self.graphs.values():
             graph.reset()
         self.graphs.clear()
         self.graph_outputs.clear()
         self.static_inputs.clear()
         self.memory_pool = None
+        if self._shared_pool is not None:
+            if self._owns_shared_window_domain:
+                self._shared_pool.release_window_reuse_domain(self)
+                self._owns_shared_window_domain = False
+                self._window_reuse_domain = None
+        else:
+            assert self._window_reuse_domain is not None
+            self._window_reuse_domain.close()

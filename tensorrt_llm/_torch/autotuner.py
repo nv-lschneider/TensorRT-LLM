@@ -18,6 +18,7 @@ import torch
 from cuda.bindings import driver
 
 import tensorrt_llm
+from tensorrt_llm._torch.cuda_graph_utils import NCCLWindowReuseDomain
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._utils import confidential_compute_enabled, nvtx_range
 from tensorrt_llm.bindings.internal.runtime import (delay_kernel,
@@ -1394,6 +1395,10 @@ class AutoTuner:
         short_profile_threshold_ms = 1
 
         avg_time = float('inf')
+        # Profiles are temporary and reset before this method returns. When
+        # tuning runs inside a graph runner's eager preparation, borrow that
+        # runner's serial domain instead of creating a foreign arena.
+        window_reuse_domain = NCCLWindowReuseDomain(borrow_active=True)
 
         def pure_profile(stream: torch.cuda.Stream, repeat: int):
             graph = torch.cuda.CUDAGraph()
@@ -1426,61 +1431,77 @@ class AutoTuner:
                     return start_evt.elapsed_time(end_evt)
 
             with torch.cuda.stream(stream):
-                if use_cuda_graph:
-                    with torch.cuda.graph(graph):
+                try:
+                    if use_cuda_graph:
+                        with window_reuse_domain.capture(graph):
+                            for r in range(repeat):
+                                runner(
+                                    input_tensor_batches[
+                                        r % len(input_tensor_batches)],
+                                    tactic=tactic,
+                                    **kwargs,
+                                )
+
+                    stream.synchronize()
+                    if tuning_config.distributed_tuning_strategy == DistributedTuningStrategy.MERGE:
+                        # Currently only AllReduce will use this strategy, and only MPI parallel will enable tuning.
+                        self._dist.tp_barrier()
+
+                    # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
+                    if use_cuda_graph:
+                        delay_kernel(self._CUDA_GRAPH_DELAY_MICRO_SECS, stream)
+                    else:
+                        delay_kernel(self.stream_delay_micro_secs, stream)
+
+                    record_start()
+
+                    if use_cuda_graph:
+                        graph.replay()
+                    else:
                         for r in range(repeat):
                             runner(
-                                input_tensor_batches[r %
-                                                     len(input_tensor_batches)],
+                                input_tensor_batches[
+                                    r % len(input_tensor_batches)],
                                 tactic=tactic,
                                 **kwargs,
                             )
 
-                stream.synchronize()
-                if tuning_config.distributed_tuning_strategy == DistributedTuningStrategy.MERGE:
-                    # Currently only AllReduce will use this strategy, and only MPI parallel will enable tuning.
-                    self._dist.tp_barrier()
+                    record_end()
+                    stream.synchronize()
+                    result = elapsed_time() / repeat
+                finally:
+                    if use_cuda_graph:
+                        graph.reset()
+                return result
 
-                # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
-                if use_cuda_graph:
-                    delay_kernel(self._CUDA_GRAPH_DELAY_MICRO_SECS, stream)
-                else:
-                    delay_kernel(self.stream_delay_micro_secs, stream)
+        try:
+            # Warm up under the same preparation domain used by the captured
+            # profiles so registered-window capacity cannot come from a
+            # foreign graph arena.
+            preparation_context = (
+                window_reuse_domain.prepare()
+                if use_cuda_graph else contextlib.nullcontext())
+            with preparation_context:
+                for _ in range(self.warmup):
+                    runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
 
-                record_start()
+            fewer_repeat_avg_time = pure_profile(stream,
+                                                  profile_fewer_repeat)
 
-                if use_cuda_graph:
-                    graph.replay()
-                else:
-                    for r in range(repeat):
-                        runner(
-                            input_tensor_batches[r % len(input_tensor_batches)],
-                            tactic=tactic,
-                            **kwargs,
-                        )
+            disable_short_profile = os.environ.get(
+                "TLLM_AUTOTUNER_DISABLE_SHORT_PROFILE", "0") == "1"
 
-                record_end()
-                stream.synchronize()
-
-                return elapsed_time() / repeat
-
-        # warm up, no timing
-        for _ in range(self.warmup):
-            runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
-
-        fewer_repeat_avg_time = pure_profile(stream, profile_fewer_repeat)
-
-        disable_short_profile = os.environ.get(
-            "TLLM_AUTOTUNER_DISABLE_SHORT_PROFILE", "0") == "1"
-
-        # Disable this feature for merged tuning strategy to avoid potential hang due to asymmetric tuning.
-        if fewer_repeat_avg_time > short_profile_threshold_ms and not disable_short_profile \
-            and tuning_config.distributed_tuning_strategy != DistributedTuningStrategy.MERGE:
-            # directly use the few repeat estimated time to avoid redundant profiling
-            avg_time = fewer_repeat_avg_time
-        else:
-            # profile the kernel with the full repeat to get precise time
-            avg_time = pure_profile(stream, self.repeat)
+            # Disable this feature for merged tuning strategy to avoid potential hang due to asymmetric tuning.
+            if fewer_repeat_avg_time > short_profile_threshold_ms and not disable_short_profile \
+                and tuning_config.distributed_tuning_strategy != DistributedTuningStrategy.MERGE:
+                # directly use the few repeat estimated time to avoid redundant profiling
+                avg_time = fewer_repeat_avg_time
+            else:
+                # profile the kernel with the full repeat to get precise time
+                avg_time = pure_profile(stream, self.repeat)
+        finally:
+            if use_cuda_graph:
+                window_reuse_domain.close()
 
         shapes = self._get_input_sizes(inputs)
         self._debug_logger(

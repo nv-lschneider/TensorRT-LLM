@@ -2749,6 +2749,13 @@ class PyTorchModelEngine(ModelEngine):
         if hasattr(self, 'encoder_cuda_graph_runner'
                    ) and self.encoder_cuda_graph_runner is not None:
             self.encoder_cuda_graph_runner.clear()
+        model = getattr(self, "model", None)
+        if model is not None:
+            for module in model.modules():
+                clear_blocks_graph = getattr(module,
+                                             "clear_blocks_cuda_graph", None)
+                if clear_blocks_graph is not None:
+                    clear_blocks_graph()
 
     def get_max_num_sequences(self) -> int:
         """

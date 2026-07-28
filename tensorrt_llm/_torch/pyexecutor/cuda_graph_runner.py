@@ -14,6 +14,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend.trtllm import TrtllmAttentionMetadata
+from ..cuda_graph_utils import NCCLWindowReuseDomain
 from ..distributed import Distributed
 from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import get_memory_buffers
@@ -37,39 +38,6 @@ CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
 # dummies need one prompt token plus one generated token.
 ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM = 2
 KeyType: TypeAlias = Tuple[int, int, bool, bool, bool]
-
-
-def _create_window_reuse_domain() -> Optional[int]:
-    op = getattr(torch.ops.trtllm, "_create_nccl_window_reuse_domain", None)
-    if op is None or not torch.cuda.is_available():
-        return None
-    return int(op(torch.cuda.current_device()))
-
-
-def _close_window_reuse_domain(domain: Optional[int]) -> None:
-    if domain is None:
-        return
-    op = getattr(torch.ops.trtllm, "_close_nccl_window_reuse_domain", None)
-    if op is not None:
-        op(domain)
-
-
-@contextlib.contextmanager
-def _window_aware_cuda_graph(graph: torch.cuda.CUDAGraph, pool: Any,
-                             domain: Optional[int]) -> Iterator[None]:
-    """Capture a graph while binding registered-window arena lifetime."""
-    with torch.cuda.graph(graph, pool=pool):
-        capture_id = None
-        begin_op = getattr(torch.ops.trtllm,
-                           "_begin_nccl_window_capture", None)
-        end_op = getattr(torch.ops.trtllm, "_end_nccl_window_capture", None)
-        if domain is not None and begin_op is not None and end_op is not None:
-            capture_id = int(begin_op(domain))
-        try:
-            yield
-        finally:
-            if capture_id is not None:
-                end_op(capture_id)
 
 
 def _save_spec_decode_capture_state(
@@ -174,7 +142,7 @@ class CUDAGraphRunner:
                                  Callable[[], Optional[torch.Tensor]]] = {}
         self.graph_metadata: Dict[KeyType, Dict[str, Any]] = {}
         self.memory_pool = config.cuda_graph_mem_pool
-        self._window_reuse_domain: Optional[int] = None
+        self._window_reuse_domain = NCCLWindowReuseDomain()
         self.padding_dummy_requests: Dict[int, LlmRequest] = {}
         self.dynamic_draft_len_mapping = config.dynamic_draft_len_mapping
 
@@ -188,11 +156,6 @@ class CUDAGraphRunner:
         # CUDA graphs.  Use allow_capture() context manager during warmup.
         self._capture_allowed = False
         self.is_warmup_only = False
-
-    def _ensure_window_reuse_domain(self) -> Optional[int]:
-        if self._window_reuse_domain is None:
-            self._window_reuse_domain = _create_window_reuse_domain()
-        return self._window_reuse_domain
 
     def _create_shared_static_tensors(self):
         """Allocates static tensors sized for the largest possible batch."""
@@ -489,7 +452,8 @@ class CUDAGraphRunner:
             return forward_fn(capture_inputs)
 
         output = None
-        with with_multi_stream(True), piecewise_cuda_graph(False):
+        with with_multi_stream(True), piecewise_cuda_graph(False), \
+                self._window_reuse_domain.prepare():
             # We have to do a warmup run to initialize PyTorch's internal
             # states according to the docs:
             # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
@@ -507,9 +471,8 @@ class CUDAGraphRunner:
                 return output
 
             graph = torch.cuda.CUDAGraph()
-            with _window_aware_cuda_graph(
-                    graph, self.memory_pool,
-                    self._ensure_window_reuse_domain()):
+            with self._window_reuse_domain.capture(
+                    graph, pool=self.memory_pool):
                 output = _setup_spec_decoding_and_forward(
                     key, forward_fn, capture_inputs)
             if postprocess_fn is not None:
@@ -744,16 +707,14 @@ class CUDAGraphRunner:
 
     def clear(self):
         """Releases all captured graphs and the associated memory pool."""
+        self._window_reuse_domain.quiesce()
         for graph in self.graphs.values():
             graph.reset()
         self.graphs.clear()
         self.graph_outputs.clear()
         self.graph_metadata.clear()
         self.padding_dummy_requests = {}
-        domain = getattr(self, "_window_reuse_domain", None)
-        _close_window_reuse_domain(domain)
-        self._window_reuse_domain = None
-        del self.memory_pool
+        self._window_reuse_domain.close()
         self.memory_pool = None
 
 
@@ -803,7 +764,7 @@ class EncoderCUDAGraphRunner:
                                                           Optional[Any]]] = {}
         self.graph_metadata: Dict[EncoderKeyType, Dict[str, Any]] = {}
         self.memory_pool = config.cuda_graph_mem_pool
-        self._window_reuse_domain: Optional[int] = None
+        self._window_reuse_domain = NCCLWindowReuseDomain()
 
         self.shared_static_tensors: Dict[str, torch.Tensor] = {}
         self.shared_static_tensors_cpu: Dict[str, torch.Tensor] = {}
@@ -818,11 +779,6 @@ class EncoderCUDAGraphRunner:
         # prefer_pinned() is false: pageable host buffers are preferred, so the
         # H2D copies must be issued before graph replay instead of captured.
         self._capture_h2d_copy = prefer_pinned()
-
-    def _ensure_window_reuse_domain(self) -> Optional[int]:
-        if self._window_reuse_domain is None:
-            self._window_reuse_domain = _create_window_reuse_domain()
-        return self._window_reuse_domain
 
     def _create_shared_static_tensors(self):
         """Allocates static tensors sized for the largest supported num_tokens."""
@@ -1094,7 +1050,8 @@ class EncoderCUDAGraphRunner:
         self.graph_metadata[key] = {"attn_metadata": attn_md}
 
         output = None
-        with with_multi_stream(True), piecewise_cuda_graph(False):
+        with with_multi_stream(True), piecewise_cuda_graph(False), \
+                self._window_reuse_domain.prepare():
             # Warmup runs required by CUDA graph semantics. See
             # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
             # Warmups initialize PyTorch and attention metadata state, and
@@ -1106,9 +1063,8 @@ class EncoderCUDAGraphRunner:
                 return output
 
             graph = torch.cuda.CUDAGraph()
-            with _window_aware_cuda_graph(
-                    graph, self.memory_pool,
-                    self._ensure_window_reuse_domain()):
+            with self._window_reuse_domain.capture(
+                    graph, pool=self.memory_pool):
                 if self._capture_h2d_copy:
                     # H2D copies for captured inside the graph: at replay
                     # time it re-issues from the pinned static buffer without
@@ -1199,13 +1155,11 @@ class EncoderCUDAGraphRunner:
         return self.memory_pool
 
     def clear(self):
+        self._window_reuse_domain.quiesce()
         for graph in self.graphs.values():
             graph.reset()
         self.graphs.clear()
         self.graph_outputs.clear()
         self.graph_metadata.clear()
-        domain = getattr(self, "_window_reuse_domain", None)
-        _close_window_reuse_domain(domain)
-        self._window_reuse_domain = None
-        del self.memory_pool
+        self._window_reuse_domain.close()
         self.memory_pool = None

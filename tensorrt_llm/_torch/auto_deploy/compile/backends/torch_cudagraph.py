@@ -45,6 +45,7 @@ except ModuleNotFoundError:
         yield  # no-op in standalone mode
 
 
+from ..._compat import NCCLWindowReuseDomain
 from ...utils.cuda_graph import CudaGraphWarmUpPhase, cuda_graph_state
 from ...utils.logger import ad_logger
 from ...utils.multi_stream_utils import disable_multi_stream
@@ -194,6 +195,7 @@ class CapturedGraph(nn.Module):
         self._output_dynamic_dim: int = 0
         self._args_hash: Optional[Tuple[int, ...]] = None
         self._cuda_graph_mem_pool = None
+        self._window_reuse_domain = NCCLWindowReuseDomain()
 
         # store the in_spec and out_spec during graph capture
         self._in_spec = None
@@ -240,36 +242,38 @@ class CapturedGraph(nn.Module):
         refresh_args_static: Optional[Callable] = None,
     ) -> Tuple[torch.cuda.CUDAGraph, Tuple[int, ...]]:
         """Capture and return one cuda graph and its output dynamic extents."""
-        # warm-up and invoke autotuner
-        with autotune():
-            for _ in range(3):
-                with CudaGraphWarmUpPhase():
-                    self.model(*args, **kwargs)
-                if refresh_args_static is not None:
-                    # model.forward() sometimes modifies the cache_seq_interface directly
-                    # Example: Eagle switches the batch from extend-only to generate-only mode during the
-                    # draft loop. We want to restore the args to satisfy invariants needed by model.forward()
-                    refresh_args_static()
+        with self._window_reuse_domain.prepare():
+            # warm-up and invoke autotuner
+            with autotune():
+                for _ in range(3):
+                    with CudaGraphWarmUpPhase():
+                        self.model(*args, **kwargs)
+                    if refresh_args_static is not None:
+                        # model.forward() sometimes modifies the cache_seq_interface directly
+                        # Example: Eagle switches the batch from extend-only to generate-only mode during the
+                        # draft loop. We want to restore the args to satisfy invariants needed by model.forward()
+                        refresh_args_static()
 
-        # capture graph now
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        od = self._output_dynamic_dim
-        output_extents = []
-        with torch.cuda.graph(graph, pool=self._cuda_graph_mem_pool):
-            # compute output
-            out = self.model(*args, **kwargs)
-            # write out into output buffer up to out batch size
-            out_flat = tree_flatten_spec(out, self._out_spec)
-            for o_buffer, o in zip(self._out_buffer_flat, out_flat):
-                output_extent = o.shape[od]
-                assert o_buffer.shape[od] >= output_extent, (
-                    "CUDA graph output extent exceeds backing buffer during capture: "
-                    f"output_extent={output_extent}, buffer_extent={o_buffer.shape[od]}"
-                )
-                o_buffer.narrow(od, 0, output_extent).copy_(o)
-                output_extents.append(output_extent)
-        torch.cuda.synchronize()
+            # capture graph now
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            od = self._output_dynamic_dim
+            output_extents = []
+            with self._window_reuse_domain.capture(
+                    graph, pool=self._cuda_graph_mem_pool):
+                # compute output
+                out = self.model(*args, **kwargs)
+                # write out into output buffer up to out batch size
+                out_flat = tree_flatten_spec(out, self._out_spec)
+                for o_buffer, o in zip(self._out_buffer_flat, out_flat):
+                    output_extent = o.shape[od]
+                    assert o_buffer.shape[od] >= output_extent, (
+                        "CUDA graph output extent exceeds backing buffer during capture: "
+                        f"output_extent={output_extent}, buffer_extent={o_buffer.shape[od]}"
+                    )
+                    o_buffer.narrow(od, 0, output_extent).copy_(o)
+                    output_extents.append(output_extent)
+            torch.cuda.synchronize()
         self._cuda_graph_mem_pool = self._cuda_graph_mem_pool or graph.pool()
         return graph, tuple(output_extents)
 
@@ -335,7 +339,7 @@ class CapturedGraph(nn.Module):
 
         # capture output once with cuda_graph_max_batch_size to capture output buffers
         # store the out_spec at this point
-        with CudaGraphWarmUpPhase():
+        with self._window_reuse_domain.prepare(), CudaGraphWarmUpPhase():
             ad_logger.info(f"Warm up with max_batch_size={batch_sizes[0]} before graph capture")
             out = self.model(*args, **kwargs)
         self._out_buffer_flat, self._out_spec = tree_flatten(out)
@@ -461,6 +465,19 @@ class CapturedGraph(nn.Module):
         ]
         return self._out_spec.unflatten(out_flat)
 
+    def clear_cuda_graphs(self) -> None:
+        """Reset every variant before retiring its registered-window arena."""
+        self._window_reuse_domain.quiesce()
+        for graph in self.cudagraphs.values():
+            graph.reset()
+        self.cudagraphs.clear()
+        self._cudagraph_output_extents.clear()
+        # Drop graph-owned tensor leases before closing the native domain.
+        self._input_buffers = []
+        self._out_buffer_flat = None
+        self._window_reuse_domain.close()
+        self._cuda_graph_mem_pool = None
+
 
 class PiecewiseCapturedGraph(nn.Module):
     """Manages piecewise CUDA graph capture/replay for prefill/mixed batches.
@@ -493,6 +510,7 @@ class PiecewiseCapturedGraph(nn.Module):
         self._is_prepared = False
         self._wrapped_dynamic_indices: Set[int] = set()
         self._static_runners: Dict[int, ADPiecewiseRunner] = {}
+        self._window_reuse_domain = NCCLWindowReuseDomain()
         # Pre-allocated static buffers for kwargs whose addresses change between
         # calls.  Allocated during warmup_and_capture, used at runtime to ensure
         # CUDA graph replay sees stable addresses.
@@ -581,6 +599,7 @@ class PiecewiseCapturedGraph(nn.Module):
             runner = ADPiecewiseRunner(
                 submodule=original_submod,
                 graph_pool=graph_pool,
+                window_reuse_domain=self._window_reuse_domain,
             )
             setattr(self.split_gm, submod_name, runner)
             runner_by_idx[idx] = runner
@@ -826,42 +845,47 @@ class PiecewiseCapturedGraph(nn.Module):
         # address-stability invariants.  Decode batches still overlap via
         # the monolithic CG path, where ``disable_multi_stream`` is not in
         # scope.
-        with disable_multi_stream():
-            for nt in num_tokens_list:
-                ad_logger.info(f"PiecewiseCapturedGraph: warming up for num_tokens={nt}")
-                args, kwargs = get_args_kwargs(nt)
-                self._copy_to_static_buffers(kwargs)
+        try:
+            with disable_multi_stream(), self._window_reuse_domain.prepare():
+                for nt in num_tokens_list:
+                    ad_logger.info(
+                        f"PiecewiseCapturedGraph: warming up for num_tokens={nt}"
+                    )
+                    args, kwargs = get_args_kwargs(nt)
+                    self._copy_to_static_buffers(kwargs)
 
-                ADPiecewiseRunner.set_current_num_tokens(nt)
+                    ADPiecewiseRunner.set_current_num_tokens(nt)
 
-                with CudaGraphWarmUpPhase():
-                    ADPiecewiseRunner.set_current_phase("warmup")
-                    for _ in range(warmup_iters - 1):
-                        self.split_gm(*args, **kwargs)
+                    with CudaGraphWarmUpPhase():
+                        ADPiecewiseRunner.set_current_phase("warmup")
+                        for _ in range(warmup_iters - 1):
+                            self.split_gm(*args, **kwargs)
 
-                    # Last warmup iteration: discover dynamic output shapes
-                    if self._wrapped_dynamic_indices:
-                        discovered = self._discover_dynamic_output_shapes(args, kwargs)
-                        self._set_dynamic_out_info_on_runners(discovered)
-                    else:
-                        self.split_gm(*args, **kwargs)
+                        # Last warmup iteration: discover dynamic output shapes
+                        if self._wrapped_dynamic_indices:
+                            discovered = self._discover_dynamic_output_shapes(args, kwargs)
+                            self._set_dynamic_out_info_on_runners(discovered)
+                        else:
+                            self.split_gm(*args, **kwargs)
 
-                    # Capture phase
-                    ADPiecewiseRunner.set_current_phase("capture")
-                    try:
-                        self.split_gm(*args, **kwargs)
-                    finally:
-                        for runner in self._static_runners.values():
-                            runner.finalize_capture(nt)
+                        # Capture phase
+                        ADPiecewiseRunner.set_current_phase("capture")
+                        try:
+                            self.split_gm(*args, **kwargs)
+                        finally:
+                            for runner in self._static_runners.values():
+                                runner.finalize_capture(nt)
 
-                ad_logger.info(f"PiecewiseCapturedGraph: captured graphs for num_tokens={nt}")
+                    ad_logger.info(
+                        f"PiecewiseCapturedGraph: captured graphs for num_tokens={nt}"
+                    )
 
-                torch.cuda.synchronize()
-                gc.collect()
-                torch.cuda.empty_cache()
-
-        ADPiecewiseRunner.set_current_num_tokens(None)
-        ADPiecewiseRunner.set_current_phase("replay")
+                    torch.cuda.synchronize()
+                    gc.collect()
+                    torch.cuda.empty_cache()
+        finally:
+            ADPiecewiseRunner.set_current_num_tokens(None)
+            ADPiecewiseRunner.set_current_phase("replay")
 
     def _reconstruct_output(self, result: Any) -> Any:
         """Reconstruct structured output from a flat tuple using the output tree spec."""
@@ -905,6 +929,19 @@ class PiecewiseCapturedGraph(nn.Module):
                 ADPiecewiseRunner.set_current_num_tokens(None)
             return self._reconstruct_output(result)
         return self.original_model(*args, **kwargs)
+
+    def clear_cuda_graphs(self) -> None:
+        """Reset all serial segments before closing their shared window domain."""
+        self._window_reuse_domain.quiesce()
+        for runner in self._static_runners.values():
+            for entry in runner.entries.values():
+                if entry.cuda_graph is not None:
+                    entry.cuda_graph.reset()
+        for runner in self._static_runners.values():
+            runner.entries.clear()
+            runner._graph_pool = None
+        self._static_input_buffers.clear()
+        self._window_reuse_domain.close()
 
 
 class DualModeCapturedGraph(nn.Module):
@@ -1236,42 +1273,54 @@ class TorchCudagraphCompiler(CompilerBackend):
             num_batched_inputs=self.num_batched_inputs,
             resource_input_names=self.resource_input_names,
         )
-        monolithic.capture_graph(get_capture_args_with_warmup, self.cuda_graph_batch_sizes)
-
         piecewise = None
-        if self.piecewise_enabled:
-            ad_logger.info("TorchCudagraphCompiler: dual-mode enabled (monolithic + piecewise)")
-            piecewise = PiecewiseCapturedGraph(
-                model=target_gm,
-                piecewise_num_tokens=self.piecewise_num_tokens,
-                max_batch_size=(
-                    self.piecewise_seq_info.max_batch_size
-                    if self.piecewise_seq_info is not None
-                    else None
-                ),
-                out_spec=monolithic._out_spec,
+        try:
+            monolithic.capture_graph(
+                get_capture_args_with_warmup, self.cuda_graph_batch_sizes
             )
-            piecewise.prepare()
 
-            if (
-                self.piecewise_seq_info is not None
-                and self.piecewise_named_args_fn is not None
-                and self.piecewise_num_tokens
-            ):
+            if self.piecewise_enabled:
+                ad_logger.info(
+                    "TorchCudagraphCompiler: dual-mode enabled (monolithic + piecewise)"
+                )
+                piecewise = PiecewiseCapturedGraph(
+                    model=target_gm,
+                    piecewise_num_tokens=self.piecewise_num_tokens,
+                    max_batch_size=(
+                        self.piecewise_seq_info.max_batch_size
+                        if self.piecewise_seq_info is not None
+                        else None
+                    ),
+                    out_spec=monolithic._out_spec,
+                )
+                piecewise.prepare()
 
-                def get_piecewise_args(num_tokens: int):
-                    _setup_piecewise_mixed_batch(self.piecewise_seq_info, num_tokens)
-                    top_level_kwargs = self.piecewise_named_args_fn()
-                    if self.full_model is not None:
-                        return (), _capture_inner_kwargs(
-                            self.full_model,
-                            target_gm,
-                            top_level_kwargs,
-                            self.resource_input_names,
+                if (
+                    self.piecewise_seq_info is not None
+                    and self.piecewise_named_args_fn is not None
+                    and self.piecewise_num_tokens
+                ):
+
+                    def get_piecewise_args(num_tokens: int):
+                        _setup_piecewise_mixed_batch(
+                            self.piecewise_seq_info, num_tokens
                         )
-                    return (), top_level_kwargs
+                        top_level_kwargs = self.piecewise_named_args_fn()
+                        if self.full_model is not None:
+                            return (), _capture_inner_kwargs(
+                                self.full_model,
+                                target_gm,
+                                top_level_kwargs,
+                                self.resource_input_names,
+                            )
+                        return (), top_level_kwargs
 
-                piecewise.warmup_and_capture(get_piecewise_args)
+                    piecewise.warmup_and_capture(get_piecewise_args)
+        except Exception:
+            if piecewise is not None:
+                piecewise.clear_cuda_graphs()
+            monolithic.clear_cuda_graphs()
+            raise
 
         if piecewise is not None:
             return DualModeCapturedGraph(monolithic, piecewise)

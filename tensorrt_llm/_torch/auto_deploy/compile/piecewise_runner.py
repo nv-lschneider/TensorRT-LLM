@@ -55,7 +55,7 @@ import torch
 import torch.nn as nn
 from torch.utils._pytree import tree_flatten
 
-from .._compat import make_weak_ref
+from .._compat import NCCLWindowReuseDomain, make_weak_ref
 from ..utils.logger import ad_logger
 
 
@@ -302,10 +302,14 @@ class ADPiecewiseRunner(nn.Module):
         self,
         submodule: nn.Module,
         graph_pool: Optional[Tuple[int, ...]] = None,
+        window_reuse_domain: Optional[NCCLWindowReuseDomain] = None,
     ):
         super().__init__()
         self.submodule = submodule
         self._graph_pool = graph_pool
+        self._window_reuse_domain = (
+            window_reuse_domain
+            if window_reuse_domain is not None else NCCLWindowReuseDomain())
 
         self._weight_ptrs: Set[int] = set()
         for p in submodule.parameters():
@@ -400,7 +404,8 @@ class ADPiecewiseRunner(nn.Module):
             graph = torch.cuda.CUDAGraph()
 
             dynamic_out_bufs: Dict[int, torch.Tensor] = {}
-            with torch.cuda.graph(graph, pool=self._graph_pool):
+            with self._window_reuse_domain.capture(
+                    graph, pool=self._graph_pool):
                 output = self.submodule(*args, **kwargs)
                 for submod_id, info in self._next_dynamic_out_infos.items():
                     dynamic_out_bufs[submod_id] = torch.empty(
