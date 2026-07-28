@@ -396,6 +396,52 @@ TEST_F(NCCLWindowAllocatorTest, EagerDifferentStreamsDoNotAlias)
     }
 }
 
+TEST_F(NCCLWindowAllocatorTest, GraphDomainRetainsAndReusesRegisteredBuffer)
+{
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    int device = -1;
+    TLLM_CUDA_CHECK(cudaGetDevice(&device));
+    auto stream = c10::cuda::getStreamFromPool(false, device);
+    c10::cuda::CUDAStreamGuard streamGuard(stream);
+
+    auto prepared = allocator.requestBuffer(*mComm, 256 * 1024, device);
+    ASSERT_TRUE(prepared.isValid());
+    void* const expectedPtr = prepared.ptr;
+    allocator.releaseBuffer(*mComm, prepared);
+
+    uint64_t const domainId = allocator.createReuseDomain(device);
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graphExec = nullptr;
+    TLLM_CUDA_CHECK(cudaStreamBeginCapture(stream.stream(), cudaStreamCaptureModeThreadLocal));
+    uint64_t const captureId = allocator.beginCapture(domainId);
+
+    auto captured = allocator.requestBuffer(*mComm, 256 * 1024, device);
+    EXPECT_TRUE(captured.isValid());
+    if (captured.isValid())
+    {
+        EXPECT_EQ(captured.ptr, expectedPtr);
+        TLLM_CUDA_CHECK(cudaMemsetAsync(captured.ptr, 0x5a, captured.size, stream.stream()));
+        allocator.releaseBuffer(*mComm, captured);
+    }
+    allocator.endCapture(captureId);
+
+    TLLM_CUDA_CHECK(cudaStreamEndCapture(stream.stream(), &graph));
+    ASSERT_NE(graph, nullptr);
+    TLLM_CUDA_CHECK(cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0));
+    ASSERT_NE(graphExec, nullptr);
+    TLLM_CUDA_CHECK(cudaGraphLaunch(graphExec, stream.stream()));
+    TLLM_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
+    TLLM_CUDA_CHECK(cudaGraphExecDestroy(graphExec));
+    TLLM_CUDA_CHECK(cudaGraphDestroy(graph));
+
+    allocator.closeReuseDomain(domainId);
+
+    auto reused = allocator.requestBuffer(*mComm, 256 * 1024, device);
+    ASSERT_TRUE(reused.isValid());
+    EXPECT_EQ(reused.ptr, expectedPtr);
+    allocator.releaseBuffer(*mComm, reused);
+}
+
 TEST_F(NCCLWindowAllocatorTest, BestFitReuse)
 {
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();

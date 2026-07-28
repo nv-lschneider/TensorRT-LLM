@@ -501,6 +501,7 @@ private:
         }
 
         auto& allocator = NCCLWindowAllocator::getInstance();
+        allocator.retainCommForActiveCapture(rawComm);
 
         // Search for existing buffer
         auto windowBuffer0 = allocator.searchBuffer(comm, input.data_ptr());

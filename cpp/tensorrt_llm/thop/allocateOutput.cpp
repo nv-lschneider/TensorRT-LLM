@@ -50,6 +50,46 @@ std::tuple<at::Tensor, int64_t> allocateOutputOp(at::Tensor const& like, int64_t
     return {tensor, static_cast<int64_t>(actual_kind)};
 }
 
+int64_t createNcclWindowReuseDomain(int64_t device)
+{
+#if ENABLE_MULTI_DEVICE && NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+    return static_cast<int64_t>(
+        common::nccl_util::NCCLWindowAllocator::getInstance().createReuseDomain(static_cast<int>(device)));
+#else
+    (void) device;
+    return 0;
+#endif
+}
+
+int64_t beginNcclWindowCapture(int64_t domainId)
+{
+#if ENABLE_MULTI_DEVICE && NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+    return static_cast<int64_t>(
+        common::nccl_util::NCCLWindowAllocator::getInstance().beginCapture(static_cast<uint64_t>(domainId)));
+#else
+    (void) domainId;
+    return 0;
+#endif
+}
+
+void endNcclWindowCapture(int64_t captureId)
+{
+#if ENABLE_MULTI_DEVICE && NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+    common::nccl_util::NCCLWindowAllocator::getInstance().endCapture(static_cast<uint64_t>(captureId));
+#else
+    (void) captureId;
+#endif
+}
+
+void closeNcclWindowReuseDomain(int64_t domainId)
+{
+#if ENABLE_MULTI_DEVICE && NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+    common::nccl_util::NCCLWindowAllocator::getInstance().closeReuseDomain(static_cast<uint64_t>(domainId));
+#else
+    (void) domainId;
+#endif
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -59,9 +99,21 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "allocate_output(Tensor like, int output_buffer_kind, int[]? group, "
         "int[]? shape=None, ScalarType? out_dtype=None) -> (Tensor, int)");
+    m.def("_create_nccl_window_reuse_domain(int device) -> int");
+    m.def("_begin_nccl_window_capture(int domain_id) -> int");
+    m.def("_end_nccl_window_capture(int capture_id) -> ()");
+    m.def("_close_nccl_window_reuse_domain(int domain_id) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("allocate_output", &tensorrt_llm::torch_ext::allocateOutputOp);
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
+{
+    m.impl("_create_nccl_window_reuse_domain", &tensorrt_llm::torch_ext::createNcclWindowReuseDomain);
+    m.impl("_begin_nccl_window_capture", &tensorrt_llm::torch_ext::beginNcclWindowCapture);
+    m.impl("_end_nccl_window_capture", &tensorrt_llm::torch_ext::endNcclWindowCapture);
+    m.impl("_close_nccl_window_reuse_domain", &tensorrt_llm::torch_ext::closeNcclWindowReuseDomain);
 }

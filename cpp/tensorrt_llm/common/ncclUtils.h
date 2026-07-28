@@ -252,7 +252,7 @@ public:
 
     // Search for a buffer by pointer. Returns an invalid buffer if not found.
     // This matches the UBManager.search_buffer() interface.
-    NCCLWindowBuffer searchBuffer(ncclComm_t comm, void* ptr, int device = -1) const;
+    NCCLWindowBuffer searchBuffer(ncclComm_t comm, void* ptr, int device = -1);
 
     // Release a buffer back to the pool for potential reuse
     // Release is conditional on the exact logical lease generation.
@@ -277,6 +277,24 @@ public:
 
     // Get the number of buffers in use for a communicator
     size_t getBufferInUseCount(ncclComm_t comm, int device = -1) const;
+
+    // Create a serial reuse domain on the current stream. The returned handle
+    // is process-local and is intended to be owned by one CUDA graph runner.
+    uint64_t createReuseDomain(int device = -1);
+
+    // Begin/end a graph capture scope for an existing serial domain. begin
+    // must run after CUDA capture has started so the active cudaGraph_t can be
+    // obtained and retained.
+    uint64_t beginCapture(uint64_t domainId);
+    void endCapture(uint64_t captureId);
+
+    // Close a domain after its graph execs have been reset. This synchronizes
+    // the teardown-only replay lane and returns its arena to the eager pool.
+    void closeReuseDomain(uint64_t domainId);
+
+    // Keep a communicator alive while the active graph domain owns window
+    // addresses from it. This is a no-op outside a window capture scope.
+    void retainCommForActiveCapture(std::shared_ptr<ncclComm_t> const& comm);
 
     // Check if a communicator is valid (non-null)
     // Note: We don't track cleaned-up comms because NCCL can reuse memory addresses.
@@ -321,6 +339,37 @@ private:
         bool inUse;
         uint64_t generation;
         cudaStream_t homeStream;
+        uint64_t domainId{0};
+        uint64_t lastCaptureId{0};
+        bool persistent{false};
+    };
+
+    struct GraphBindingRecord
+    {
+        std::atomic<bool> retired{false};
+        bool accounted{false};
+        uint64_t captureId{0};
+    };
+
+    struct ReuseDomain
+    {
+        uint64_t id{0};
+        int device{-1};
+        cudaStream_t replayStream{nullptr};
+        bool closing{false};
+        size_t liveBindings{0};
+        std::vector<std::unique_ptr<GraphBindingRecord>> bindings;
+        std::unordered_map<ncclComm_t, std::shared_ptr<ncclComm_t>> commOwners;
+    };
+
+    struct CaptureState
+    {
+        std::shared_ptr<ReuseDomain> domain;
+        uint64_t captureId{0};
+        cudaGraph_t graph{nullptr};
+        cudaStream_t captureStream{nullptr};
+        bool graphBound{false};
+        std::vector<BufferEntry*> touchedEntries;
     };
 
     struct PoolKey
@@ -344,6 +393,10 @@ private:
     };
 
     static int resolveDevice(int device);
+    static void graphBindingDestructor(void* userData);
+    void ensureGraphBindingLocked(CaptureState& capture);
+    void touchEntryLocked(BufferEntry& entry, CaptureState& capture);
+    void drainRetiredBindingsLocked(ReuseDomain& domain);
 
     mutable std::mutex mMutex;
     std::unordered_map<PoolKey, std::vector<std::unique_ptr<BufferEntry>>, PoolKeyHash> mBufferPool;
@@ -352,6 +405,9 @@ private:
     // Requests below the recorded size may still succeed and already-pooled buffers are always
     // reused before consulting this cache.
     std::unordered_map<PoolKey, size_t, PoolKeyHash> mMinSymmetricFailureSize;
+    std::unordered_map<uint64_t, std::shared_ptr<ReuseDomain>> mReuseDomains;
+    std::atomic<uint64_t> mNextDomainId{1};
+    static thread_local std::unique_ptr<CaptureState> mActiveCapture;
 };
 
 // RAII wrapper for NCCL window buffers
@@ -447,6 +503,7 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
 
     try
     {
+        allocator.retainCommForActiveCapture(comm);
         lease = allocator.requestBuffer(*comm, buffer_size, device.index());
     }
     catch (std::exception const& e)
