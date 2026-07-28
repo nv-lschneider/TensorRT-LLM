@@ -46,6 +46,11 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
     def from_config(
         config: ModelConfig[TConfig],
     ) -> DecoderModelForCausalLM[TModel, TConfig]:
+        extra_attrs = config.extra_attrs
+        # Constructors that do not receive an explicit per-module strategy
+        # inherit the model-level setting through the same scoped attributes
+        # used by nested modules during model construction.
+        extra_attrs["allreduce_strategy"] = config.allreduce_strategy
         if config.mm_encoder_only:
             model_arch = config.pretrained_config.architectures[0]
             vision_encoder_info = MODEL_CLASS_VISION_ENCODER_MAPPING.get(
@@ -55,7 +60,10 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
                     f"Unknown architecture for AutoModelForMultimodalEncoder: {model_arch}"
                 )
             vision_encoder_cls, vlm_base_model = vision_encoder_info
-            return vision_encoder_cls(config, vlm_base_model)
+            with model_extra_attrs(extra_attrs):
+                model = vision_encoder_cls(config, vlm_base_model)
+            model.extra_attrs = extra_attrs
+            return model
         cls = AutoModelForCausalLM._resolve_class(config)
         if cls is None:
             raise ValueError(
@@ -65,7 +73,6 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
             config._frozen = False
             config.skip_create_weights_in_init = True
             config._frozen = True
-        extra_attrs = config.extra_attrs
         with model_extra_attrs(extra_attrs):
             model = cls(config)
         model.extra_attrs = extra_attrs

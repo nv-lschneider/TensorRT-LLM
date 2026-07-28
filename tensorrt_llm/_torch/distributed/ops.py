@@ -655,7 +655,7 @@ class AllReduce(nn.Module):
 
     def __init__(self,
                  mapping: Mapping,
-                 strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
+                 strategy: Optional[AllReduceStrategy] = None,
                  dtype: Optional[torch.dtype] = None):
         super().__init__()
         """
@@ -664,6 +664,8 @@ class AllReduce(nn.Module):
         Args:
             mapping (Mapping):  The parallel mapping config.
             strategy (AllReduceStrategy):
+                If omitted, inherit the model-level ``allreduce_strategy``.
+                Outside model construction this defaults to ``AUTO``.
                 The following all-reduce strategies are supported:
 
                 - SYMM_MEM: Uses PyTorch's symmetric memory with MULTIMEM hardware instructions.
@@ -703,6 +705,11 @@ class AllReduce(nn.Module):
 
         self.mapping = mapping
         self.workspace = None
+        if strategy is None:
+            extra_attrs = get_model_extra_attrs()
+            strategy = (extra_attrs.get("allreduce_strategy",
+                                        AllReduceStrategy.AUTO)
+                        if extra_attrs else AllReduceStrategy.AUTO)
         self.strategy = strategy
         self.mnnvl_allreduce = None
         self.symm_mem_allreduce = None

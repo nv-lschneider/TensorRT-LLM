@@ -3259,7 +3259,7 @@ class Linear(nn.Module):
         use_custom_cublas_mm: bool = False,
         use_cute_dsl_bf16_gemm: bool = False,
         lora: Optional[LoraLayer] = None,
-        allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
+        allreduce_strategy: Optional[AllReduceStrategy] = None,
         force_dynamic_quantization: bool = False,
         use_cute_dsl_blockscaling_mm: bool = False,
         disable_deep_gemm: bool = False,
