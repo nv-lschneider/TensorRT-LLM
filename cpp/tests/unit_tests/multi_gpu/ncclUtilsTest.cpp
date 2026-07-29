@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/opUtils.h"
+#include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include <gtest/gtest.h>
@@ -37,6 +38,17 @@
 namespace mpi = tensorrt_llm::mpi;
 namespace tr = tensorrt_llm::runtime;
 namespace nccl_util = tensorrt_llm::common::nccl_util;
+
+TRTLLM_NAMESPACE_BEGIN
+namespace torch_ext
+{
+std::vector<torch::Tensor> allreduce_raw(torch::Tensor const& input, torch::optional<torch::Tensor> const& residual,
+    torch::optional<torch::Tensor> const& norm_weight, torch::optional<torch::Tensor> const& scale,
+    torch::optional<torch::Tensor> const& bias, torch::optional<torch::Tensor> workspace,
+    torch::List<int64_t> const& group, int64_t strategy, int64_t fusion_op, double eps,
+    bool trigger_completion_at_end);
+}
+TRTLLM_NAMESPACE_END
 
 using tensorrt_llm::getComm;
 
@@ -642,6 +654,69 @@ TEST_F(NCCLWindowAllocatorTest, GraphDomainRetainsAndReusesRegisteredBuffer)
         TLLM_CUDA_CHECK(cudaStreamSynchronize(captureStream0.stream()));
     }
     testComm.reset();
+}
+
+TEST_F(NCCLWindowAllocatorTest, SymmetricAllReduceReplaysCorrectlyInGraph)
+{
+    using tensorrt_llm::kernels::AllReduceFusionOp;
+    using tensorrt_llm::kernels::AllReduceStrategyType;
+
+    // This goes through torch_ext::allreduce_raw -> AllreduceOp ->
+    // runNCCLAllReduceSymmetric, including its input copy into a registered
+    // window and the symmetric ncclAllReduce itself.
+    constexpr int64_t kElements = 256 * 1024;
+    auto const options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, mRank % 4);
+    auto input = torch::full({kElements}, static_cast<float>(mRank + 1), options);
+    torch::List<int64_t> group;
+    for (int rank = 0; rank < mWorldSize; ++rank)
+    {
+        group.push_back(rank);
+    }
+    auto const run = [&group](torch::Tensor const& value)
+    {
+        return tensorrt_llm::torch_ext::allreduce_raw(value, torch::nullopt, torch::nullopt, torch::nullopt,
+            torch::nullopt, torch::nullopt, group, static_cast<int64_t>(AllReduceStrategyType::NCCL_SYMMETRIC),
+            static_cast<int64_t>(AllReduceFusionOp::NONE), 1e-5, false)
+            .at(0);
+    };
+
+    // Populate both the symmetric input-copy and output slots before capture:
+    // registration is forbidden during graph capture.
+    auto warmupOutput = run(input);
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+    warmupOutput = torch::Tensor();
+
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    auto replayStream = c10::cuda::getStreamFromPool(false, input.get_device());
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graphExec = nullptr;
+    torch::Tensor capturedOutput;
+    uint64_t domainId = 0;
+    {
+        c10::cuda::CUDAStreamGuard streamGuard(replayStream);
+        domainId = allocator.createReuseDomain(input.get_device());
+        TLLM_CUDA_CHECK(cudaStreamBeginCapture(replayStream.stream(), cudaStreamCaptureModeThreadLocal));
+        auto const captureId = allocator.beginCapture(domainId);
+        capturedOutput = run(input);
+        allocator.endCapture(captureId);
+        TLLM_CUDA_CHECK(cudaStreamEndCapture(replayStream.stream(), &graph));
+        ASSERT_NE(graph, nullptr);
+        TLLM_CUDA_CHECK(cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0));
+        for (int replay = 0; replay < 64; ++replay)
+        {
+            TLLM_CUDA_CHECK(cudaGraphLaunch(graphExec, replayStream.stream()));
+        }
+        TLLM_CUDA_CHECK(cudaStreamSynchronize(replayStream.stream()));
+    }
+
+    float const expected = static_cast<float>(mWorldSize * (mWorldSize + 1) / 2);
+    EXPECT_FLOAT_EQ(capturedOutput.to(torch::kCPU)[0].item<float>(), expected);
+
+    allocator.quiesceReuseDomain(domainId);
+    TLLM_CUDA_CHECK(cudaGraphExecDestroy(graphExec));
+    TLLM_CUDA_CHECK(cudaGraphDestroy(graph));
+    capturedOutput = torch::Tensor();
+    allocator.closeReuseDomain(domainId);
 }
 
 TEST_F(NCCLWindowAllocatorTest, BestFitReuse)
