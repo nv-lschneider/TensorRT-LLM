@@ -847,7 +847,7 @@ void AgentConnectionManager::runStartupPreconnect()
 
             auto const peerCount = peers.size();
             TLLM_CHECK_WITH_INFO(peerCount == static_cast<size_t>(session.getSize()),
-                "Bijective startup preconnect requires equal local and peer rank counts: local=%d peer=%zu",
+                "Rank-major startup preconnect requires equal local and peer rank counts: local=%d peer=%zu",
                 session.getSize(), peerCount);
             TLLM_CHECK_WITH_INFO(connections.size() == peerCount,
                 "Startup preconnect loaded %zu generation agents, expected %zu", connections.size(), peerCount);
@@ -902,7 +902,9 @@ void AgentConnectionManager::runStartupPreconnect()
             {
                 for (size_t round = 0; round < peerCount; ++round)
                 {
-                    auto const peerRank = (static_cast<size_t>(sessionRank) + round) % peerCount;
+                    // Preserve the proven v17 ownership and collective order:
+                    // every CTX rank initializes GEN rank 0, then rank 1, etc.
+                    auto const peerRank = round;
                     auto const& peerState = peers[peerRank].first;
                     auto const& peerPool = peers[peerRank].second;
                     auto const& peerCommState = peerState.getCommState().value();
@@ -1124,7 +1126,7 @@ void AgentConnectionManager::runStartupPreconnect()
 
             auto const peerCount = peers.size();
             TLLM_CHECK_WITH_INFO(peerCount == static_cast<size_t>(session.getSize()),
-                "Bijective startup preconnect requires equal local and peer rank counts: local=%d peer=%zu",
+                "Rank-major startup preconnect requires equal local and peer rank counts: local=%d peer=%zu",
                 session.getSize(), peerCount);
             TLLM_CHECK_WITH_INFO(connections.size() == peerCount,
                 "Startup preconnect loaded %zu context agents, expected %zu", connections.size(), peerCount);
@@ -1132,7 +1134,9 @@ void AgentConnectionManager::runStartupPreconnect()
             uint64_t contextPairCount{0};
             for (size_t round = 0; round < peerCount; ++round)
             {
-                auto const peerRank = (static_cast<size_t>(sessionRank) + round) % peerCount;
+                // Match the CTX-primary rank order so this reciprocal pass
+                // deterministically reuses the established sessions/windows.
+                auto const peerRank = round;
                 auto const& peerState = peers[peerRank].first;
                 auto const& peerPool = peers[peerRank].second;
                 auto const& peerCommState = peerState.getCommState().value();
