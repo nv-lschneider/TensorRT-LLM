@@ -284,6 +284,12 @@ if(TARGET ${MOONCAKE_WRAPPER_TARGET})
   add_dependencies(${SHARED_TARGET} ${MOONCAKE_WRAPPER_TARGET})
 endif()
 
+# Ensure the Paged GIN wrapper is built and packaged with the shared library.
+if(TARGET tensorrt_llm_mooncake_paged_gin_wrapper)
+  target_link_libraries(tensorrt_llm_mooncake_paged_gin_wrapper INTERFACE ${SHARED_TARGET})
+  add_dependencies(${SHARED_TARGET} tensorrt_llm_mooncake_paged_gin_wrapper)
+endif()
+
 if(NOT WIN32)
   # Load libraries at $PREFIX/lib from
   # $PREFIX/lib/python3.12/site-packages/tensorrt_llm/libs

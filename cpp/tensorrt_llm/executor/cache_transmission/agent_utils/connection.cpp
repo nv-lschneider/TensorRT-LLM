@@ -19,12 +19,15 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 #include "tensorrt_llm/executor/serialization.h"
+#include <algorithm>
+#include <charconv>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <random>
 #include <string>
 #include <thread>
@@ -141,6 +144,85 @@ std::pair<DataTransceiverState, MemoryDesc> deserializeStartupPeerState(std::vec
     auto statePayload = su::deserialize<std::vector<char>>(input);
     auto pool = MemoryDesc::deserialize(input);
     return {Serialization::deserializeDataTransceiverState(statePayload), pool};
+}
+
+std::vector<std::vector<char>> allgatherStartupPayloads(
+    mpi::MpiComm const& session, std::vector<char> const& localPayload)
+{
+    auto const sessionSize = session.getSize();
+    TLLM_CHECK_WITH_INFO(sessionSize > 0, "Startup preconnect requires a non-empty MPI session");
+    TLLM_CHECK_WITH_INFO(localPayload.size() <= static_cast<size_t>(std::numeric_limits<SizeType32>::max()),
+        "Startup preconnect rank payload is too large: %zu bytes", localPayload.size());
+
+    auto const localPayloadSize = static_cast<SizeType32>(localPayload.size());
+    std::vector<SizeType32> payloadSizes(sessionSize);
+    session.allgather(&localPayloadSize, payloadSizes.data(), 1, mpi::MpiType::kINT32);
+
+    size_t totalSize{0};
+    std::vector<int> displacements(sessionSize);
+    for (int rank = 0; rank < sessionSize; ++rank)
+    {
+        TLLM_CHECK_WITH_INFO(totalSize <= static_cast<size_t>(std::numeric_limits<int>::max()),
+            "Startup preconnect state bundle exceeds MPI displacement range");
+        displacements[rank] = static_cast<int>(totalSize);
+        totalSize += static_cast<size_t>(payloadSizes[rank]);
+    }
+    TLLM_CHECK_WITH_INFO(totalSize <= static_cast<size_t>(std::numeric_limits<int>::max()),
+        "Startup preconnect state bundle is too large: %zu bytes", totalSize);
+
+    std::vector<char> gatheredPayloads(totalSize);
+    session.allgatherv(localPayload.data(), localPayloadSize, mpi::MpiType::kCHAR, gatheredPayloads.data(),
+        payloadSizes, displacements, mpi::MpiType::kCHAR);
+
+    std::vector<std::vector<char>> rankPayloads;
+    rankPayloads.reserve(sessionSize);
+    for (int rank = 0; rank < sessionSize; ++rank)
+    {
+        auto const begin = gatheredPayloads.begin() + displacements[rank];
+        rankPayloads.emplace_back(begin, begin + payloadSizes[rank]);
+    }
+    return rankPayloads;
+}
+
+std::vector<char> serializeStartupPeerStateBundle(std::vector<std::vector<char>> const& rankPayloads)
+{
+    namespace su = executor::serialize_utils;
+    std::ostringstream output;
+    su::serialize(rankPayloads, output);
+    auto const serialized = output.str();
+    return std::vector<char>(serialized.begin(), serialized.end());
+}
+
+std::vector<std::vector<char>> deserializeStartupPeerStateBundle(std::vector<char>& payload)
+{
+    namespace su = executor::serialize_utils;
+    su::VectorWrapBuf<char> buffer(payload);
+    std::istream input(&buffer);
+    return su::deserialize<std::vector<std::vector<char>>>(input);
+}
+
+uint64_t parseStartupPairCount(std::vector<char> const& payload, char const* markerName)
+{
+    auto const message = std::string(payload.begin(), payload.end());
+    auto const token = std::string{"pairs="};
+    auto const tokenPos = message.find(token);
+    TLLM_CHECK_WITH_INFO(message.rfind("OK ", 0) == 0 && tokenPos != std::string::npos,
+        "%s marker has invalid content '%s'", markerName, message.c_str());
+    TLLM_CHECK_WITH_INFO(message.find(token, tokenPos + token.size()) == std::string::npos,
+        "%s marker contains multiple pair counts: '%s'", markerName, message.c_str());
+
+    auto const valueBegin = tokenPos + token.size();
+    auto const valueEnd = message.find('\n', valueBegin);
+    TLLM_CHECK_WITH_INFO(valueEnd != std::string::npos && valueEnd + 1 == message.size() && valueEnd > valueBegin,
+        "%s marker has an invalid pair-count suffix: '%s'", markerName, message.c_str());
+
+    uint64_t pairCount{0};
+    auto const* begin = message.data() + valueBegin;
+    auto const* end = message.data() + valueEnd;
+    auto const result = std::from_chars(begin, end, pairCount);
+    TLLM_CHECK_WITH_INFO(result.ec == std::errc{} && result.ptr == end,
+        "%s marker has a non-numeric pair count: '%s'", markerName, message.c_str());
+    return pairCount;
 }
 
 } // namespace
@@ -637,16 +719,35 @@ void AgentConnectionManager::runStartupPreconnect()
     auto const rendezvousTimeout
         = std::chrono::seconds(getStartupEnvInt("TRTLLM_MOONCAKE_PAGED_GIN_RENDEZVOUS_TIMEOUT_SECONDS", 900));
     auto const initTimeout
-        = std::chrono::seconds(getStartupEnvInt("TRTLLM_MOONCAKE_PAGED_GIN_INIT_TIMEOUT_SECONDS", 120));
-    auto const rendezvousDeadline = std::chrono::steady_clock::now() + rendezvousTimeout;
+        = std::chrono::seconds(getStartupEnvInt("TRTLLM_MOONCAKE_PAGED_GIN_INIT_TIMEOUT_SECONDS", 900));
+    auto const makeDeadline = [](std::chrono::seconds timeout)
+    {
+        return std::chrono::steady_clock::now() + timeout;
+    };
     auto const contextStatePath = [&](int context)
     {
-        return directory / ("ctx-" + std::to_string(context) + "-epoch-" + std::to_string(startupEpoch) + ".state");
+        // CTX creates one long-lived connection manager, whereas GEN rebuilds
+        // its manager after it has allocated the final NCCL-window KV pool.
+        // The latter construction must preconnect with the same live CTX
+        // agents, not wait for a CTX epoch which will never occur. The run
+        // directory is unique per submission, so a per-context stable state
+        // file cannot be inherited from a prior attempt. GEN completion
+        // markers remain epoch-qualified below because every rebuilt GEN
+        // manager needs its own collective completion acknowledgement.
+        return directory / ("ctx-" + std::to_string(context) + ".states-v2");
     };
-    auto const generationMarkerPath = [&](int generation, char const* suffix)
+    auto const generationMarkerPath = [&](int generation, int epoch, char const* suffix)
     {
         return directory
-            / ("gen-" + std::to_string(generation) + "-epoch-" + std::to_string(startupEpoch) + suffix);
+            / ("gen-" + std::to_string(generation) + "-epoch-" + std::to_string(epoch) + "-v2" + suffix);
+    };
+    auto const generationStatePath = [&](int generation, int epoch)
+    {
+        return directory / ("gen-" + std::to_string(generation) + "-epoch-" + std::to_string(epoch) + ".states-v2");
+    };
+    auto const contextAckPath = [&](int generation, int epoch)
+    {
+        return directory / ("ctx-ack-gen-" + std::to_string(generation) + "-epoch-" + std::to_string(epoch));
     };
 
     TLLM_CHECK_WITH_INFO(role == "CTX" || role == "GEN", "Invalid startup preconnect role %s", role.c_str());
@@ -656,39 +757,275 @@ void AgentConnectionManager::runStartupPreconnect()
 
     if (role == "CTX")
     {
+        auto localState = DataTransceiverState{mCacheState, mCommState};
+        TLLM_CHECK(mPagedPoolMemory.has_value());
+        auto localPayload = serializeStartupPeerState(localState, mPagedPoolMemory.value());
+        auto rankPayloads = allgatherStartupPayloads(session, localPayload);
         if (sessionRank == 0)
         {
-            auto localState = DataTransceiverState{mCacheState, mCommState};
-            TLLM_CHECK(mPagedPoolMemory.has_value());
-            auto payload = serializeStartupPeerState(localState, mPagedPoolMemory.value());
+            auto payload = serializeStartupPeerStateBundle(rankPayloads);
             auto const statePath = contextStatePath(instanceId);
             writeStartupFile(statePath, payload);
             TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-                "MOONCAKE_PAGED_GIN startup preconnect published context state instance=%d epoch=%d bytes=%zu path=%s",
-                instanceId, startupEpoch, payload.size(), statePath.c_str());
+                "MOONCAKE_PAGED_GIN startup preconnect published stable context state instance=%d epoch=%d rank_states=%zu bytes=%zu path=%s",
+                instanceId, startupEpoch, rankPayloads.size(), payload.size(), statePath.c_str());
 
             for (int generation = 0; generation < generationInstances; ++generation)
             {
-                auto const readyPath = generationMarkerPath(generation, ".ready");
-                auto const failedPath = generationMarkerPath(generation, ".failed");
+                auto const readyPath = generationMarkerPath(generation, startupEpoch, ".ready");
+                auto const failedPath = generationMarkerPath(generation, startupEpoch, ".failed");
+                auto const readyDeadline = makeDeadline(rendezvousTimeout);
                 while (!startupPathExists(readyPath))
                 {
                     TLLM_CHECK_WITH_INFO(!startupPathExists(failedPath),
                         "Generation instance %d epoch %d failed during startup preconnect; see %s", generation,
                         startupEpoch, failedPath.c_str());
-                    TLLM_CHECK_WITH_INFO(std::chrono::steady_clock::now() < rendezvousDeadline,
+                    TLLM_CHECK_WITH_INFO(std::chrono::steady_clock::now() < readyDeadline,
                         "Timed out waiting for generation instance %d epoch %d startup preconnect", generation,
                         startupEpoch);
                     std::this_thread::sleep_for(std::chrono::milliseconds(200));
                 }
+                auto const provisionalPayload = readStartupFile(readyPath);
+                auto const provisionalMessage
+                    = std::string(provisionalPayload.begin(), provisionalPayload.end());
+                TLLM_CHECK_WITH_INFO(provisionalMessage == "OK provisional-state-only pairs=0\n",
+                    "Generation instance %d epoch %d reported invalid provisional result '%s'", generation,
+                    startupEpoch, provisionalMessage.c_str());
             }
         }
         session.barrier();
+        TLLM_CHECK_WITH_INFO(startupEpoch == 0,
+            "Context startup preconnect expected one connection manager, got epoch %d", startupEpoch);
+        for (int generation = 0; generation < generationInstances; ++generation)
+        {
+            std::vector<char> generationBundle;
+            if (sessionRank == 0)
+            {
+                auto const statePath = generationStatePath(generation, 1);
+                waitForStartupPath(statePath, makeDeadline(rendezvousTimeout));
+                generationBundle = readStartupFile(statePath);
+            }
+            session.bcast(generationBundle, 0);
+            auto peerRankPayloads = deserializeStartupPeerStateBundle(generationBundle);
+            TLLM_CHECK_WITH_INFO(
+                !peerRankPayloads.empty(), "Startup preconnect received an empty generation state bundle");
+
+            std::optional<std::vector<AgentState>> expectedAgentStates;
+            std::vector<Connection const*> connections;
+            std::vector<std::pair<DataTransceiverState, MemoryDesc>> peers;
+            peers.reserve(peerRankPayloads.size());
+            for (size_t peerRank = 0; peerRank < peerRankPayloads.size(); ++peerRank)
+            {
+                auto peer = deserializeStartupPeerState(peerRankPayloads[peerRank]);
+                auto const& peerState = peer.first;
+                auto const& peerPool = peer.second;
+                TLLM_CHECK(peerState.getCacheState().has_value());
+                TLLM_CHECK(peerState.getCommState().has_value());
+                auto const& peerCommState = peerState.getCommState().value();
+                TLLM_CHECK_WITH_INFO(peerCommState.isAgentState(),
+                    "Startup preconnect generation rank %zu did not publish an agent communication state", peerRank);
+                TLLM_CHECK_WITH_INFO(peerCommState.getSelfIdx() == static_cast<int>(peerRank),
+                    "Startup preconnect generation payload index %zu contains self rank %d", peerRank,
+                    peerCommState.getSelfIdx());
+                TLLM_CHECK_WITH_INFO(peerCommState.getAgentState().size() == peerRankPayloads.size(),
+                    "Startup preconnect generation rank %zu advertises %zu agents, but the bundle contains %zu ranks",
+                    peerRank, peerCommState.getAgentState().size(), peerRankPayloads.size());
+                TLLM_CHECK_WITH_INFO(peerPool.getAddr() != 0 && peerPool.getLen() != 0,
+                    "Startup preconnect generation rank %zu published an empty KV-pool descriptor", peerRank);
+                if (!expectedAgentStates.has_value())
+                {
+                    expectedAgentStates = peerCommState.getAgentState();
+                    connections = getConnections(peerCommState);
+                }
+                else
+                {
+                    TLLM_CHECK_WITH_INFO(expectedAgentStates.value() == peerCommState.getAgentState(),
+                        "Startup preconnect generation rank %zu published an inconsistent agent list", peerRank);
+                }
+                peers.emplace_back(std::move(peer));
+            }
+
+            auto const peerCount = peers.size();
+            TLLM_CHECK_WITH_INFO(peerCount == static_cast<size_t>(session.getSize()),
+                "Bijective startup preconnect requires equal local and peer rank counts: local=%d peer=%zu",
+                session.getSize(), peerCount);
+            TLLM_CHECK_WITH_INFO(connections.size() == peerCount,
+                "Startup preconnect loaded %zu generation agents, expected %zu", connections.size(), peerCount);
+
+            auto const localAgentCount = static_cast<uint64_t>(connections.size());
+
+            uint64_t instanceAgentCount{0};
+            session.allreduce(
+                &localAgentCount, &instanceAgentCount, 1, mpi::MpiType::kUINT64, mpi::MpiOp::SUM);
+            auto const expectedAgentCount
+                = static_cast<uint64_t>(peerCount) * static_cast<uint64_t>(session.getSize());
+            TLLM_CHECK_WITH_INFO(instanceAgentCount == expectedAgentCount,
+                "Incomplete final-pool callback coverage: got %lu, expected %lu",
+                static_cast<unsigned long>(instanceAgentCount),
+                static_cast<unsigned long>(expectedAgentCount));
+            TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+                "MOONCAKE_PAGED_GIN final-pool callbacks ready local_agents=%lu instance_agents=%lu role=CTX "
+                "ctx_instance=%d gen_instance=%d local_rank=%d",
+                static_cast<unsigned long>(localAgentCount), static_cast<unsigned long>(instanceAgentCount),
+                instanceId, generation, sessionRank);
+
+            auto const failedPath = generationMarkerPath(generation, 1, ".failed");
+            std::mutex primaryWatchdogMutex;
+            std::condition_variable primaryWatchdogCv;
+            bool primaryWatchdogDone{false};
+            std::thread primaryWatchdog([&]()
+            {
+                std::unique_lock lock(primaryWatchdogMutex);
+                if (!primaryWatchdogCv.wait_for(lock, initTimeout, [&]() { return primaryWatchdogDone; }))
+                {
+                    writeStartupMarkerNoThrow(failedPath, "CTX primary final-pool preconnect timed out\n");
+                    TLLM_LOG_ERROR(mpi::MpiComm::world().getRank(),
+                        "MOONCAKE_PAGED_GIN CTX-primary final-pool preconnect timed out after %lld seconds "
+                        "ctx_instance=%d gen_instance=%d local_rank=%d",
+                        static_cast<long long>(initTimeout.count()), instanceId, generation, sessionRank);
+                    std::_Exit(124);
+                }
+            });
+            auto stopPrimaryWatchdog = [&]()
+            {
+                {
+                    std::lock_guard lock(primaryWatchdogMutex);
+                    primaryWatchdogDone = true;
+                }
+                primaryWatchdogCv.notify_all();
+                primaryWatchdog.join();
+            };
+
+            uint64_t localPairCount{0};
+            uint64_t instancePairCount{0};
+            try
+            {
+                for (size_t round = 0; round < peerCount; ++round)
+                {
+                    auto const peerRank = (static_cast<size_t>(sessionRank) + round) % peerCount;
+                    auto const& peerState = peers[peerRank].first;
+                    auto const& peerPool = peers[peerRank].second;
+                    auto const& peerCommState = peerState.getCommState().value();
+                    auto const counterparts = targetIRanks(
+                        mCacheState, peerState.getCacheState().value(), peerCommState.getSelfIdx()).mIRanks;
+                    if (std::find(counterparts.begin(), counterparts.end(), mCommState.getSelfIdx())
+                        != counterparts.end())
+                    {
+                        auto const* connection
+                            = connections.at(static_cast<size_t>(peerCommState.getSelfIdx()));
+                        auto const* agentConnection = dynamic_cast<AgentConnection const*>(connection);
+                        TLLM_CHECK(agentConnection != nullptr);
+                        agentConnection->preconnect(peerPool);
+                        ++localPairCount;
+                    }
+                    session.barrier();
+                }
+                session.allreduce(
+                    &localPairCount, &instancePairCount, 1, mpi::MpiType::kUINT64, mpi::MpiOp::SUM);
+                auto const oneToOnePairCount = static_cast<uint64_t>(peerCount);
+                auto const allToAllPairCount = oneToOnePairCount * oneToOnePairCount;
+                TLLM_CHECK_WITH_INFO(
+                    instancePairCount == oneToOnePairCount || instancePairCount == allToAllPairCount,
+                    "Unsupported or incomplete CTX-primary pair coverage: got %lu, expected %lu or %lu",
+                    static_cast<unsigned long>(instancePairCount),
+                    static_cast<unsigned long>(oneToOnePairCount),
+                    static_cast<unsigned long>(allToAllPairCount));
+                TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+                    "MOONCAKE_PAGED_GIN CTX-primary final-pool preconnect local_pairs=%lu instance_pairs=%lu "
+                    "ctx_instance=%d gen_instance=%d local_rank=%d",
+                    static_cast<unsigned long>(localPairCount), static_cast<unsigned long>(instancePairCount),
+                    instanceId, generation, sessionRank);
+                session.barrier();
+                std::vector<char> readyPayload;
+                if (sessionRank == 0)
+                {
+                    auto const ackMessage = "OK callbacks=" + std::to_string(instanceAgentCount)
+                        + " pairs=" + std::to_string(instancePairCount) + "\n";
+                    writeStartupFile(
+                        contextAckPath(generation, 1), std::vector<char>(ackMessage.begin(), ackMessage.end()));
+
+                    auto const readyPath = generationMarkerPath(generation, 1, ".ready");
+                    auto const readyDeadline = makeDeadline(rendezvousTimeout + initTimeout);
+                    while (!startupPathExists(readyPath))
+                    {
+                        TLLM_CHECK_WITH_INFO(!startupPathExists(failedPath),
+                            "Generation instance %d final-pool preconnect failed; see %s", generation,
+                            failedPath.c_str());
+                        TLLM_CHECK_WITH_INFO(std::chrono::steady_clock::now() < readyDeadline,
+                            "Timed out waiting for generation instance %d final-pool preconnect", generation);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    }
+                    readyPayload = readStartupFile(readyPath);
+                }
+                session.bcast(readyPayload, 0);
+                auto const readyMessage = std::string(readyPayload.begin(), readyPayload.end());
+                auto const readyPairCount = parseStartupPairCount(readyPayload, "Generation ready");
+                auto const expectedReadyMessage = "OK pairs=" + std::to_string(instancePairCount) + "\n";
+                TLLM_CHECK_WITH_INFO(
+                    readyPairCount == instancePairCount && readyMessage == expectedReadyMessage,
+                    "Generation instance %d reported startup result '%s', expected '%s'", generation,
+                    readyMessage.c_str(), expectedReadyMessage.c_str());
+                session.barrier();
+                stopPrimaryWatchdog();
+            }
+            catch (...)
+            {
+                writeStartupMarkerNoThrow(failedPath, "CTX primary final-pool preconnect failed\n");
+                stopPrimaryWatchdog();
+                throw;
+            }
+        }
         TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
             "MOONCAKE_PAGED_GIN startup preconnect complete role=CTX instance=%d epoch=%d local_rank=%d", instanceId,
             startupEpoch, sessionRank);
         return;
     }
+
+    auto localState = DataTransceiverState{mCacheState, mCommState};
+    TLLM_CHECK(mPagedPoolMemory.has_value());
+    auto generationRankPayloads
+        = allgatherStartupPayloads(session, serializeStartupPeerState(localState, mPagedPoolMemory.value()));
+    auto const readyPath = generationMarkerPath(instanceId, startupEpoch, ".ready");
+    auto const failedPath = generationMarkerPath(instanceId, startupEpoch, ".failed");
+    if (sessionRank == 0)
+    {
+        writeStartupFile(generationStatePath(instanceId, startupEpoch),
+            serializeStartupPeerStateBundle(generationRankPayloads));
+    }
+    session.barrier();
+
+    if (startupEpoch == 0)
+    {
+        if (sessionRank == 0)
+        {
+            std::string const readyMessage = "OK provisional-state-only pairs=0\n";
+            writeStartupFile(readyPath, std::vector<char>(readyMessage.begin(), readyMessage.end()));
+        }
+        session.barrier();
+        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+            "MOONCAKE_PAGED_GIN startup preconnect published provisional generation state role=GEN "
+            "instance=%d epoch=%d local_rank=%d",
+            instanceId, startupEpoch, sessionRank);
+        return;
+    }
+
+    TLLM_CHECK_WITH_INFO(startupEpoch == 1,
+        "Generation startup preconnect expected provisional epoch 0 or final epoch 1, got epoch %d", startupEpoch);
+    std::vector<char> contextAckPayload;
+    if (sessionRank == 0)
+    {
+        auto const ackPath = contextAckPath(instanceId, startupEpoch);
+        auto const ackTimeout = rendezvousTimeout + initTimeout * (instanceId + 1);
+        waitForStartupPath(ackPath, makeDeadline(ackTimeout));
+        contextAckPayload = readStartupFile(ackPath);
+    }
+    session.bcast(contextAckPayload, 0);
+    auto const contextAckMessage = std::string(contextAckPayload.begin(), contextAckPayload.end());
+    TLLM_CHECK_WITH_INFO(contextAckMessage.rfind("OK callbacks=", 0) == 0,
+        "Context primary marker has invalid content '%s'", contextAckMessage.c_str());
+    auto const contextPrimaryPairCount = parseStartupPairCount(contextAckPayload, "Context primary");
+    TLLM_CHECK_WITH_INFO(contextPrimaryPairCount != 0, "Context primary marker reported zero preconnected pairs");
+    session.barrier();
 
     std::vector<char> peerStateBundle;
     if (sessionRank == 0)
@@ -698,7 +1035,7 @@ void AgentConnectionManager::runStartupPreconnect()
         for (int context = 0; context < contextInstances; ++context)
         {
             auto const statePath = contextStatePath(context);
-            waitForStartupPath(statePath, rendezvousDeadline);
+            waitForStartupPath(statePath, makeDeadline(rendezvousTimeout));
             peerStatePayloads.emplace_back(readStartupFile(statePath));
         }
         std::ostringstream output;
@@ -717,16 +1054,15 @@ void AgentConnectionManager::runStartupPreconnect()
     std::mutex watchdogMutex;
     std::condition_variable watchdogCv;
     bool watchdogDone{false};
-    auto const readyPath = generationMarkerPath(instanceId, ".ready");
-    auto const failedPath = generationMarkerPath(instanceId, ".failed");
     std::thread watchdog([&]()
     {
         std::unique_lock lock(watchdogMutex);
         if (!watchdogCv.wait_for(lock, initTimeout, [&]() { return watchdogDone; }))
         {
-            writeStartupMarkerNoThrow(failedPath, "NCCL startup preconnect timed out\n");
+            writeStartupMarkerNoThrow(failedPath, "NCCL final-pool preconnect timed out\n");
             TLLM_LOG_ERROR(mpi::MpiComm::world().getRank(),
-                "MOONCAKE_PAGED_GIN startup preconnect timed out after %lld seconds role=GEN instance=%d epoch=%d local_rank=%d",
+                "MOONCAKE_PAGED_GIN final-pool preconnect timed out after %lld seconds role=GEN instance=%d "
+                "epoch=%d local_rank=%d",
                 static_cast<long long>(initTimeout.count()), instanceId, startupEpoch, sessionRank);
             std::_Exit(124);
         }
@@ -744,43 +1080,122 @@ void AgentConnectionManager::runStartupPreconnect()
     try
     {
         session.barrier();
-        for (auto& peerPayload : peerStatePayloads)
+        uint64_t localPairCount{0};
+        for (auto& peerBundle : peerStatePayloads)
         {
-            auto [peerState, peerPool] = deserializeStartupPeerState(peerPayload);
-            TLLM_CHECK(peerState.getCacheState().has_value());
-            TLLM_CHECK(peerState.getCommState().has_value());
-            auto const counterparts
-                = targetIRanks(peerState.getCacheState().value(), mCacheState, mCommState.getSelfIdx()).mIRanks;
-            auto const connections = getConnections(peerState.getCommState().value());
-            TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-                "MOONCAKE_PAGED_GIN startup preconnect pairs=%zu role=GEN instance=%d epoch=%d local_rank=%d peer=%s",
-                counterparts.size(), instanceId, startupEpoch, sessionRank, peerState.getCommState()->toString().c_str());
-            for (auto const counterpart : counterparts)
+            auto peerRankPayloads = deserializeStartupPeerStateBundle(peerBundle);
+            TLLM_CHECK_WITH_INFO(!peerRankPayloads.empty(),
+                "Startup preconnect received an empty context state bundle");
+
+            std::optional<std::vector<AgentState>> expectedAgentStates;
+            std::vector<Connection const*> connections;
+            std::vector<std::pair<DataTransceiverState, MemoryDesc>> peers;
+            peers.reserve(peerRankPayloads.size());
+            for (size_t peerRank = 0; peerRank < peerRankPayloads.size(); ++peerRank)
             {
-                auto const* connection = connections.at(counterpart);
-                auto const* agentConnection = dynamic_cast<AgentConnection const*>(connection);
-                TLLM_CHECK(agentConnection != nullptr);
-                agentConnection->preconnect(peerPool);
+                auto peer = deserializeStartupPeerState(peerRankPayloads[peerRank]);
+                auto const& peerState = peer.first;
+                auto const& peerPool = peer.second;
+                TLLM_CHECK(peerState.getCacheState().has_value());
+                TLLM_CHECK(peerState.getCommState().has_value());
+                auto const& peerCommState = peerState.getCommState().value();
+                TLLM_CHECK_WITH_INFO(peerCommState.isAgentState(),
+                    "Startup preconnect context rank %zu did not publish an agent communication state", peerRank);
+                TLLM_CHECK_WITH_INFO(peerCommState.getSelfIdx() == static_cast<int>(peerRank),
+                    "Startup preconnect context payload index %zu contains self rank %d", peerRank,
+                    peerCommState.getSelfIdx());
+                TLLM_CHECK_WITH_INFO(peerCommState.getAgentState().size() == peerRankPayloads.size(),
+                    "Startup preconnect context rank %zu advertises %zu agents, but the bundle contains %zu ranks",
+                    peerRank, peerCommState.getAgentState().size(), peerRankPayloads.size());
+                TLLM_CHECK_WITH_INFO(peerPool.getAddr() != 0 && peerPool.getLen() != 0,
+                    "Startup preconnect context rank %zu published an empty KV-pool descriptor", peerRank);
+                if (!expectedAgentStates.has_value())
+                {
+                    expectedAgentStates = peerCommState.getAgentState();
+                    connections = getConnections(peerCommState);
+                }
+                else
+                {
+                    TLLM_CHECK_WITH_INFO(expectedAgentStates.value() == peerCommState.getAgentState(),
+                        "Startup preconnect context rank %zu published an inconsistent agent list", peerRank);
+                }
+                peers.emplace_back(std::move(peer));
             }
+
+            auto const peerCount = peers.size();
+            TLLM_CHECK_WITH_INFO(peerCount == static_cast<size_t>(session.getSize()),
+                "Bijective startup preconnect requires equal local and peer rank counts: local=%d peer=%zu",
+                session.getSize(), peerCount);
+            TLLM_CHECK_WITH_INFO(connections.size() == peerCount,
+                "Startup preconnect loaded %zu context agents, expected %zu", connections.size(), peerCount);
+
+            uint64_t contextPairCount{0};
+            for (size_t round = 0; round < peerCount; ++round)
+            {
+                auto const peerRank = (static_cast<size_t>(sessionRank) + round) % peerCount;
+                auto const& peerState = peers[peerRank].first;
+                auto const& peerPool = peers[peerRank].second;
+                auto const& peerCommState = peerState.getCommState().value();
+                auto const counterparts
+                    = targetIRanks(peerState.getCacheState().value(), mCacheState, mCommState.getSelfIdx()).mIRanks;
+                if (std::find(counterparts.begin(), counterparts.end(), peerCommState.getSelfIdx())
+                    != counterparts.end())
+                {
+                    auto const* connection = connections.at(static_cast<size_t>(peerCommState.getSelfIdx()));
+                    auto const* agentConnection = dynamic_cast<AgentConnection const*>(connection);
+                    TLLM_CHECK(agentConnection != nullptr);
+                    agentConnection->preconnect(peerPool);
+                    ++contextPairCount;
+                }
+                session.barrier();
+            }
+            localPairCount += contextPairCount;
+            TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+                "MOONCAKE_PAGED_GIN final-pool preconnect context_pairs=%lu context_ranks=%zu role=GEN "
+                "instance=%d epoch=%d local_rank=%d",
+                static_cast<unsigned long>(contextPairCount), peerRankPayloads.size(), instanceId, startupEpoch,
+                sessionRank);
         }
+
+        uint64_t instancePairCount{0};
+        session.allreduce(
+            &localPairCount, &instancePairCount, 1, mpi::MpiType::kUINT64, mpi::MpiOp::SUM);
+        auto const oneToOnePairCount
+            = static_cast<uint64_t>(session.getSize()) * static_cast<uint64_t>(contextInstances);
+        auto const allToAllPairCount = oneToOnePairCount * static_cast<uint64_t>(session.getSize());
+        TLLM_CHECK_WITH_INFO(instancePairCount == contextPrimaryPairCount,
+            "GEN reuse pair coverage %lu does not match CTX-primary coverage %lu",
+            static_cast<unsigned long>(instancePairCount),
+            static_cast<unsigned long>(contextPrimaryPairCount));
+        TLLM_CHECK_WITH_INFO(
+            instancePairCount == oneToOnePairCount || instancePairCount == allToAllPairCount,
+            "Unsupported or incomplete GEN reuse pair coverage: got %lu, expected %lu or %lu",
+            static_cast<unsigned long>(instancePairCount), static_cast<unsigned long>(oneToOnePairCount),
+            static_cast<unsigned long>(allToAllPairCount));
+        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+            "MOONCAKE_PAGED_GIN final-pool preconnect local_pairs=%lu instance_pairs=%lu role=GEN instance=%d "
+            "epoch=%d local_rank=%d",
+            static_cast<unsigned long>(localPairCount), static_cast<unsigned long>(instancePairCount), instanceId,
+            startupEpoch, sessionRank);
         session.barrier();
         if (sessionRank == 0)
         {
-            writeStartupFile(readyPath, std::vector<char>{'O', 'K', '\n'});
+            auto const readyMessage = "OK pairs=" + std::to_string(instancePairCount) + "\n";
+            writeStartupFile(readyPath, std::vector<char>(readyMessage.begin(), readyMessage.end()));
         }
         session.barrier();
         stopWatchdog();
     }
     catch (...)
     {
-        writeStartupMarkerNoThrow(failedPath, "Startup preconnect failed\n");
+        writeStartupMarkerNoThrow(failedPath, "Final-pool preconnect failed\n");
         stopWatchdog();
         throw;
     }
 
     TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-        "MOONCAKE_PAGED_GIN startup preconnect complete role=GEN instance=%d epoch=%d local_rank=%d", instanceId,
-        startupEpoch, sessionRank);
+        "MOONCAKE_PAGED_GIN final-pool preconnect complete role=GEN instance=%d epoch=%d local_rank=%d",
+        instanceId, startupEpoch, sessionRank);
 }
 
 AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(

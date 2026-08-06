@@ -18,6 +18,7 @@ gen_instances=${11:-1}
 # Set CUDA_VISIBLE_DEVICES from script argument (srun --export cannot
 # reliably pass comma-separated values inside shared containers).
 export CUDA_VISIBLE_DEVICES=${cuda_devices}
+export LD_LIBRARY_PATH=/opt/nccl-gin/lib:/opt/mooncake-paged-gin/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
 
 # Paged GIN consumes these before its cache sender/receiver threads start.
 # Other transfer backends ignore them.
@@ -28,7 +29,7 @@ export TRTLLM_MOONCAKE_PAGED_GIN_CTX_INSTANCES="${ctx_instances}"
 export TRTLLM_MOONCAKE_PAGED_GIN_GEN_INSTANCES="${gen_instances}"
 export TRTLLM_MOONCAKE_PAGED_GIN_PRECONNECT_DIR="${log_dir}/mooncake-paged-gin-preconnect"
 export TRTLLM_MOONCAKE_PAGED_GIN_RENDEZVOUS_TIMEOUT_SECONDS="${TRTLLM_MOONCAKE_PAGED_GIN_RENDEZVOUS_TIMEOUT_SECONDS:-2100}"
-export TRTLLM_MOONCAKE_PAGED_GIN_INIT_TIMEOUT_SECONDS="${TRTLLM_MOONCAKE_PAGED_GIN_INIT_TIMEOUT_SECONDS:-120}"
+export TRTLLM_MOONCAKE_PAGED_GIN_INIT_TIMEOUT_SECONDS="${TRTLLM_MOONCAKE_PAGED_GIN_INIT_TIMEOUT_SECONDS:-900}"
 
 # Clear UCX_TLS for specific clusters
 unset UCX_TLS
