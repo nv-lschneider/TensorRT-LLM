@@ -788,9 +788,16 @@ void AgentConnectionManager::runStartupPreconnect()
                 auto const provisionalPayload = readStartupFile(readyPath);
                 auto const provisionalMessage
                     = std::string(provisionalPayload.begin(), provisionalPayload.end());
-                TLLM_CHECK_WITH_INFO(provisionalMessage == "OK provisional-state-only pairs=0\n",
-                    "Generation instance %d epoch %d reported invalid provisional result '%s'", generation,
-                    startupEpoch, provisionalMessage.c_str());
+                auto const provisionalPairCount
+                    = parseStartupPairCount(provisionalPayload, "Generation provisional");
+                auto const expectedProvisionalPairCount = static_cast<uint64_t>(session.getSize())
+                    * static_cast<uint64_t>(session.getSize()) * static_cast<uint64_t>(contextInstances);
+                auto const expectedProvisionalMessage
+                    = "OK provisional pairs=" + std::to_string(expectedProvisionalPairCount) + "\n";
+                TLLM_CHECK_WITH_INFO(provisionalPairCount == expectedProvisionalPairCount
+                        && provisionalMessage == expectedProvisionalMessage,
+                    "Generation instance %d epoch %d reported provisional result '%s', expected '%s'", generation,
+                    startupEpoch, provisionalMessage.c_str(), expectedProvisionalMessage.c_str());
             }
         }
         session.barrier();
@@ -996,38 +1003,50 @@ void AgentConnectionManager::runStartupPreconnect()
     }
     session.barrier();
 
-    if (startupEpoch == 0)
+    TLLM_CHECK_WITH_INFO(startupEpoch == 0 || startupEpoch == 1,
+        "Generation startup preconnect expected provisional epoch 0 or final epoch 1, got epoch %d", startupEpoch);
+    if (startupEpoch == 0 && instanceId > 0)
     {
+        // A 1k/1k launch has three generation instances sharing the same
+        // context RPC servers. Prime them one instance at a time so the
+        // proven eight-rank v17 warm-up is not turned into a 24-to-1 burst.
         if (sessionRank == 0)
         {
-            std::string const readyMessage = "OK provisional-state-only pairs=0\n";
-            writeStartupFile(readyPath, std::vector<char>(readyMessage.begin(), readyMessage.end()));
+            auto const priorReadyPath = generationMarkerPath(instanceId - 1, startupEpoch, ".ready");
+            auto const priorFailedPath = generationMarkerPath(instanceId - 1, startupEpoch, ".failed");
+            auto const priorDeadline = makeDeadline(rendezvousTimeout + initTimeout * instanceId);
+            while (!startupPathExists(priorReadyPath))
+            {
+                TLLM_CHECK_WITH_INFO(!startupPathExists(priorFailedPath),
+                    "Prior generation instance %d failed provisional preconnect; see %s", instanceId - 1,
+                    priorFailedPath.c_str());
+                TLLM_CHECK_WITH_INFO(std::chrono::steady_clock::now() < priorDeadline,
+                    "Timed out waiting for prior generation instance %d provisional preconnect", instanceId - 1);
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
         }
         session.barrier();
-        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-            "MOONCAKE_PAGED_GIN startup preconnect published provisional generation state role=GEN "
-            "instance=%d epoch=%d local_rank=%d",
-            instanceId, startupEpoch, sessionRank);
-        return;
     }
-
-    TLLM_CHECK_WITH_INFO(startupEpoch == 1,
-        "Generation startup preconnect expected provisional epoch 0 or final epoch 1, got epoch %d", startupEpoch);
-    std::vector<char> contextAckPayload;
-    if (sessionRank == 0)
+    std::optional<uint64_t> contextPrimaryPairCount;
+    if (startupEpoch == 1)
     {
-        auto const ackPath = contextAckPath(instanceId, startupEpoch);
-        auto const ackTimeout = rendezvousTimeout + initTimeout * (instanceId + 1);
-        waitForStartupPath(ackPath, makeDeadline(ackTimeout));
-        contextAckPayload = readStartupFile(ackPath);
+        std::vector<char> contextAckPayload;
+        if (sessionRank == 0)
+        {
+            auto const ackPath = contextAckPath(instanceId, startupEpoch);
+            auto const ackTimeout = rendezvousTimeout + initTimeout * (instanceId + 1);
+            waitForStartupPath(ackPath, makeDeadline(ackTimeout));
+            contextAckPayload = readStartupFile(ackPath);
+        }
+        session.bcast(contextAckPayload, 0);
+        auto const contextAckMessage = std::string(contextAckPayload.begin(), contextAckPayload.end());
+        TLLM_CHECK_WITH_INFO(contextAckMessage.rfind("OK callbacks=", 0) == 0,
+            "Context primary marker has invalid content '%s'", contextAckMessage.c_str());
+        contextPrimaryPairCount = parseStartupPairCount(contextAckPayload, "Context primary");
+        TLLM_CHECK_WITH_INFO(
+            contextPrimaryPairCount.value() != 0, "Context primary marker reported zero preconnected pairs");
+        session.barrier();
     }
-    session.bcast(contextAckPayload, 0);
-    auto const contextAckMessage = std::string(contextAckPayload.begin(), contextAckPayload.end());
-    TLLM_CHECK_WITH_INFO(contextAckMessage.rfind("OK callbacks=", 0) == 0,
-        "Context primary marker has invalid content '%s'", contextAckMessage.c_str());
-    auto const contextPrimaryPairCount = parseStartupPairCount(contextAckPayload, "Context primary");
-    TLLM_CHECK_WITH_INFO(contextPrimaryPairCount != 0, "Context primary marker reported zero preconnected pairs");
-    session.barrier();
 
     std::vector<char> peerStateBundle;
     if (sessionRank == 0)
@@ -1061,11 +1080,14 @@ void AgentConnectionManager::runStartupPreconnect()
         std::unique_lock lock(watchdogMutex);
         if (!watchdogCv.wait_for(lock, initTimeout, [&]() { return watchdogDone; }))
         {
-            writeStartupMarkerNoThrow(failedPath, "NCCL final-pool preconnect timed out\n");
+            writeStartupMarkerNoThrow(failedPath,
+                startupEpoch == 0 ? "NCCL provisional preconnect timed out\n"
+                                  : "NCCL final-pool preconnect timed out\n");
             TLLM_LOG_ERROR(mpi::MpiComm::world().getRank(),
-                "MOONCAKE_PAGED_GIN final-pool preconnect timed out after %lld seconds role=GEN instance=%d "
-                "epoch=%d local_rank=%d",
-                static_cast<long long>(initTimeout.count()), instanceId, startupEpoch, sessionRank);
+                "MOONCAKE_PAGED_GIN %s preconnect timed out after %lld seconds role=GEN instance=%d epoch=%d "
+                "local_rank=%d",
+                startupEpoch == 0 ? "provisional" : "final-pool", static_cast<long long>(initTimeout.count()),
+                instanceId, startupEpoch, sessionRank);
             std::_Exit(124);
         }
     });
@@ -1155,8 +1177,9 @@ void AgentConnectionManager::runStartupPreconnect()
             }
             localPairCount += contextPairCount;
             TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-                "MOONCAKE_PAGED_GIN final-pool preconnect context_pairs=%lu context_ranks=%zu role=GEN "
-                "instance=%d epoch=%d local_rank=%d",
+                "MOONCAKE_PAGED_GIN %s preconnect context_pairs=%lu context_ranks=%zu role=GEN instance=%d "
+                "epoch=%d local_rank=%d",
+                startupEpoch == 0 ? "provisional" : "final-pool",
                 static_cast<unsigned long>(contextPairCount), peerRankPayloads.size(), instanceId, startupEpoch,
                 sessionRank);
         }
@@ -1167,24 +1190,29 @@ void AgentConnectionManager::runStartupPreconnect()
         auto const oneToOnePairCount
             = static_cast<uint64_t>(session.getSize()) * static_cast<uint64_t>(contextInstances);
         auto const allToAllPairCount = oneToOnePairCount * static_cast<uint64_t>(session.getSize());
-        TLLM_CHECK_WITH_INFO(instancePairCount == contextPrimaryPairCount,
-            "GEN reuse pair coverage %lu does not match CTX-primary coverage %lu",
-            static_cast<unsigned long>(instancePairCount),
-            static_cast<unsigned long>(contextPrimaryPairCount));
+        if (contextPrimaryPairCount.has_value())
+        {
+            TLLM_CHECK_WITH_INFO(instancePairCount == contextPrimaryPairCount.value(),
+                "GEN reuse pair coverage %lu does not match CTX-primary coverage %lu",
+                static_cast<unsigned long>(instancePairCount),
+                static_cast<unsigned long>(contextPrimaryPairCount.value()));
+        }
         TLLM_CHECK_WITH_INFO(
             instancePairCount == oneToOnePairCount || instancePairCount == allToAllPairCount,
             "Unsupported or incomplete GEN reuse pair coverage: got %lu, expected %lu or %lu",
             static_cast<unsigned long>(instancePairCount), static_cast<unsigned long>(oneToOnePairCount),
             static_cast<unsigned long>(allToAllPairCount));
         TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-            "MOONCAKE_PAGED_GIN final-pool preconnect local_pairs=%lu instance_pairs=%lu role=GEN instance=%d "
-            "epoch=%d local_rank=%d",
-            static_cast<unsigned long>(localPairCount), static_cast<unsigned long>(instancePairCount), instanceId,
-            startupEpoch, sessionRank);
+            "MOONCAKE_PAGED_GIN %s preconnect local_pairs=%lu instance_pairs=%lu role=GEN instance=%d epoch=%d "
+            "local_rank=%d",
+            startupEpoch == 0 ? "provisional" : "final-pool", static_cast<unsigned long>(localPairCount),
+            static_cast<unsigned long>(instancePairCount), instanceId, startupEpoch, sessionRank);
         session.barrier();
         if (sessionRank == 0)
         {
-            auto const readyMessage = "OK pairs=" + std::to_string(instancePairCount) + "\n";
+            auto const readyMessage = startupEpoch == 0
+                ? "OK provisional pairs=" + std::to_string(instancePairCount) + "\n"
+                : "OK pairs=" + std::to_string(instancePairCount) + "\n";
             writeStartupFile(readyPath, std::vector<char>(readyMessage.begin(), readyMessage.end()));
         }
         session.barrier();
@@ -1192,14 +1220,15 @@ void AgentConnectionManager::runStartupPreconnect()
     }
     catch (...)
     {
-        writeStartupMarkerNoThrow(failedPath, "Final-pool preconnect failed\n");
+        writeStartupMarkerNoThrow(
+            failedPath, startupEpoch == 0 ? "Provisional preconnect failed\n" : "Final-pool preconnect failed\n");
         stopWatchdog();
         throw;
     }
 
     TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-        "MOONCAKE_PAGED_GIN final-pool preconnect complete role=GEN instance=%d epoch=%d local_rank=%d",
-        instanceId, startupEpoch, sessionRank);
+        "MOONCAKE_PAGED_GIN %s preconnect complete role=GEN instance=%d epoch=%d local_rank=%d",
+        startupEpoch == 0 ? "provisional" : "final-pool", instanceId, startupEpoch, sessionRank);
 }
 
 AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
