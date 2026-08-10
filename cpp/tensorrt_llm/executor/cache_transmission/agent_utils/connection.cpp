@@ -785,22 +785,30 @@ void AgentConnectionManager::runStartupPreconnect()
                         startupEpoch);
                     std::this_thread::sleep_for(std::chrono::milliseconds(200));
                 }
-                auto const provisionalPayload = readStartupFile(readyPath);
-                auto const provisionalMessage
-                    = std::string(provisionalPayload.begin(), provisionalPayload.end());
-                auto const provisionalPairCount
-                    = parseStartupPairCount(provisionalPayload, "Generation provisional");
-                auto const expectedProvisionalPairCount = static_cast<uint64_t>(session.getSize())
+                auto const readyPayload = readStartupFile(readyPath);
+                auto const readyMessage = std::string(readyPayload.begin(), readyPayload.end());
+                auto const readyPairCount = parseStartupPairCount(readyPayload, "Generation ready");
+                auto const expectedPairCount = static_cast<uint64_t>(session.getSize())
                     * static_cast<uint64_t>(session.getSize()) * static_cast<uint64_t>(contextInstances);
-                auto const expectedProvisionalMessage
-                    = "OK provisional pairs=" + std::to_string(expectedProvisionalPairCount) + "\n";
-                TLLM_CHECK_WITH_INFO(provisionalPairCount == expectedProvisionalPairCount
-                        && provisionalMessage == expectedProvisionalMessage,
-                    "Generation instance %d epoch %d reported provisional result '%s', expected '%s'", generation,
-                    startupEpoch, provisionalMessage.c_str(), expectedProvisionalMessage.c_str());
+                auto const expectedReadyMessage = startupEpoch == 0
+                    ? "OK provisional pairs=" + std::to_string(expectedPairCount) + "\n"
+                    : "OK pairs=" + std::to_string(expectedPairCount) + "\n";
+                TLLM_CHECK_WITH_INFO(readyPairCount == expectedPairCount && readyMessage == expectedReadyMessage,
+                    "Generation instance %d epoch %d reported startup result '%s', expected '%s'", generation,
+                    startupEpoch, readyMessage.c_str(), expectedReadyMessage.c_str());
             }
         }
         session.barrier();
+        TLLM_CHECK_WITH_INFO(startupEpoch == 0 || startupEpoch == 1,
+            "Context startup preconnect expected provisional epoch 0 or final epoch 1, got epoch %d", startupEpoch);
+        if (startupEpoch == 1)
+        {
+            TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+                "MOONCAKE_PAGED_GIN secondary context manager validated final-pool completion role=CTX "
+                "instance=%d epoch=%d local_rank=%d",
+                instanceId, startupEpoch, sessionRank);
+            return;
+        }
         TLLM_CHECK_WITH_INFO(startupEpoch == 0,
             "Context startup preconnect expected one connection manager, got epoch %d", startupEpoch);
         for (int generation = 0; generation < generationInstances; ++generation)
