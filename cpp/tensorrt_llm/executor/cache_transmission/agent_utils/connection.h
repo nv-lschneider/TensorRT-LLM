@@ -315,7 +315,7 @@ public:
     void sendPagedTransfer(DataContext const& ctx, PagedTransferMetadata const& localMetadata) const;
     [[nodiscard]] std::optional<PagedTransferMetadata> const& getPagedTransferMetadata() const;
     void setPagedTransferMetadata(std::optional<PagedTransferMetadata> pagedTransferMetadata);
-    void registerMemoryForPagedTransfer(MemoryDesc const& desc) const;
+    void validateMemoryForPagedTransfer(MemoryDesc const& desc) const;
     void setSenderState(std::vector<MemoryDesc> cacheReceiverBufferDescs, int valideSegmentIdx,
         std::vector<std::pair<size_t, size_t>> offsetRatios, std::vector<uint8_t> bufferKinds);
     void setHasLoadRemoteAgent(bool hasLoadRemoteAgent);
@@ -371,6 +371,7 @@ public:
     [[nodiscard]] std::vector<uint8_t> const& getBufferKinds() const;
     [[nodiscard]] bool supportsPagedTransfer() const;
     [[nodiscard]] MemoryDesc const& getPagedPoolMemory() const;
+    void validateMemoryForPagedTransfer(MemoryDesc const& desc) const;
     void registerMemoryForPagedTransfer(MemoryDesc const& desc);
     void updateUnhandledNotifications();
     [[nodiscard]] BaseTransferAgent* getAgent() const;

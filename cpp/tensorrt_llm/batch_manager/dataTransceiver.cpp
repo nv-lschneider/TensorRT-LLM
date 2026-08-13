@@ -34,6 +34,7 @@
 #include <map>
 #include <memory>
 #include <unordered_map>
+#include <unistd.h>
 
 namespace tensorrt_llm::batch_manager
 {
@@ -202,7 +203,12 @@ std::filesystem::path getTransferOutputPath(char const* tag)
         auto rank = mpi::MpiComm::world().getRank();
         auto path = fs::path(outputPath);
         fs::create_directories(path);
-        return path / ("rank_" + std::to_string(rank) + "_" + tag + ".csv");
+        char hostname[256]{};
+        std::string host = gethostname(hostname, sizeof(hostname)) == 0
+            ? hostname
+            : "unknown-host";
+        return path / (host + "_pid_" + std::to_string(::getpid()) + "_rank_"
+            + std::to_string(rank) + "_" + tag + ".csv");
     }
     return {};
 }

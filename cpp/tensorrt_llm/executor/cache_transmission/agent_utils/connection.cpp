@@ -421,16 +421,16 @@ void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& reque
         if (mooncakePagedGinDiagEnabled())
         {
             TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-                "MOONCAKE_PAGED_GIN_DIAG agent_register_dest_begin request_id=%lu addr=%p len=%lu",
+                "MOONCAKE_PAGED_GIN_DIAG agent_validate_dest_begin request_id=%lu addr=%p len=%lu",
                 static_cast<unsigned long>(diagRequestId),
                 reinterpret_cast<void*>(pagedTransferMetadata->mRegisteredMemory.getAddr()),
                 pagedTransferMetadata->mRegisteredMemory.getLen());
         }
-        registerMemoryForPagedTransfer(pagedTransferMetadata->mRegisteredMemory);
+        validateMemoryForPagedTransfer(pagedTransferMetadata->mRegisteredMemory);
         if (mooncakePagedGinDiagEnabled())
         {
             TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-                "MOONCAKE_PAGED_GIN_DIAG agent_register_dest_end request_id=%lu",
+                "MOONCAKE_PAGED_GIN_DIAG agent_validate_dest_end request_id=%lu",
                 static_cast<unsigned long>(diagRequestId));
         }
     }
@@ -505,15 +505,15 @@ void AgentConnection::sendPagedTransfer(DataContext const& ctx, PagedTransferMet
     if (mooncakePagedGinDiagEnabled())
     {
         TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-            "MOONCAKE_PAGED_GIN_DIAG agent_register_source_begin tag=%lu addr=%p len=%lu",
+            "MOONCAKE_PAGED_GIN_DIAG agent_validate_source_begin tag=%lu addr=%p len=%lu",
             static_cast<unsigned long>(ctx.getTag()), reinterpret_cast<void*>(localMetadata.mRegisteredMemory.getAddr()),
             localMetadata.mRegisteredMemory.getLen());
     }
-    registerMemoryForPagedTransfer(localMetadata.mRegisteredMemory);
+    validateMemoryForPagedTransfer(localMetadata.mRegisteredMemory);
     if (mooncakePagedGinDiagEnabled())
     {
         TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-            "MOONCAKE_PAGED_GIN_DIAG agent_register_source_end tag=%lu", static_cast<unsigned long>(ctx.getTag()));
+            "MOONCAKE_PAGED_GIN_DIAG agent_validate_source_end tag=%lu", static_cast<unsigned long>(ctx.getTag()));
     }
     PagedTransferRequest request{localMetadata.mLayerPtrs, remoteMetadata.mLayerPtrs, localMetadata.mPageIndices,
         remoteMetadata.mPageIndices, localMetadata.mPageBytes, mRemoteAgentName};
@@ -549,9 +549,9 @@ void AgentConnection::setPagedTransferMetadata(std::optional<PagedTransferMetada
     mPagedTransferMetadata = std::move(pagedTransferMetadata);
 }
 
-void AgentConnection::registerMemoryForPagedTransfer(MemoryDesc const& desc) const
+void AgentConnection::validateMemoryForPagedTransfer(MemoryDesc const& desc) const
 {
-    mAgentConnectionManager->registerMemoryForPagedTransfer(desc);
+    mAgentConnectionManager->validateMemoryForPagedTransfer(desc);
 }
 
 void AgentConnection::setHasLoadRemoteAgent(bool hasLoadRemoteAgent)
@@ -726,14 +726,11 @@ void AgentConnectionManager::runStartupPreconnect()
     };
     auto const contextStatePath = [&](int context)
     {
-        // CTX creates one long-lived connection manager, whereas GEN rebuilds
-        // its manager after it has allocated the final NCCL-window KV pool.
-        // The latter construction must preconnect with the same live CTX
-        // agents, not wait for a CTX epoch which will never occur. The run
-        // directory is unique per submission, so a per-context stable state
-        // file cannot be inherited from a prior attempt. GEN completion
-        // markers remain epoch-qualified below because every rebuilt GEN
-        // manager needs its own collective completion acknowledgement.
+        // CTX and GEN both rebuild their connection managers after allocating
+        // the final NCCL-window KV pool. Epoch 1 republishes this stable path
+        // with the exact agents and pool descriptor used during serving. GEN
+        // reads it after the epoch-1 CTX acknowledgement, so it cannot observe
+        // the provisional epoch-0 descriptor at final preconnect.
         return directory / ("ctx-" + std::to_string(context) + ".states-v2");
     };
     auto const generationMarkerPath = [&](int generation, int epoch, char const* suffix)
@@ -757,6 +754,8 @@ void AgentConnectionManager::runStartupPreconnect()
 
     if (role == "CTX")
     {
+        TLLM_CHECK_WITH_INFO(startupEpoch == 0 || startupEpoch == 1,
+            "Context startup preconnect expected provisional epoch 0 or final epoch 1, got epoch %d", startupEpoch);
         auto localState = DataTransceiverState{mCacheState, mCommState};
         TLLM_CHECK(mPagedPoolMemory.has_value());
         auto localPayload = serializeStartupPeerState(localState, mPagedPoolMemory.value());
@@ -770,47 +769,45 @@ void AgentConnectionManager::runStartupPreconnect()
                 "MOONCAKE_PAGED_GIN startup preconnect published stable context state instance=%d epoch=%d rank_states=%zu bytes=%zu path=%s",
                 instanceId, startupEpoch, rankPayloads.size(), payload.size(), statePath.c_str());
 
-            for (int generation = 0; generation < generationInstances; ++generation)
+            if (startupEpoch == 0)
             {
-                auto const readyPath = generationMarkerPath(generation, startupEpoch, ".ready");
-                auto const failedPath = generationMarkerPath(generation, startupEpoch, ".failed");
-                auto const readyDeadline = makeDeadline(rendezvousTimeout);
-                while (!startupPathExists(readyPath))
+                for (int generation = 0; generation < generationInstances; ++generation)
                 {
-                    TLLM_CHECK_WITH_INFO(!startupPathExists(failedPath),
-                        "Generation instance %d epoch %d failed during startup preconnect; see %s", generation,
-                        startupEpoch, failedPath.c_str());
-                    TLLM_CHECK_WITH_INFO(std::chrono::steady_clock::now() < readyDeadline,
-                        "Timed out waiting for generation instance %d epoch %d startup preconnect", generation,
-                        startupEpoch);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    auto const readyPath = generationMarkerPath(generation, startupEpoch, ".ready");
+                    auto const failedPath = generationMarkerPath(generation, startupEpoch, ".failed");
+                    auto const readyDeadline = makeDeadline(rendezvousTimeout);
+                    while (!startupPathExists(readyPath))
+                    {
+                        TLLM_CHECK_WITH_INFO(!startupPathExists(failedPath),
+                            "Generation instance %d epoch %d failed during startup preconnect; see %s", generation,
+                            startupEpoch, failedPath.c_str());
+                        TLLM_CHECK_WITH_INFO(std::chrono::steady_clock::now() < readyDeadline,
+                            "Timed out waiting for generation instance %d epoch %d startup preconnect", generation,
+                            startupEpoch);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    }
+                    auto const readyPayload = readStartupFile(readyPath);
+                    auto const readyMessage = std::string(readyPayload.begin(), readyPayload.end());
+                    auto const readyPairCount = parseStartupPairCount(readyPayload, "Generation ready");
+                    auto const expectedPairCount = static_cast<uint64_t>(session.getSize())
+                        * static_cast<uint64_t>(session.getSize()) * static_cast<uint64_t>(contextInstances);
+                    auto const expectedReadyMessage
+                        = "OK provisional pairs=" + std::to_string(expectedPairCount) + "\n";
+                    TLLM_CHECK_WITH_INFO(readyPairCount == expectedPairCount && readyMessage == expectedReadyMessage,
+                        "Generation instance %d epoch %d reported startup result %s, expected %s", generation,
+                        startupEpoch, readyMessage.c_str(), expectedReadyMessage.c_str());
                 }
-                auto const readyPayload = readStartupFile(readyPath);
-                auto const readyMessage = std::string(readyPayload.begin(), readyPayload.end());
-                auto const readyPairCount = parseStartupPairCount(readyPayload, "Generation ready");
-                auto const expectedPairCount = static_cast<uint64_t>(session.getSize())
-                    * static_cast<uint64_t>(session.getSize()) * static_cast<uint64_t>(contextInstances);
-                auto const expectedReadyMessage = startupEpoch == 0
-                    ? "OK provisional pairs=" + std::to_string(expectedPairCount) + "\n"
-                    : "OK pairs=" + std::to_string(expectedPairCount) + "\n";
-                TLLM_CHECK_WITH_INFO(readyPairCount == expectedPairCount && readyMessage == expectedReadyMessage,
-                    "Generation instance %d epoch %d reported startup result '%s', expected '%s'", generation,
-                    startupEpoch, readyMessage.c_str(), expectedReadyMessage.c_str());
             }
         }
         session.barrier();
-        TLLM_CHECK_WITH_INFO(startupEpoch == 0 || startupEpoch == 1,
-            "Context startup preconnect expected provisional epoch 0 or final epoch 1, got epoch %d", startupEpoch);
-        if (startupEpoch == 1)
+        if (startupEpoch == 0)
         {
             TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-                "MOONCAKE_PAGED_GIN secondary context manager validated final-pool completion role=CTX "
+                "MOONCAKE_PAGED_GIN provisional startup preconnect complete role=CTX "
                 "instance=%d epoch=%d local_rank=%d",
                 instanceId, startupEpoch, sessionRank);
             return;
         }
-        TLLM_CHECK_WITH_INFO(startupEpoch == 0,
-            "Context startup preconnect expected one connection manager, got epoch %d", startupEpoch);
         for (int generation = 0; generation < generationInstances; ++generation)
         {
             std::vector<char> generationBundle;
@@ -895,7 +892,7 @@ void AgentConnectionManager::runStartupPreconnect()
                 {
                     writeStartupMarkerNoThrow(failedPath, "CTX primary final-pool preconnect timed out\n");
                     TLLM_LOG_ERROR(mpi::MpiComm::world().getRank(),
-                        "MOONCAKE_PAGED_GIN CTX-primary final-pool preconnect timed out after %lld seconds "
+                        "MOONCAKE_PAGED_GIN final-pool CTX manager preconnect timed out after %lld seconds "
                         "ctx_instance=%d gen_instance=%d local_rank=%d",
                         static_cast<long long>(initTimeout.count()), instanceId, generation, sessionRank);
                     std::_Exit(124);
@@ -943,12 +940,12 @@ void AgentConnectionManager::runStartupPreconnect()
                 auto const allToAllPairCount = oneToOnePairCount * oneToOnePairCount;
                 TLLM_CHECK_WITH_INFO(
                     instancePairCount == oneToOnePairCount || instancePairCount == allToAllPairCount,
-                    "Unsupported or incomplete CTX-primary pair coverage: got %lu, expected %lu or %lu",
+                    "Unsupported or incomplete final-pool CTX pair coverage: got %lu, expected %lu or %lu",
                     static_cast<unsigned long>(instancePairCount),
                     static_cast<unsigned long>(oneToOnePairCount),
                     static_cast<unsigned long>(allToAllPairCount));
                 TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-                    "MOONCAKE_PAGED_GIN CTX-primary final-pool preconnect local_pairs=%lu instance_pairs=%lu "
+                    "MOONCAKE_PAGED_GIN final-pool CTX manager preconnect local_pairs=%lu instance_pairs=%lu "
                     "ctx_instance=%d gen_instance=%d local_rank=%d",
                     static_cast<unsigned long>(localPairCount), static_cast<unsigned long>(instancePairCount),
                     instanceId, generation, sessionRank);
@@ -987,7 +984,7 @@ void AgentConnectionManager::runStartupPreconnect()
             }
             catch (...)
             {
-                writeStartupMarkerNoThrow(failedPath, "CTX primary final-pool preconnect failed\n");
+                writeStartupMarkerNoThrow(failedPath, "Final-pool CTX manager preconnect failed\n");
                 stopPrimaryWatchdog();
                 throw;
             }
@@ -1406,6 +1403,19 @@ MemoryDesc const& AgentConnectionManager::getPagedPoolMemory() const
 {
     TLLM_CHECK_WITH_INFO(mPagedPoolMemory.has_value(), "Paged KV-pool memory is unavailable");
     return mPagedPoolMemory.value();
+}
+
+void AgentConnectionManager::validateMemoryForPagedTransfer(MemoryDesc const& desc) const
+{
+    TLLM_CHECK_WITH_INFO(supportsPagedTransfer(),
+        "validateMemoryForPagedTransfer is only supported by MOONCAKE_PAGED_GIN");
+    auto const& pool = getPagedPoolMemory();
+    TLLM_CHECK_WITH_INFO(desc.getAddr() == pool.getAddr() && desc.getLen() == pool.getLen()
+            && desc.getDeviceId() == pool.getDeviceId(),
+        "MOONCAKE_PAGED_GIN serving metadata does not match the startup-registered KV pool: "
+        "actual addr=%p len=%lu device=%u expected addr=%p len=%lu device=%u",
+        reinterpret_cast<void*>(desc.getAddr()), desc.getLen(), desc.getDeviceId(),
+        reinterpret_cast<void*>(pool.getAddr()), pool.getLen(), pool.getDeviceId());
 }
 
 void AgentConnectionManager::registerMemoryForPagedTransfer(MemoryDesc const& desc)
