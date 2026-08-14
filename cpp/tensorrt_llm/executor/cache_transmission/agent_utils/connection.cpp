@@ -789,13 +789,19 @@ void AgentConnectionManager::runStartupPreconnect()
                     auto const readyPayload = readStartupFile(readyPath);
                     auto const readyMessage = std::string(readyPayload.begin(), readyPayload.end());
                     auto const readyPairCount = parseStartupPairCount(readyPayload, "Generation ready");
-                    auto const expectedPairCount = static_cast<uint64_t>(session.getSize())
-                        * static_cast<uint64_t>(session.getSize()) * static_cast<uint64_t>(contextInstances);
+                    auto const oneToOnePairCount
+                        = static_cast<uint64_t>(session.getSize()) * static_cast<uint64_t>(contextInstances);
+                    auto const allToAllPairCount
+                        = oneToOnePairCount * static_cast<uint64_t>(session.getSize());
                     auto const expectedReadyMessage
-                        = "OK provisional pairs=" + std::to_string(expectedPairCount) + "\n";
-                    TLLM_CHECK_WITH_INFO(readyPairCount == expectedPairCount && readyMessage == expectedReadyMessage,
-                        "Generation instance %d epoch %d reported startup result %s, expected %s", generation,
-                        startupEpoch, readyMessage.c_str(), expectedReadyMessage.c_str());
+                        = "OK provisional pairs=" + std::to_string(readyPairCount) + "\n";
+                    TLLM_CHECK_WITH_INFO(
+                        (readyPairCount == oneToOnePairCount || readyPairCount == allToAllPairCount)
+                            && readyMessage == expectedReadyMessage,
+                        "Generation instance %d epoch %d reported startup result %s, expected %lu or %lu pairs",
+                        generation, startupEpoch, readyMessage.c_str(),
+                        static_cast<unsigned long>(oneToOnePairCount),
+                        static_cast<unsigned long>(allToAllPairCount));
                 }
             }
         }
