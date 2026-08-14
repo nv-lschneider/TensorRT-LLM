@@ -18,6 +18,8 @@ from ..distributed import Distributed
 from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import Buffers, get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
+from ..nccl_window_graph import (nccl_window_graph_capture,
+                                 release_nccl_window_graph_owner)
 from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.interface import SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
@@ -686,10 +688,11 @@ class CUDAGraphRunner:
                 return output
 
             graph = torch.cuda.CUDAGraph()
+            graph_pool = self.memory_pool or torch.cuda.graph_pool_handle()
             # Do not keep the eager result live from this runner across graph
             # setup/capture; release its reference before entering.
             output = None
-            with torch.cuda.graph(graph, pool=self.memory_pool):
+            with nccl_window_graph_capture(graph, graph_pool):
                 output = _setup_spec_decoding_and_forward(
                     key, forward_fn, capture_inputs)
             if postprocess_fn is not None:
@@ -700,7 +703,7 @@ class CUDAGraphRunner:
         self.graphs[key] = graph
         graph_output = make_weak_ref(output)
         self.graph_outputs[key] = graph_output
-        self.memory_pool = graph.pool()
+        self.memory_pool = graph_pool
         return graph_output
 
     def replay(self, key: KeyType,
@@ -1079,6 +1082,7 @@ class CUDAGraphRunner:
 
     def clear(self):
         """Releases all captured graphs and the associated memory pool."""
+        graph_pool = self.memory_pool
         for graph in self.graphs.values():
             graph.reset()
         self.graphs.clear()
@@ -1087,6 +1091,8 @@ class CUDAGraphRunner:
         self.padding_dummy_requests = {}
         del self.memory_pool
         self.memory_pool = None
+        if graph_pool is not None:
+            release_nccl_window_graph_owner(graph_pool)
         torch.cuda.empty_cache()
 
 
@@ -1829,12 +1835,13 @@ class EncoderCUDAGraphRunner:
                 return output
 
             graph = torch.cuda.CUDAGraph()
+            graph_pool = self.memory_pool or torch.cuda.graph_pool_handle()
             # Do not keep the eager result live from this runner across graph
             # setup/capture; release its reference before entering.
             output = None
-            with torch.cuda.graph(graph,
-                                  pool=self.memory_pool,
-                                  capture_error_mode="thread_local"):
+            with nccl_window_graph_capture(graph,
+                                           graph_pool,
+                                           capture_error_mode="thread_local"):
                 if self._capture_h2d_copy:
                     # H2D copies for captured inside the graph: at replay
                     # time it re-issues from the pinned static buffer without
@@ -1856,7 +1863,7 @@ class EncoderCUDAGraphRunner:
         self.graphs[key] = graph
         graph_output = make_weak_ref(output)
         self.graph_outputs[key] = graph_output
-        self.memory_pool = graph.pool()
+        self.memory_pool = graph_pool
         return graph_output
 
     def retire_staging(self) -> None:
@@ -1892,6 +1899,7 @@ class EncoderCUDAGraphRunner:
         return self.memory_pool
 
     def clear(self):
+        graph_pool = self.memory_pool
         for graph in self.graphs.values():
             graph.reset()
         self.graphs.clear()
@@ -1899,4 +1907,6 @@ class EncoderCUDAGraphRunner:
         self.graph_metadata.clear()
         del self.memory_pool
         self.memory_pool = None
+        if graph_pool is not None:
+            release_nccl_window_graph_owner(graph_pool)
         torch.cuda.empty_cache()
