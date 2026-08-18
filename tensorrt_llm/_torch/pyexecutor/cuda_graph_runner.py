@@ -689,6 +689,7 @@ class CUDAGraphRunner:
 
             graph = torch.cuda.CUDAGraph()
             graph_pool = self.memory_pool or torch.cuda.graph_pool_handle()
+            self.memory_pool = graph_pool
             # Do not keep the eager result live from this runner across graph
             # setup/capture; release its reference before entering.
             output = None
@@ -703,7 +704,6 @@ class CUDAGraphRunner:
         self.graphs[key] = graph
         graph_output = make_weak_ref(output)
         self.graph_outputs[key] = graph_output
-        self.memory_pool = graph_pool
         return graph_output
 
     def replay(self, key: KeyType,
@@ -1836,6 +1836,7 @@ class EncoderCUDAGraphRunner:
 
             graph = torch.cuda.CUDAGraph()
             graph_pool = self.memory_pool or torch.cuda.graph_pool_handle()
+            self.memory_pool = graph_pool
             # Do not keep the eager result live from this runner across graph
             # setup/capture; release its reference before entering.
             output = None
@@ -1863,7 +1864,6 @@ class EncoderCUDAGraphRunner:
         self.graphs[key] = graph
         graph_output = make_weak_ref(output)
         self.graph_outputs[key] = graph_output
-        self.memory_pool = graph_pool
         return graph_output
 
     def retire_staging(self) -> None:
