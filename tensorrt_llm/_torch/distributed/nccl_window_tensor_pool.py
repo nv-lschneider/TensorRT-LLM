@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Engine-owned NCCL-window storage for zero-copy FP4 GEMM outputs."""
+"""Engine-owned NCCL-window storage for zero-copy GEMM outputs."""
 
 import os
 from typing import Dict, List, Tuple
@@ -33,10 +33,12 @@ _PreallocationKey = Tuple[Tuple[int, ...], str, int, torch.dtype, int]
 class NCCLWindowTensorPool:
     """Own one persistent output buffer for each output signature.
 
-    The current FP4 application consumes each output before another eligible
-    GEMM with the same signature runs. That serialized lifetime lets all
-    eligible modules and CUDA graphs share one address. Supporting concurrent
-    producers will require an explicit workspace/lease contract instead.
+    Eligible GEMM producers opt in through their native caller-owned output
+    contract and the method policy in ``linear.py``. Each current application
+    consumes its output before another eligible GEMM with the same signature
+    runs. That serialized lifetime lets eligible modules and CUDA graphs share
+    one address. Supporting concurrent producers will require an explicit
+    workspace/lease contract instead.
     """
 
     def __init__(self, mapping: Mapping):
@@ -64,7 +66,12 @@ class NCCLWindowTensorPool:
         self.enabled = False
 
     def reserve(self, capacity: int) -> None:
-        """Allocate storage before tracing or CUDA-graph capture begins."""
+        """Allocate storage before tracing or CUDA-graph capture begins.
+
+        The first successful reservation owns the storage for this pool's
+        lifetime. Later warmups reuse it; shapes beyond its capacity take the
+        existing allocating path instead of resizing captured storage.
+        """
         if not self.enabled or not self._registrations:
             return
 
@@ -72,10 +79,12 @@ class NCCLWindowTensorPool:
         if capacity <= 0:
             return
         if self.capacity:
-            if capacity != self.capacity:
-                raise RuntimeError(
-                    "cannot resize NCCL-window output storage after reservation"
-                )
+            if capacity > self.capacity:
+                logger.warning_once(
+                    "NCCL window Tensor pool is retaining its existing "
+                    f"capacity of {self.capacity} tokens; requests above that "
+                    "capacity will use the allocating fallback.",
+                    key="nccl_window_tensor_pool_capacity_not_resized")
             return
 
         representatives: Dict[_BufferSpec, torch.Tensor] = {}

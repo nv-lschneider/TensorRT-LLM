@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
 import torch
 from torch import nn
 
@@ -83,9 +82,11 @@ def test_reserve_uses_exact_capacity_and_shares_output_signatures(monkeypatch):
 
     allocation_count = len(allocations)
     pool.reserve(7)
+    pool.reserve(6)
+    pool.reserve(8)
     assert len(allocations) == allocation_count
-    with pytest.raises(RuntimeError, match="cannot resize"):
-        pool.reserve(8)
+    assert pool.capacity == 7
+    assert first._nccl_window_output.shape == (7, 16)
 
 
 def test_reserve_is_all_or_nothing(monkeypatch):

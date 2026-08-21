@@ -2318,14 +2318,6 @@ class AllReduceRunner(TunableRunner):
         )
 
     @classmethod
-    def has_reserved_nccl_window(cls, input: torch.Tensor,
-                                 group: List[int]) -> bool:
-        key = cls._nccl_window_key(group, input.device, input.dtype,
-                                   input.size(-1))
-        with cls._prealloc_lock:
-            return bool(cls._preallocated_windows.get(key, 0))
-
-    @classmethod
     def mark_nccl_window_preallocated(
         cls, group: List[int], buffers: List[torch.Tensor]
     ) -> Tuple[_NcclWindowKey, ...]:
@@ -2598,7 +2590,7 @@ def tunable_allreduce(
         if not isinstance(input_tensor,
                           torch.Tensor) or not input_tensor.is_cuda:
             return inputs
-        if AllReduceRunner.has_reserved_nccl_window(input_tensor, group):
+        if torch.ops.trtllm.is_nccl_window_buffer(input_tensor, group_list):
             return inputs
         nccl_symmetric_memory_window_tensor, actual_kind = torch.ops.trtllm.allocate_output(
             input_tensor, int(BufferKind.NCCL_WINDOW), group_list)

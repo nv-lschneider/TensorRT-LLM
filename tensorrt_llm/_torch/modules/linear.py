@@ -1508,6 +1508,11 @@ class NVFP4LinearMethod(LinearMethodBase):
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
     quantizes_nvfp4_activations: ClassVar[bool] = True
+    # Temporary workaround which will be resolved by TRTLLM-11958
+    # When True, use tunable_fp4_quantize (AutoTuner selects TRTLLM vs
+    # FlashInfer). Visual gen pipelines set this to True before model
+    # construction; LLM paths leave it False to avoid host overhead.
+    use_tunable_quantize: bool = False
     nccl_window_tensor_pool_method: ClassVar[str] = "nvfp4"
 
     def can_apply_out(self, module: Linear) -> bool:

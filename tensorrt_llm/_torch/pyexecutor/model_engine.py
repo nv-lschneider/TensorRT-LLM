@@ -1449,11 +1449,13 @@ class PyTorchModelEngine(ModelEngine):
             and not self.mapping.has_cp_helix() and self.guided_decoder is None
             and not isinstance(kv_cache_manager, MambaHybridCacheManager))
 
-        # Reserve exactly the largest output requested by the warmup/capture
-        # plan. This avoids coupling the pool to max_num_tokens while still
-        # binding one stable address before torch.compile or CUDA graph capture.
+        # Derive capacity from the warmup/capture plan, then normalize it
+        # across TP ranks before binding one stable address for torch.compile
+        # and CUDA graph capture.
         requested_capacity = self._get_nccl_window_tensor_capacity(
             resource_manager, can_run_general_warmup)
+        requested_capacity = self._get_tp_nccl_window_tensor_capacity(
+            requested_capacity)
         self.nccl_window_tensor_pool.reserve(requested_capacity)
 
         # Create AutoTuner singleton in eager context before any compiled forward.
@@ -2190,6 +2192,43 @@ class PyTorchModelEngine(ModelEngine):
                 if batch_size <= self.batch_size)
 
         return max(requested_tokens, default=0)
+
+    def _get_tp_nccl_window_tensor_capacity(self,
+                                            local_capacity: int) -> int:
+        """Choose one safe NCCL-window pool capacity for every TP rank."""
+        if (not self.nccl_window_tensor_pool.enabled
+                or self.mapping.tp_size <= 1):
+            return local_capacity
+        if self.dist is None:
+            logger.warning_once(
+                "NCCL window Tensor pool requires a distributed communicator "
+                "to agree on its TP-wide capacity; disabling the pool.",
+                key="nccl_window_tensor_pool_missing_dist")
+            return 0
+
+        capacities = tuple(
+            int(capacity)
+            for capacity in self.dist.tp_allgather(int(local_capacity)))
+        if len(capacities) != self.mapping.tp_size:
+            logger.warning_once(
+                "NCCL window Tensor pool received an incomplete TP capacity "
+                f"set ({len(capacities)} of {self.mapping.tp_size}); disabling "
+                "the pool.",
+                key="nccl_window_tensor_pool_incomplete_capacities")
+            return 0
+
+        # Window registration is collective and must use the same allocation
+        # size on every rank. The minimum stays within every rank-local warmup
+        # plan; larger shapes safely use the normal allocating path.
+        common_capacity = min(capacities)
+        if len(set(capacities)) > 1:
+            logger.warning_once(
+                "NCCL window Tensor pool capacity differs across TP ranks "
+                f"({list(capacities)}); using the common capacity "
+                f"{common_capacity}. Larger shapes will use the allocating "
+                "fallback.",
+                key="nccl_window_tensor_pool_asymmetric_capacities")
+        return common_capacity
 
     def _get_graphs_to_capture(
         self, cuda_graph_batch_sizes: list[int],
