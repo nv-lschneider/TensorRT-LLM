@@ -77,5 +77,22 @@ def test_cublas_mm_out_fp32(dtype, m, k_n):
     np.testing.assert_allclose(ref.float().cpu(), output.float().cpu(), atol=0.01, rtol=0.01)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("bias", [False, True])
+def test_cublas_mm_out_writes_caller_owned_output(dtype, bias):
+    torch.random.manual_seed(13)
+    m, k, n = 8, 512, 1024
+    x = torch.randn((m, k), device="cuda", dtype=dtype)
+    w = torch.randn((n, k), device="cuda", dtype=dtype)
+    b = torch.randn((n), device="cuda", dtype=dtype) if bias else None
+    out = torch.full((m, n), float("nan"), device="cuda", dtype=dtype)
+
+    result = torch.ops.trtllm.cublas_mm_out(x, w.t(), b, out)
+
+    assert result.data_ptr() == out.data_ptr()
+    ref = F.linear(x, w, b)
+    np.testing.assert_allclose(ref.float().cpu(), out.float().cpu(), atol=0.01, rtol=0.01)
+
+
 if __name__ == "__main__":
     test_cublas_mm(torch.float16, 12, (8192, 10240))

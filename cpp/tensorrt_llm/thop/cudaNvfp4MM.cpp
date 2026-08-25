@@ -102,8 +102,10 @@ Tensor& cuda_core_nvfp4_gemm_out(Tensor const& mat_a, Tensor const& mat_b, Tenso
     CHECK_INPUT(mat_a, FLOAT4_E2M1X2);
     CHECK_INPUT(mat_b, FLOAT4_E2M1X2);
 
+    TORCH_CHECK(out.device() == mat_a.device(), "output must reside on the same CUDA device as mat_a");
+    TORCH_CHECK(out.is_contiguous(), "output must be contiguous");
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2 && out.dim() == 2);
-    TORCH_CHECK(mat_a.sizes()[0] == out.sizes()[0]);
+    TORCH_CHECK(out.sizes()[0] >= mat_a.sizes()[0]);
     TORCH_CHECK(mat_a.sizes()[1] == mat_b.sizes()[1]);
     TORCH_CHECK(mat_b.sizes()[0] == out.sizes()[1]);
 
@@ -146,9 +148,13 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "cuda_core_nvfp4_gemm(Tensor mat_a, Tensor mat_b, Tensor scale_a, Tensor scale_b, Tensor alpha, Tensor? bias,"
         " ScalarType? out_dtype, int output_buffer_kind=0, int[]? group=None)"
         " -> (Tensor out)");
+    m.def(
+        "cuda_core_nvfp4_gemm_out(Tensor mat_a, Tensor mat_b, Tensor scale_a, Tensor scale_b, Tensor alpha,"
+        " Tensor? bias, Tensor(a!) out) -> Tensor(a!)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("cuda_core_nvfp4_gemm", &tensorrt_llm::torch_ext::cuda_core_nvfp4_gemm);
+    m.impl("cuda_core_nvfp4_gemm_out", &tensorrt_llm::torch_ext::cuda_core_nvfp4_gemm_out);
 }

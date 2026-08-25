@@ -778,6 +778,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             inputs: List[torch.Tensor],
             tactic,
             bias: Optional[torch.Tensor] = None,
+            output: Optional[torch.Tensor] = None,
             **kwargs,
         ) -> torch.Tensor:
             """
@@ -805,12 +806,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
             a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, alpha_tensor = inputs
             m, k, n = a_tensor.shape[0], a_tensor.shape[1], b_tensor.shape[0]
 
-            # Allocate output tensor based on output_buffer_kind.
-            # allocate_output returns the actual BufferKind used (may fall back
-            # to Default if NcclWindow allocation fails); we discard it here.
-            c_tensor, _ = torch.ops.trtllm.allocate_output(
-                a_tensor, self.output_buffer_kind, self.group, [m, n],
-                self.output_dtype)
+            if output is None:
+                c_tensor, _ = torch.ops.trtllm.allocate_output(
+                    a_tensor, self.output_buffer_kind, self.group, [m, n],
+                    self.output_dtype)
+            else:
+                if (output.device != a_tensor.device or not output.is_contiguous()
+                        or output.ndim != 2 or output.shape[0] < m
+                        or output.shape[1] != n
+                        or output.dtype != self.output_dtype):
+                    raise ValueError(
+                        "output must be a contiguous tensor on the input device "
+                        f"with dtype {self.output_dtype} and shape at least [{m}, {n}]; "
+                        f"got {output.dtype} {tuple(output.shape)} on {output.device}")
+                c_tensor = output
 
             if swap_ab:
                 c_tensor = c_tensor.permute(1, 0)
@@ -1009,8 +1018,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     raise ValueError(
                         f"bias must be a 1-D tensor of shape [N]={c_tensor.shape[-1]}, "
                         f"got shape {tuple(bias.shape)}")
-                c_tensor = c_tensor + bias
+                if output is None:
+                    c_tensor = c_tensor + bias
+                else:
+                    c_tensor[:m].add_(bias)
             return c_tensor
+
+        def forward_out(
+            self,
+            inputs: List[torch.Tensor],
+            output: torch.Tensor,
+            tactic,
+            bias: Optional[torch.Tensor] = None,
+        ) -> None:
+            self.forward(inputs, tactic, bias=bias, output=output)
 
     # a/b: fp4, scale: fp8, output: bf16
     @torch.library.custom_op("trtllm::cute_dsl_nvfp4_gemm_blackwell",

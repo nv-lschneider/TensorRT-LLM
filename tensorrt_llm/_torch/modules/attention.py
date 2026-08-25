@@ -334,6 +334,12 @@ def _helix_cp_output_projection(
                                        mapping.cp_size)
         attn_output = reducescatter(attn_output, mapping_o, dim=0)
     else:
+        if (all_reduce_params is not None
+                and all_reduce_params.enable_allreduce is False):
+            pooled_output = o_proj.try_apply_nccl_window_output_handoff(
+                attn_output, lora_params=lora_params)
+            if pooled_output is not None:
+                return pooled_output
         attn_output = o_proj(attn_output,
                              all_reduce_params=all_reduce_params,
                              lora_params=lora_params,

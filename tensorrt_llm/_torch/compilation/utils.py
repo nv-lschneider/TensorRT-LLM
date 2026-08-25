@@ -69,6 +69,9 @@ def inplace_info():
             1: "input",
             2: "residual"
         },
+        torch.ops.trtllm.nvfp4_gemm_out.default: {
+            1: "output"
+        },
         torch.ops.trtllm.flashinfer_fused_add_rmsnorm_quant.default: {
             1: "out",
             2: "residual"
@@ -175,6 +178,15 @@ def inplace_info():
             5: "acceptIndex",
             6: "acceptTokenNum",
             7: "acceptToken"
+        },
+        torch.ops.trtllm.cublas_mm_out.default: {
+            3: "out"
+        },
+        torch.ops.trtllm.cublas_scaled_mm_out.default: {
+            5: "out"
+        },
+        torch.ops.trtllm.fp8_rowwise_gemm_out.default: {
+            4: "output"
         }
     }
     optional_inplace_infos = {

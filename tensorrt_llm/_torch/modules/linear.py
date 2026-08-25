@@ -13,7 +13,8 @@ from torch import nn
 from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
-from tensorrt_llm._torch.custom_ops.torch_custom_ops import BufferKind
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
+    BufferKind, fp8_rowwise_gemm_out, nvfp4_gemm_out)
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
@@ -45,6 +46,24 @@ def _should_apply_low_m_gemm(input: torch.Tensor) -> bool:
         return False
     k = int(input.shape[-1])
     return k > 0 and input.numel() <= _LOW_M_GEMM_MAX_M * k
+
+
+def is_nccl_window_tensor_pool_method_enabled(method: Optional[str]) -> bool:
+    """Return whether a caller-owned output method is allowed to use the pool.
+
+    ``TLLM_NCCL_WINDOW_TENSOR_POOL_METHODS`` is a comma-separated allow-list.
+    It defaults to ``nvfp4,fp8_qdq_cublas`` because both have repeatable
+    full-model gains. FP8 rowwise support remains available for focused
+    testing but requires an explicit opt-in. Use ``all`` to enable every
+    method with a proven native ``apply_out`` contract, or ``none`` to disable
+    every method while leaving the global pool switch unchanged.
+    """
+    if method is None:
+        return False
+    methods = os.environ.get("TLLM_NCCL_WINDOW_TENSOR_POOL_METHODS",
+                             "nvfp4,fp8_qdq_cublas")
+    enabled = {value.strip().lower() for value in methods.split(",")}
+    return "all" in enabled or method.lower() in enabled
 
 
 class WeightMode(str, enum.Enum):
@@ -386,6 +405,29 @@ class LinearMethodBase(ABC):
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = False
     quantizes_nvfp4_activations: ClassVar[bool] = False
 
+    # A caller-owned output implementation may be present without being the
+    # default performance choice for that quantization method.  The pool gate
+    # below applies the explicit method allow-list.
+    nccl_window_tensor_pool_method: ClassVar[Optional[str]] = None
+
+    def can_apply_out(self, module: Linear) -> bool:
+        """Whether ``apply_out`` has a native, caller-owned output contract.
+
+        This is deliberately separate from
+        ``supports_nccl_symmetric_memory_window_output``. The latter means
+        the allocating implementation can request NCCL-window storage; this
+        capability additionally guarantees that the producer can write into a
+        retained Python Tensor wrapper supplied by the pool.
+        """
+        return False
+
+    def apply_out(self, module: Linear, input: torch.Tensor,
+                  bias: Optional[torch.Tensor], output: torch.Tensor) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} has no caller-owned output implementation"
+        )
+
+
     @abstractmethod
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype, *args,
@@ -549,6 +591,25 @@ class UnquantizedLinearMethod(LinearMethodBase):
     """
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
+    nccl_window_tensor_pool_method: ClassVar[str] = "cublas_mm"
+
+    def can_apply_out(self, module: Linear) -> bool:
+        # cublas_mm_out has the same 2-D GEMM contract as the allocating
+        # custom op. cublas_mm_out accepts the rank-local bias, preserving the
+        # existing pre-allreduce bias ordering.
+        # FP8 QDQ and block-scale methods subclass this class for weight
+        # loading utilities but launch different GEMM operators. Do not let
+        # this capability inherit into those producers.
+        return type(self) is UnquantizedLinearMethod and module.use_custom_cublas_mm
+
+    def apply_out(self, module: Linear, input: torch.Tensor,
+                  bias: Optional[torch.Tensor], output: torch.Tensor) -> None:
+        torch.ops.trtllm.cublas_mm_out(
+            input,
+            module.weight.t(),
+            bias,
+            output.narrow(0, 0, input.shape[0]),
+        )
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
@@ -694,6 +755,33 @@ class UnquantizedLinearMethod(LinearMethodBase):
 class FP8QDQLinearMethod(UnquantizedLinearMethod):
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
+    nccl_window_tensor_pool_method: ClassVar[str] = "fp8_qdq_cublas"
+
+    def can_apply_out(self, module: Linear) -> bool:
+        return not module.enable_cuda_core and module.out_features % 16 == 0
+
+    def apply_out(self, module: Linear, input: torch.Tensor,
+                  bias: Optional[torch.Tensor], output: torch.Tensor) -> None:
+        input_scale = self.get_static_input_scale(module)
+        if input.dtype == torch.float8_e4m3fn:
+            qinput = input
+            input_scale = module.input_scale
+        elif input_scale is not None:
+            qinput, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                input, input_scale)
+        else:
+            qinput, input_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(
+                input)
+            input_scale = input_scale.to(torch.float32)
+        torch.ops.trtllm.cublas_scaled_mm_out(
+            qinput,
+            module.weight.t(),
+            input_scale,
+            module.weight_scale,
+            bias,
+            output.narrow(0, 0, qinput.shape[0]),
+        )
+
 
     def get_static_input_scale(self, module: Linear) -> Optional[torch.Tensor]:
         if module.input_scale is not None and not module.force_dynamic_quantization:
@@ -1021,6 +1109,11 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
 class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
+    nccl_window_tensor_pool_method: ClassVar[str] = "fp8_rowwise"
+
+    def can_apply_out(self, module: Linear) -> bool:
+        # fp8_rowwise_gemm_out is a CUTLASS-only op and does not fuse bias.
+        return module.bias is None
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
@@ -1080,6 +1173,22 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
         if bias is not None:
             output = output + bias
         return output
+
+    def apply_out(self, module: Linear, input: torch.Tensor,
+                  bias: Optional[torch.Tensor], output: torch.Tensor) -> None:
+        # Keep this preparation identical to apply(). The pool gate restricts
+        # callers to 2-D activations, matching the native GEMM contract.
+        if input.dtype == torch.float8_e4m3fn:
+            qinput = input
+            cur_input_scale = torch.ones(input.shape[0],
+                                         device=input.device,
+                                         dtype=torch.float32)
+        else:
+            qinput, cur_input_scale = torch.ops.tensorrt_llm.quantize_e4m3_activation(
+                input)
+        fp8_rowwise_gemm_out(qinput, module.weight, cur_input_scale.float(),
+                             module.weight_scale,
+                             output.narrow(0, 0, qinput.shape[0]))
 
     def _get_scale_name(self, weights: List[Dict]):
         # `weight_scale_inv` for DS recipe and `weight_scale` for ModelOpt recipe.
@@ -1399,12 +1508,24 @@ class NVFP4LinearMethod(LinearMethodBase):
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
     quantizes_nvfp4_activations: ClassVar[bool] = True
-
     # Temporary workaround which will be resolved by TRTLLM-11958
     # When True, use tunable_fp4_quantize (AutoTuner selects TRTLLM vs
     # FlashInfer). Visual gen pipelines set this to True before model
     # construction; LLM paths leave it False to avoid host overhead.
     use_tunable_quantize: bool = False
+    nccl_window_tensor_pool_method: ClassVar[str] = "nvfp4"
+
+    def can_apply_out(self, module: Linear) -> bool:
+        # Subclasses may change activation preparation or the GEMM itself.
+        # They must opt in explicitly after proving their native out contract.
+        output_backends = {
+            "cutlass", "cublaslt", "cutedsl", "cuda_core", "marlin"
+        }
+        configured_backends = set(module.nvfp4_allowed_backends)
+        return (type(self) is NVFP4LinearMethod and configured_backends
+                and configured_backends <= output_backends
+                and module.weight.shape[0] == module.out_features
+                and module.bias is None)
 
     def get_tp_alignment(self, tp_mode, quant_config=None):
         # 32-element alignment for both modes. ROW shards in_features which
@@ -1588,6 +1709,20 @@ class NVFP4LinearMethod(LinearMethodBase):
         if bias is not None and not fuse_bias_in_gemm:
             output = output + bias
         return output
+
+    def apply_out(self, module: Linear, input: torch.Tensor,
+                  bias: Optional[torch.Tensor], output: torch.Tensor) -> None:
+        """Write a 2-D NVFP4 result into caller-owned storage."""
+        act_fp4, act_sf, alpha = self._input_prepare(module, input)
+        nvfp4_gemm_out(
+            act_fp4,
+            module.weight,
+            act_sf,
+            module.weight_scale,
+            alpha,
+            output,
+            allowed_backends=",".join(module.nvfp4_allowed_backends),
+        )
 
     def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
                                bias: Optional[torch.Tensor], tp_rank: int,
@@ -3504,6 +3639,12 @@ class Linear(nn.Module):
         self.all_reduce = AllReduce(mapping=self.mapping,
                                     strategy=allreduce_strategy,
                                     dtype=self.dtype) if reduce_output else None
+        self.register_buffer("_nccl_window_output", None, persistent=False)
+        # A model may explicitly opt this row-parallel Linear into a retained
+        # output handoff when its collective lives at a parent-module boundary.
+        # Keep this false by default: a pooled Tensor is only safe when that
+        # parent consumes it immediately on the same stream.
+        self.enable_nccl_window_output_handoff = False
 
         self._weights_created = False
         self._weights_transformed = False
@@ -3818,6 +3959,41 @@ class Linear(nn.Module):
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_mxfp8(
         )
 
+    def _can_use_nccl_window_output(self) -> bool:
+        return (
+            self.tp_mode == TensorParallelMode.ROW and self.reduce_output
+            and self.all_reduce is not None
+            and self.quant_method.can_apply_out(self)
+            and is_nccl_window_tensor_pool_method_enabled(
+                self.quant_method.nccl_window_tensor_pool_method)
+            and not self.use_fused_gemm_allreduce
+            and (self.all_reduce.uses_nccl_symmetric_memory_window()
+                 or self.all_reduce.strategy == AllReduceStrategy.AUTO))
+
+    def _can_use_nccl_window_output_handoff(self) -> bool:
+        """Whether a model-owned external allreduce may consume this output."""
+        return (
+            self.enable_nccl_window_output_handoff
+            and self.tp_mode == TensorParallelMode.ROW and not self.reduce_output
+            and self.quant_method.can_apply_out(self)
+            and is_nccl_window_tensor_pool_method_enabled(
+                self.quant_method.nccl_window_tensor_pool_method))
+
+    def try_apply_nccl_window_output_handoff(
+            self, input: Union[torch.Tensor, Fp4QuantizedTensor],
+            lora_params: Optional[dict] = None) -> Optional[torch.Tensor]:
+        """Write an output for an immediate parent-owned allreduce, if pooled."""
+        scratch = self._nccl_window_output
+        if scratch is None or lora_params:
+            return None
+        input_tensor = (input.fp4_tensor if isinstance(input, Fp4QuantizedTensor)
+                        else input[0] if isinstance(input, tuple) else input)
+        if input_tensor.dim() != 2 or input_tensor.shape[0] > scratch.shape[0]:
+            return None
+        bias = None if self.tp_rank > 0 else self.bias
+        self.quant_method.apply_out(self, input, bias, scratch)
+        return scratch.narrow(0, 0, input_tensor.shape[0])
+
     def apply_linear(self,
                      input,
                      bias,
@@ -3882,23 +4058,34 @@ class Linear(nn.Module):
                     fuse_bias = self._maybe_fuse_bias_into_allreduce(
                         bias, all_reduce_params)
                     bias = None if fuse_bias else bias
-                    # Write GEMM output directly into the NCCL window buffer when
-                    # available so allreduce reads it without a copy. apply()
-                    # derives output_buffer_kind from supports_nccl_symmetric_memory_window_output
-                    # (ClassVar); a failed window allocation falls back gracefully
-                    # inside the C++ allocate_output.
-                    use_nccl_symmetric_memory_window = (
-                        self.all_reduce is not None and self.quant_method.
-                        supports_nccl_symmetric_memory_window_output
-                        and self.all_reduce.uses_nccl_symmetric_memory_window()
-                        and not (self.lora is not None and lora_params))
-                    if use_nccl_symmetric_memory_window:
-                        output = self.quant_method.apply(self, input, bias)
-                    else:
-                        output = self.apply_linear(input, bias, lora_params,
-                                                   layer_idx)
-                    output = self.all_reduce(
-                        output, all_reduce_params=all_reduce_params)
+                    scratch = self._nccl_window_output
+                    scratch_output_used = False
+                    if scratch is not None:
+                        input_tensor = (input.fp4_tensor if isinstance(
+                            input, Fp4QuantizedTensor) else input[0]
+                                        if isinstance(input, tuple) else input)
+                        if (input_tensor.dim() == 2 and input_tensor.shape[0]
+                                <= scratch.shape[0]):
+                            self.quant_method.apply_out(self, input, bias, scratch)
+                            output = scratch.narrow(0, 0,
+                                                    input_tensor.shape[0])
+                            output = self.all_reduce(
+                                output, all_reduce_params=all_reduce_params)
+                            scratch_output_used = True
+                    if not scratch_output_used:
+                        use_nccl_symmetric_memory_window = (
+                            self.all_reduce is not None and self.quant_method.
+                            supports_nccl_symmetric_memory_window_output
+                            and self.all_reduce.
+                            uses_nccl_symmetric_memory_window() and not (
+                                self.lora is not None and lora_params))
+                        if use_nccl_symmetric_memory_window:
+                            output = self.quant_method.apply(self, input, bias)
+                        else:
+                            output = self.apply_linear(input, bias, lora_params,
+                                                       layer_idx)
+                        output = self.all_reduce(
+                            output, all_reduce_params=all_reduce_params)
             else:
                 output = self.apply_linear(input, bias, lora_params, layer_idx)
         elif self.tp_mode == TensorParallelMode.COLUMN:

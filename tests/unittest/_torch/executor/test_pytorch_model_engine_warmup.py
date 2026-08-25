@@ -14,7 +14,7 @@ import contextlib
 import unittest
 from dataclasses import dataclass
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -258,6 +258,24 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertEqual(
             calls.count("empty_cache"), 0, f"Helix CP should skip all warmup cleanup; got {calls}"
         )
+
+
+class TestNcclWindowTensorPoolCapacity(unittest.TestCase):
+
+    def test_uses_capacity_supported_by_every_tp_rank(self):
+        dist = Mock()
+        dist.tp_allgather.return_value = [64, 32, 48, 40]
+        engine = SimpleNamespace(
+            nccl_window_tensor_pool=SimpleNamespace(enabled=True),
+            mapping=SimpleNamespace(tp_size=4),
+            dist=dist,
+        )
+
+        capacity = PyTorchModelEngine._get_tp_nccl_window_tensor_capacity(
+            engine, 64)
+
+        self.assertEqual(capacity, 32)
+        dist.tp_allgather.assert_called_once_with(64)
 
 
 if __name__ == "__main__":
