@@ -167,6 +167,21 @@ class NcclEpContext:
                 pass
 
         # NCCL-EP v0.2+ may support opportunistic zero-copy dispatch.
+        # Prefer kernel-side sentinel reset when the linked binding exposes it.
+        try:
+            from nccl.ep import DispatchConfig as _DispatchConfig
+            from nccl.ep import RecvTopkIdxFlags as _RecvTopkIdxFlags
+
+            if hasattr(_DispatchConfig()._lowpp, "recv_topk_idx_flags"):
+                self._recv_topk_idx_flags_with_sentinel_reset = int(
+                    _RecvTopkIdxFlags.WRITE_SRC_RANK_COUNTERS
+                    | _RecvTopkIdxFlags.RESET_SENTINELS
+                )
+            else:
+                self._recv_topk_idx_flags_with_sentinel_reset = None
+        except (ImportError, AttributeError):
+            self._recv_topk_idx_flags_with_sentinel_reset = None
+
         # When the Pythonic GroupConfig facade exposes `zero_copy` (i.e.,
         # the wheel was built against a libnccl_ep.so that has the field
         # in ncclEpGroupConfig_t), we allocate a VMM-backed,
@@ -297,6 +312,10 @@ class NcclEpContext:
         return torch.cuda.current_stream().cuda_stream
 
     def destroy(self):
+        if self._recv_topk_idx_flags_with_sentinel_reset is not None:
+            self.dispatch_config._lowpp.recv_topk_idx_flags = (
+                self._recv_topk_idx_flags_with_sentinel_reset
+            )
         """Release EP group, NCCL comm, and MPI sub-comm in LIFO order.
 
         Avoids relying on Python GC ordering between the group, the comm it

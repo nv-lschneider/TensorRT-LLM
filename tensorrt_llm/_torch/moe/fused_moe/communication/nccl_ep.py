@@ -229,7 +229,7 @@ class NcclEP(Communication):
 
         # NCCL-EP v0.2+ resets inactive rank-major recv_topk_idx rows in
         # the dispatch kernel. Older wheels retain this host-side fallback.
-        if not ctx._kernel_resets_recv_topk_idx:
+        if ctx._recv_topk_idx_flags_with_sentinel_reset is None:
             ctx.recv_topk_idx_buf.fill_(-1)
 
         outputs = DispatchOutputs(
@@ -245,7 +245,11 @@ class NcclEP(Communication):
         if ctx._expert_id_kind_global is not None:
             layout_info._lowpp.recv_topk_idx_kind = ctx._expert_id_kind_global
 
-        topk_idx_dev = token_selected_slots.to(ctx.topk_idx_dtype).contiguous()
+        topk_idx_dev = (
+            token_selected_slots
+            if token_selected_slots.dtype == ctx.topk_idx_dtype and token_selected_slots.is_contiguous()
+            else token_selected_slots.to(ctx.topk_idx_dtype).contiguous()
+        )
         topk_nd = Tensor(topk_idx_dev)
         handle = self._setup_handle(ctx, topk_nd, stream)
         inputs = DispatchInputs(
