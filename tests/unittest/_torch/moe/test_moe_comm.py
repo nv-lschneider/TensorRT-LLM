@@ -1249,7 +1249,14 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig) -> dict:
     """Capture LL dispatch, change routing, and verify replay sees the change."""
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
+    from tensorrt_llm._torch.nccl_window_graph import (
+        nccl_window_graph_capture,
+        release_nccl_window_graph_owner,
+    )
+
     comm = None
+    graph = None
+    pool = torch.cuda.graph_pool_handle()
     try:
         mapping = Mapping(
             rank=rank,
@@ -1287,18 +1294,22 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig) -> dict:
         with nccl_window_tensor_scope(hidden_states):
             # Initialize the context and handle eagerly. Capture is intentionally
             # rejected before this point, matching production graph setup.
-            comm.dispatch(
+            warmup_hs, *_ = comm.dispatch(
                 hidden_states,
                 None,
                 local_routes,
                 weights,
                 all_rank_num_tokens,
             )
-            torch.cuda.synchronize()
+            comm.combine(warmup_hs)
+            del warmup_hs
+        torch.cuda.synchronize()
 
+        # End the warmup lease scope before capture can claim its buffer.
+        with nccl_window_tensor_scope(hidden_states):
             static_routes = local_routes.clone()
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            with nccl_window_graph_capture(graph, pool):
                 recv_hs, _, recv_slots, _ = comm.dispatch(
                     hidden_states,
                     None,
@@ -1307,6 +1318,10 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig) -> dict:
                     all_rank_num_tokens,
                 )
             torch.cuda.synchronize()
+            if comm._get_context().zerocopy_enabled:
+                assert comm._dispatch_state["window_tokens"] is not None, (
+                    "Graph dispatch unexpectedly fell back to staged output"
+                )
 
             def replay_and_check(expected_sender: int) -> dict:
                 graph.replay()
@@ -1327,6 +1342,9 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig) -> dict:
         traceback.print_exc()
         raise
     finally:
+        if graph is not None:
+            graph.reset()
+        release_nccl_window_graph_owner(pool)
         if comm is not None:
             comm.destroy()
 

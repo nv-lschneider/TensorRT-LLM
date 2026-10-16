@@ -333,9 +333,9 @@ class NcclEP(Communication):
         topk_nd = Tensor(topk_idx_dev)
         dispatch_outputs = ctx.dispatch_outputs
         window_tokens = None
-        # CUDA graph capture requires stable context-owned output addresses.
-        # Eager dispatch keeps the operation-scoped NCCL-window allocation.
-        if ctx.zerocopy_enabled and not torch.cuda.is_current_stream_capturing():
+        # The window allocator binds captured buffers to the active graph pool.
+        # It reuses eagerly registered storage and rejects unsafe capture requests.
+        if ctx.zerocopy_enabled:
             window_tokens, actual_kind, window_handle = (
                 torch.ops.trtllm.allocate_output_with_nccl_window(
                     ctx.output_tokens_buf,
