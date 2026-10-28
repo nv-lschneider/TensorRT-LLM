@@ -50,11 +50,12 @@ import torch
 from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.route_capture import get_active_route_capture  # R3
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
+from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from .communication import DeepEP, DeepEPLowLatency, NcclEP, NVLinkOneSided, NVLinkTwoSided
 from .communication.nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
-from .fused_moe_cutlass import raise_moe_lora_multichunk_unsupported
+from .fused_moe_cutlass import CutlassFusedMoE, raise_moe_lora_multichunk_unsupported
 from .impl_contract import MoECommPlan, MoERunContext
 from .interface import FORCE_SEPARATED_ROUTING, MoESchedulerKind
 
@@ -893,9 +894,19 @@ class ExternalCommMoEScheduler(MoEScheduler):
             recv_expert_count, deep_ep_expert_capacity = (
                 moe.comm.get_expert_major_dispatch_metadata()
             )
+        enable_alltoall = moe.enable_alltoall
+        # NCCL-EP returns global expert IDs; CUTLASS W4A16 uses this flag
+        # to select the matching ID remap for weight dequantization and fused_moe.
+        if (
+            isinstance(moe.comm, NcclEP)
+            and isinstance(moe.backend, CutlassFusedMoE)
+            and moe.backend.quant_config is not None
+            and moe.backend.quant_config.quant_algo == QuantAlgo.W4A16_NVFP4
+        ):
+            enable_alltoall = False
         return MoECommPlan(
             input_sf_swizzled=not supports_post_quant,
-            enable_alltoall=moe.enable_alltoall,
+            enable_alltoall=enable_alltoall,
             moe_output=moe_output,
             payload_in_workspace=payload_in_workspace,
             recv_expert_count=recv_expert_count,

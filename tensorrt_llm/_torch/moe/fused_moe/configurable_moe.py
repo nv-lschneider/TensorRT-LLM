@@ -50,7 +50,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .activation import install_activation_params
 from .communication import AllGatherReduceScatter, Communication, CommunicationFactory
-from .communication.nccl_ep import NcclEP
+from .communication.nccl_ep import NcclEP, NcclEPDispatchFormat
 from .moe_scheduler import MoEScheduler, create_moe_scheduler
 
 # Attributes that ConfigurableMoE owns (computed in MoE.__init__ from real
@@ -754,8 +754,6 @@ class ConfigurableMoE(MoE):
             if self._override_quant_config is not None
             else self.quant_config
         )
-        if isinstance(self.comm, NcclEP):
-            self.comm.set_quant_config(quant_config)
         self.backend.quant_config = quant_config
         # The quant config just changed and a backend may resolve its activation
         # ABI from it: TRTLLMGenFusedMoE narrows the clamp to a uniform scalar on
@@ -767,7 +765,19 @@ class ConfigurableMoE(MoE):
         # NVFP4TRTLLMGenFusedMoEBaseMethod applies to beta and clamp.
         if not self.backend._weights_created:
             install_activation_params(self.backend)
-        return self.backend.create_weights()
+        result = self.backend.create_weights()
+        if isinstance(self.comm, NcclEP):
+            if self.backend.has_nvfp4_activation_quantization:
+                dispatch_format = NcclEPDispatchFormat.NVFP4
+            elif quant_config is not None and quant_config.layer_quant_mode.has_fp8_qdq():
+                dispatch_format = NcclEPDispatchFormat.FP8
+            else:
+                dispatch_format = NcclEPDispatchFormat.BF16
+            self.comm.set_quant_config(
+                quant_config,
+                dispatch_format=dispatch_format,
+            )
+        return result
 
     def load_weights(self, weights: List[Dict], allow_partial_loading: bool = False):
         """

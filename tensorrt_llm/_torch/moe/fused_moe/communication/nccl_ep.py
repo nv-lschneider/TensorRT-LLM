@@ -43,14 +43,14 @@ import torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.quantization import QuantMode
+from tensorrt_llm.quantization import QuantAlgo, QuantMode
 
 from .base import Communication
 
 _NCCL_RUNTIME_ERRORS = (RuntimeError, OSError)
 
 
-class _TransportMode(Enum):
+class NcclEPDispatchFormat(Enum):
     BF16 = "bf16"
     FP8 = "fp8"
     NVFP4 = "nvfp4"
@@ -107,28 +107,33 @@ class NcclEP(Communication):
         self._handle = None  # nccl.ep.Handle | None
         self._dispatch_state: dict = {}
 
-    def set_quant_config(self, quant_config: Optional[QuantConfig]) -> None:
-        """Apply a layer's resolved format before allocating its communication context."""
+    def set_quant_config(
+        self,
+        quant_config: Optional[QuantConfig],
+        dispatch_format: Optional[NcclEPDispatchFormat] = None,
+    ) -> None:
+        """Resolve dispatch format before context allocation; finalization supplies the backend format."""
         quant_mode = quant_config.layer_quant_mode if quant_config is not None else QuantMode(0)
-        has_fp8 = quant_mode.has_fp8_qdq()
-        has_nvfp4 = quant_mode.has_nvfp4()
-        mode = (
-            _TransportMode.NVFP4
-            if has_nvfp4
-            else _TransportMode.FP8
-            if has_fp8
-            else _TransportMode.BF16
-        )
+        if dispatch_format is None:
+            if quant_config is not None and quant_config.quant_algo in (
+                QuantAlgo.NVFP4, QuantAlgo.NVFP4_AWQ, QuantAlgo.NVFP4_ARC
+            ):
+                dispatch_format = NcclEPDispatchFormat.NVFP4
+            elif quant_mode.has_fp8_qdq():
+                dispatch_format = NcclEPDispatchFormat.FP8
+            else:
+                dispatch_format = NcclEPDispatchFormat.BF16
+        mode = dispatch_format
         fallback_reason = None
-        if has_fp8 or has_nvfp4:
+        if mode in (NcclEPDispatchFormat.FP8, NcclEPDispatchFormat.NVFP4):
             from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import nccl_ep_supports_version
 
             if not nccl_ep_supports_version("0.2"):
                 fallback_reason = "quantized dispatch requires libnccl_ep >= 0.2"
-        if has_nvfp4 and self.hidden_size % 256 != 0:
+        if mode is NcclEPDispatchFormat.NVFP4 and self.hidden_size % 256 != 0:
             fallback_reason = "NVFP4 dispatch requires hidden_size divisible by 256"
         if fallback_reason is not None:
-            mode = _TransportMode.BF16
+            mode = NcclEPDispatchFormat.BF16
         if self._ctx is not None and mode != self._transport_mode:
             raise RuntimeError(
                 "Cannot change NCCL-EP transport format after context initialization."
@@ -142,11 +147,11 @@ class NcclEP(Communication):
 
     @property
     def use_external_fp8(self) -> bool:
-        return self._transport_mode is _TransportMode.FP8
+        return self._transport_mode is NcclEPDispatchFormat.FP8
 
     @property
     def use_external_nvfp4(self) -> bool:
-        return self._transport_mode is _TransportMode.NVFP4
+        return self._transport_mode is NcclEPDispatchFormat.NVFP4
 
     @property
     def use_low_precision_combine(self) -> bool:

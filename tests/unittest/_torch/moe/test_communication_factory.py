@@ -569,6 +569,7 @@ _NCCL_EP_QUANT_ALGOS = [
     QuantAlgo.FP8,
     QuantAlgo.FP8_BLOCK_SCALES,
     QuantAlgo.NVFP4,
+    QuantAlgo.W4A16_NVFP4,
 ]
 
 
